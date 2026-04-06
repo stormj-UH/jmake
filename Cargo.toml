@@ -1,0 +1,21 @@
+[package]
+name = "jmake"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-AllRightsReserved"
+description = "Clean-room drop-in replacement for GNU Make"
+
+[[bin]]
+name = "jmake"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+indexmap = "2"
+filetime = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
