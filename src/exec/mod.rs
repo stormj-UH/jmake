@@ -612,9 +612,231 @@ impl<'a> Executor<'a> {
         result
     }
 
+    /// Extract the prerequisite-building phase of `build_with_rules`, without running
+    /// the recipe. Returns `(any_prereq_rebuilt, all_prereqs, all_order_only, recipe,
+    /// recipe_source_file, pattern_stem)` so the caller can run the recipe itself.
+    /// Used by `build_with_rules_grouped` to sequence prereq phases for grouped targets.
+    fn build_with_rules_prereqs(
+        &mut self,
+        target: &str,
+        rules: &[Rule],
+        is_phony: bool,
+    ) -> Result<(bool, Vec<String>, Vec<String>, Vec<(usize, String)>, String, String), String> {
+        // Double-colon rules are not used for grouped targets, but handle gracefully
+        // by delegating — in practice grouped targets use single-colon rules.
+
+        let mut all_prereqs: Vec<String> = Vec::new();
+        let mut all_order_only: Vec<String> = Vec::new();
+        let mut se_prereq_texts: Vec<String> = Vec::new();
+        let mut se_order_only_texts: Vec<String> = Vec::new();
+        let mut recipe = Vec::new();
+        let mut recipe_source_file = String::new();
+
+        for rule in rules {
+            all_prereqs.extend(rule.prerequisites.clone());
+            all_order_only.extend(rule.order_only_prerequisites.clone());
+            if let Some(ref text) = rule.second_expansion_prereqs {
+                se_prereq_texts.push(text.clone());
+            }
+            if let Some(ref text) = rule.second_expansion_order_only {
+                se_order_only_texts.push(text.clone());
+            }
+            if !rule.recipe.is_empty() {
+                recipe = rule.recipe.clone();
+                recipe_source_file = rule.source_file.clone();
+            }
+        }
+
+        all_prereqs.retain(|p| p != ".WAIT");
+        all_order_only.retain(|p| p != ".WAIT");
+
+        let auto_var_prereqs: Vec<String> = all_prereqs.clone();
+        let auto_var_order_only: Vec<String> = all_order_only.clone();
+
+        let mut se_expanded_prereqs: Vec<String> = Vec::new();
+        let mut se_expanded_order_only: Vec<String> = Vec::new();
+
+        if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
+            let stem = rules.iter()
+                .find(|r| !r.static_stem.is_empty())
+                .map(|r| r.static_stem.clone())
+                .unwrap_or_default();
+            let oo_refs: Vec<&str> = auto_var_order_only.iter().map(|s| s.as_str()).collect();
+            let mut base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
+            let collected_target_vars = self.collect_target_vars(target);
+            self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut base_auto_vars);
+
+            for text in &se_prereq_texts {
+                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                se_expanded_prereqs.extend(normal);
+                se_expanded_order_only.extend(oo);
+            }
+            for text in &se_order_only_texts {
+                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                se_expanded_order_only.extend(normal);
+                se_expanded_order_only.extend(oo);
+            }
+        }
+
+        se_expanded_prereqs.retain(|p| p != ".WAIT");
+        se_expanded_order_only.retain(|p| p != ".WAIT");
+
+        let my_target_vars = self.collect_target_vars(target);
+        self.inherited_vars_stack.push(my_target_vars);
+
+        let mut any_prereq_rebuilt = false;
+        let mut prereq_errors = Vec::new();
+
+        for prereq in all_prereqs.clone() {
+            match self.build_target(&prereq) {
+                Ok(rebuilt) => {
+                    if rebuilt { any_prereq_rebuilt = true; }
+                }
+                Err(e) => {
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    } else {
+                        e
+                    };
+                    if self.keep_going {
+                        prereq_errors.push(propagated);
+                    } else {
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
+                }
+            }
+        }
+
+        for prereq in all_order_only.clone() {
+            let _ = self.build_target(&prereq);
+        }
+
+        for prereq in se_expanded_prereqs.clone() {
+            match self.build_target(&prereq) {
+                Ok(rebuilt) => {
+                    if rebuilt { any_prereq_rebuilt = true; }
+                }
+                Err(e) => {
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    } else {
+                        e
+                    };
+                    if self.keep_going {
+                        prereq_errors.push(propagated);
+                    } else {
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
+                }
+            }
+        }
+
+        for prereq in se_expanded_order_only.clone() {
+            let _ = self.build_target(&prereq);
+        }
+
+        all_prereqs.extend(se_expanded_prereqs);
+        all_order_only.extend(se_expanded_order_only);
+        all_prereqs.retain(|p| p != ".WAIT");
+        all_order_only.retain(|p| p != ".WAIT");
+
+        self.inherited_vars_stack.pop();
+
+        if !prereq_errors.is_empty() {
+            return Err(prereq_errors.join("\n"));
+        }
+
+        // If there is no recipe, try to find a matching pattern rule whose recipe
+        // can be used (same logic as build_with_rules).
+        let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
+            if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
+                let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
+                    .map(|p| p.replace('%', &stem))
+                    .collect();
+                let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
+                    .map(|p| p.replace('%', &stem))
+                    .collect();
+
+                if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
+                    let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                    let collected_target_vars = self.collect_target_vars(target);
+                    self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut pat_se_auto_vars);
+
+                    if let Some(ref text) = pattern_rule.second_expansion_prereqs {
+                        let stem_subst = text.replace('%', &stem);
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        pat_prereqs.extend(normal);
+                        pat_order_only.extend(oo);
+                    }
+                    if let Some(ref text) = pattern_rule.second_expansion_order_only {
+                        let stem_subst = text.replace('%', &stem);
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        pat_order_only.extend(normal);
+                        pat_order_only.extend(oo);
+                    }
+                }
+
+                let mut already_built: std::collections::HashSet<String> = all_prereqs.iter().cloned().collect();
+                let orig_explicit_prereqs = all_prereqs.clone();
+                all_prereqs.clear();
+                for prereq in &pat_prereqs {
+                    if !already_built.contains(prereq) {
+                        match self.build_target(prereq) {
+                            Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
+                            Err(e) => {
+                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                    let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                                    format!("{}, needed by '{}'.  Stop.", base, target)
+                                } else { e };
+                                if !self.keep_going {
+                                    return Err(propagated);
+                                }
+                            }
+                        }
+                        already_built.insert(prereq.clone());
+                    }
+                    all_prereqs.push(prereq.clone());
+                }
+                all_prereqs.extend(orig_explicit_prereqs);
+
+                for prereq in &pat_order_only {
+                    if !all_order_only.contains(prereq) {
+                        let _ = self.build_target(prereq);
+                        all_order_only.push(prereq.clone());
+                    }
+                }
+
+                (pattern_rule.recipe.clone(), pattern_rule.source_file.clone(), stem)
+            } else {
+                // No recipe and no matching pattern rule.
+                let stem = rules.iter()
+                    .find(|r| !r.static_stem.is_empty())
+                    .map(|r| r.static_stem.clone())
+                    .unwrap_or_default();
+                (recipe, recipe_source_file, stem)
+            }
+        } else {
+            let stem = rules.iter()
+                .find(|r| !r.static_stem.is_empty())
+                .map(|r| r.static_stem.clone())
+                .unwrap_or_default();
+            (recipe, recipe_source_file, stem)
+        };
+
+        Ok((any_prereq_rebuilt, all_prereqs, all_order_only, recipe, recipe_source_file, pattern_stem))
+    }
+
     /// Wrapper for grouped targets (&:): builds the primary target AND its siblings.
-    /// Siblings' prerequisites are built before the recipe runs, but only the primary
-    /// target's recipe executes (once). Siblings are then marked as built.
+    /// For GNU Make grouped targets:
+    ///   1. Primary target's prerequisites (including SE) are built first.
+    ///   2. Each sibling's prerequisites (including SE) are built next.
+    ///   3. Recipe runs ONCE with primary target's auto vars.
+    ///   4. All siblings are marked as built.
     fn build_with_rules_grouped(
         &mut self,
         target: &str,
@@ -631,26 +853,64 @@ impl<'a> Executor<'a> {
             .filter_map(|s| self.db.rules.get(s).cloned().map(|r| (s.clone(), r)))
             .collect();
 
-        // Build the primary target's prerequisites (via normal path).
-        // We intercept the recipe-running step by temporarily:
-        //   1. Build primary target's prereqs (via build_with_rules)
-        //   2. Build each sibling's prereqs only (not recipe)
-        //   3. Return the primary result and mark siblings as built
+        // Phase 1: build primary target's prerequisites (the SE expansion + prereq build
+        // for the primary target). We get back (needs_rebuild, all_prereqs, all_order_only,
+        // recipe, recipe_source, pattern_stem).
+        let primary_result = self.build_with_rules_prereqs(target, rules, is_phony);
+        let (any_prereq_rebuilt, all_prereqs, all_order_only, recipe, recipe_source_file, pattern_stem) = match primary_result {
+            Err(e) => {
+                // Mark siblings as failed
+                for (sibling, _) in &sibling_rules {
+                    self.built.insert(sibling.clone(), false);
+                }
+                return Err(e);
+            }
+            Ok(parts) => parts,
+        };
 
-        // For grouped targets, the full build_with_rules handles the primary target.
-        // We need to build sibling prereqs BEFORE the recipe runs.
-        // The simplest correct approach: build sibling prereqs inline here,
-        // then call build_with_rules for the primary (it will run the recipe once).
-
-        // Build each sibling's prerequisites (without running their recipe).
+        // Phase 2: build each sibling's prerequisites only.
         for (sibling, s_rules) in &sibling_rules {
             self.build_sibling_prereqs_only(sibling, s_rules);
         }
 
-        // Now build the primary target (this runs its prereqs again if needed, then recipe).
-        let result = self.build_with_rules(target, rules, is_phony);
+        // Phase 3: determine if we need to rebuild and run the recipe.
+        let needs_rebuild = if self.always_make || is_phony {
+            true
+        } else {
+            self.needs_rebuild(target, &all_prereqs, any_prereq_rebuilt)
+        };
 
-        // Mark all siblings as built with the same result value.
+        if !needs_rebuild {
+            // Mark siblings as not rebuilt.
+            for (sibling, _) in &sibling_rules {
+                self.built.insert(sibling.clone(), false);
+            }
+            return Ok(false);
+        }
+
+        let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+        let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
+        let collected_target_vars = self.collect_target_vars(target);
+        self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
+
+        if self.question {
+            let has_real_cmds = self.recipe_has_real_commands(&recipe, &auto_vars);
+            if has_real_cmds {
+                self.question_out_of_date = true;
+            }
+            let rebuilt = has_real_cmds;
+            for (sibling, _) in &sibling_rules {
+                self.built.insert(sibling.clone(), rebuilt);
+            }
+            return Ok(rebuilt);
+        }
+
+        self.target_extra_exports = self.compute_target_exports(target);
+        self.target_extra_unexports = self.compute_target_unexports(target);
+        let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
+        self.target_extra_exports.clear();
+        self.target_extra_unexports.clear();
+
         let rebuilt = result.as_ref().copied().unwrap_or(false);
         for (sibling, _) in &sibling_rules {
             self.built.insert(sibling.clone(), rebuilt);
@@ -1037,7 +1297,7 @@ impl<'a> Executor<'a> {
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
                                 || self.find_in_vpath(&resolved).is_some();
                             if !ok {
-                                if self.db.explicitly_mentioned.contains(&resolved)
+                                if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
                                 {
                                     found_compat = true;
@@ -1079,7 +1339,7 @@ impl<'a> Executor<'a> {
                                 || self.find_pattern_rule_exists(&resolved)
                                 || self.find_in_vpath(&resolved).is_some();
                             if !ok {
-                                if self.db.explicitly_mentioned.contains(&resolved)
+                                if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
                                 {
                                     found_compat = true;
@@ -1352,18 +1612,53 @@ impl<'a> Executor<'a> {
                             if !is_override && existing_is_override {
                                 // Skip this non-override append.
                             } else {
-                                let rhs = expand_imm(&self.state, &var.value);
-                                let base = get_staging_val(&staging, &staging_idx, var_name)
-                                    .or_else(|| get_global_val(&self.state, var_name))
-                                    .unwrap_or_default();
-                                let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                                // Determine if the base is simple (already expanded) or recursive.
+                                // For recursive base: keep result recursive (don't expand rhs yet).
+                                // For simple base: expand rhs immediately with staging context.
+                                let base_is_expanded = staging_idx.get(var_name)
+                                    .map(|&i| staging[i].2)
+                                    .unwrap_or_else(|| {
+                                        // Check global var flavor
+                                        self.db.variables.get(var_name)
+                                            .map(|v| v.flavor == VarFlavor::Simple)
+                                            .unwrap_or(false)
+                                    });
                                 let new_is_override = is_override || existing_is_override;
-                                if let Some(&i) = staging_idx.get(var_name) {
-                                    staging[i] = (var_name.to_string(), val, true, new_is_override, VarFlavor::Append);
+                                if base_is_expanded {
+                                    // Simple base: expand rhs with staging context for
+                                    // correct target-specific var references.
+                                    let staging_ctx: HashMap<String, String> = staging.iter()
+                                        .filter(|(_, _, is_exp, _, _)| *is_exp)
+                                        .map(|(n, v, _, _, _)| (n.clone(), v.clone()))
+                                        .collect();
+                                    let rhs = self.state.expand_with_auto_vars(&var.value, &staging_ctx);
+                                    let base = get_staging_val(&staging, &staging_idx, var_name)
+                                        .or_else(|| self.db.variables.get(var_name).map(|v| v.value.clone()))
+                                        .unwrap_or_default();
+                                    let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                                    if let Some(&i) = staging_idx.get(var_name) {
+                                        staging[i] = (var_name.to_string(), val, true, new_is_override, VarFlavor::Append);
+                                    } else {
+                                        let idx = staging.len();
+                                        staging.push((var_name.to_string(), val, true, new_is_override, VarFlavor::Append));
+                                        staging_idx.insert(var_name.to_string(), idx);
+                                    }
                                 } else {
-                                    let idx = staging.len();
-                                    staging.push((var_name.to_string(), val, true, new_is_override, VarFlavor::Append));
-                                    staging_idx.insert(var_name.to_string(), idx);
+                                    // Recursive base: keep result recursive.
+                                    // Get raw (unexpanded) base value from staging or global.
+                                    let base_raw = staging_idx.get(var_name)
+                                        .map(|&i| staging[i].1.clone())
+                                        .or_else(|| self.db.variables.get(var_name).map(|v| v.value.clone()))
+                                        .unwrap_or_default();
+                                    let rhs_raw = &var.value;
+                                    let val = if base_raw.is_empty() { rhs_raw.clone() } else { format!("{} {}", base_raw, rhs_raw) };
+                                    if let Some(&i) = staging_idx.get(var_name) {
+                                        staging[i] = (var_name.to_string(), val, false, new_is_override, VarFlavor::Recursive);
+                                    } else {
+                                        let idx = staging.len();
+                                        staging.push((var_name.to_string(), val, false, new_is_override, VarFlavor::Recursive));
+                                        staging_idx.insert(var_name.to_string(), idx);
+                                    }
                                 }
                             }
                         }

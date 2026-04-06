@@ -1251,9 +1251,11 @@ impl MakeState {
         // This prevents targets that appear as prereqs from being considered intermediate.
         for prereq in &rule.prerequisites {
             self.db.explicitly_mentioned.insert(prereq.clone());
+            self.db.explicit_dep_names.insert(prereq.clone());
         }
         for prereq in &rule.order_only_prerequisites {
             self.db.explicitly_mentioned.insert(prereq.clone());
+            self.db.explicit_dep_names.insert(prereq.clone());
         }
 
         // Register explicit rules

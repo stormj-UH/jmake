@@ -246,6 +246,11 @@ pub struct MakeDatabase {
     /// - Literal (non-% containing) prerequisites of pattern rules
     /// Targets built by implicit rules are NOT intermediate if they appear here.
     pub explicitly_mentioned: HashSet<String>,
+    /// Prerequisites of explicit (non-pattern) rules only.
+    /// Used for the "compat rule" check in implicit rule search: a prereq is
+    /// "compat-eligible" only if it is mentioned in an explicit rule's dep list
+    /// (not just as a literal dep of a pattern rule).
+    pub explicit_dep_names: HashSet<String>,
     /// Names of variables that were originally imported from the process environment.
     /// Even if overridden by the Makefile, these are still exported to child processes.
     pub env_var_names: HashSet<String>,
@@ -290,6 +295,7 @@ impl MakeDatabase {
             pattern_specific_vars: Vec::new(),
             builtin_pattern_rules_count: 0,
             explicitly_mentioned: HashSet::new(),
+            explicit_dep_names: HashSet::new(),
         }
     }
 
