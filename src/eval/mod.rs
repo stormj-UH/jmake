@@ -671,7 +671,7 @@ impl MakeState {
                 // If so, handle value expansion based on flavor.
                 let trimmed = line.trim();
                 if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
-                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_private: raw_is_private, target: raw_target } = raw_parsed {
+                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: _, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple => {
                                 // Immediate expansion: expand the whole line
@@ -894,7 +894,7 @@ impl MakeState {
                         sib.recipe.push((lineno, recipe.clone()));
                     }
                 }
-                ParsedLine::VariableAssignment { name, value, flavor, is_override, is_export, is_private, target } => {
+                ParsedLine::VariableAssignment { name, value, flavor, is_override, is_export, is_unexport, is_private, target } => {
                     if let Some(prev) = current_rule.take() {
                         for sib in &mut static_rule_siblings {
                             sib.recipe = prev.recipe.clone();
@@ -916,6 +916,11 @@ impl MakeState {
                                 // Pattern-specific variable: stored separately for lookup at build time
                                 let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
                                 var.is_private = is_private;
+                                if is_export {
+                                    var.export = Some(true);
+                                } else if is_unexport {
+                                    var.export = Some(false);
+                                }
                                 self.db.pattern_specific_vars.push(PatternSpecificVar {
                                     pattern: t,
                                     var_name: name.clone(),
@@ -927,6 +932,11 @@ impl MakeState {
                                 // to support multiple += entries for the same variable.
                                 let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
                                 var.is_private = is_private;
+                                if is_export {
+                                    var.export = Some(true);
+                                } else if is_unexport {
+                                    var.export = Some(false);
+                                }
                                 let rules = self.db.rules.entry(t.clone()).or_insert_with(Vec::new);
                                 // Add to all rules for this target
                                 for r in rules.iter_mut() {
@@ -1127,7 +1137,16 @@ impl MakeState {
                     SpecialTarget::Wait => {
                         // .WAIT is a synchronization marker in dependency lists.
                         // It has no prerequisites and no special database state.
-                        // Just register it so it's recognized and not treated as a real target.
+                        // Warn if .WAIT has prerequisites or a recipe.
+                        if !rule.prerequisites.is_empty() {
+                            eprintln!("{}:{}: .WAIT should not have prerequisites",
+                                rule.source_file, rule.lineno);
+                        }
+                        if !rule.recipe.is_empty() {
+                            let recipe_lineno = rule.recipe.first().map(|(l, _)| *l).unwrap_or(rule.lineno);
+                            eprintln!("{}:{}: .WAIT should not have commands",
+                                rule.source_file, recipe_lineno);
+                        }
                     }
                     SpecialTarget::ExportAllVariables => {
                         // .EXPORT_ALL_VARIABLES: causes all variables to be exported
@@ -1354,8 +1373,10 @@ impl MakeState {
         // (Override origin).  This mirrors GNU Make behaviour where `override`
         // protects a variable from subsequent non-override file assignments as
         // well as from command-line assignments.
-        let is_protected = |orig: &VarOrigin| {
+        let env_overrides = self.args.environment_overrides;
+        let is_protected = move |orig: &VarOrigin| {
             matches!(orig, VarOrigin::CommandLine | VarOrigin::Override)
+                || (env_overrides && matches!(orig, VarOrigin::Environment))
         };
 
         // MAKEFLAGS is special: with -e, the makefile cannot change it.
@@ -1480,6 +1501,10 @@ impl MakeState {
             .collect();
         self.args.include_dirs = deduped_dirs;
         self.include_dirs = self.args.include_dirs.clone();
+
+        // Deduplicate debug flags (same issue: cmdline --debug=b + MAKEFLAGS --debug=b → duplicates).
+        let mut seen_debug: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.args.debug.retain(|d| seen_debug.insert(d.clone()));
 
         // Deduplicate variables (keep last occurrence: cmdline beat env since cmdline is added last).
         let mut seen_var_names: std::collections::HashSet<String> = std::collections::HashSet::new();

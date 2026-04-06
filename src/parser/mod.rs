@@ -191,10 +191,44 @@ impl Parser {
         }
 
         // define directive (also handles "override define" and "export define")
-        if effective.starts_with("define ") || effective == "define"
+        // BUT: "define = value" or "define := value" etc. is a regular variable assignment
+        // where the variable name happens to be "define". If the first token after "define"
+        // is itself an assignment operator, treat as a regular variable assignment.
+        let is_define_directive = (effective.starts_with("define ") || effective == "define"
             || effective.starts_with("override define ")
-            || effective.starts_with("export define ")
-        {
+            || effective.starts_with("export define "))
+            && {
+                // After stripping "define" (and optional override/export prefix),
+                // check if what remains starts with an assignment operator (no variable name).
+                let rest = if effective.starts_with("override define ") {
+                    effective.strip_prefix("override define ").unwrap_or("").trim()
+                } else if effective.starts_with("export define ") {
+                    effective.strip_prefix("export define ").unwrap_or("").trim()
+                } else {
+                    effective.strip_prefix("define").unwrap_or("").trim()
+                };
+                // If rest starts with a pure assignment operator, not a define directive
+                let assignment_ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
+                let starts_with_op = assignment_ops.iter().any(|op| {
+                    rest.starts_with(op) && (rest.len() == op.len()
+                        || rest[op.len()..].starts_with(' ')
+                        || rest[op.len()..].starts_with('\t')
+                        || rest[op.len()..].starts_with('\n'))
+                });
+                // If rest (the part after "define") starts with ':' not followed by '=' or ':',
+                // it's a rule like "define : recipe", not a define directive.
+                // But note: rest here is the part AFTER the "define" keyword AND any variable name.
+                // When the full line is "define : recipe", rest after stripping "define" is ": recipe",
+                // so we check if the stripped rest starts with a rule colon.
+                // However, rest could also be "VAR_NAME" or "VAR_NAME =", so we only trigger this
+                // when rest itself starts with ':' (meaning there's no variable name, just a colon).
+                let starts_with_rule_colon = rest.starts_with(':')
+                    && !rest.starts_with(":=")
+                    && !rest.starts_with("::=")
+                    && !rest.starts_with(":::=");
+                !starts_with_op && !starts_with_rule_colon
+            };
+        if is_define_directive {
             return parse_define_start(&effective);
         }
 
@@ -310,11 +344,12 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
             if let Some(colon_pos) = name.find(':') {
                 let potential_target = name[..colon_pos].trim();
                 let raw_var_part = name[colon_pos+1..].trim();
-                // Strip override/export/private prefixes from the variable part
-                let (inner_override, inner_export, inner_private, potential_var) =
+                // Strip override/export/unexport/private prefixes from the variable part
+                let (inner_override, inner_export, inner_unexport, inner_private, potential_var) =
                     strip_var_prefixes(raw_var_part);
                 let effective_override = is_override || inner_override;
                 let effective_export = is_export || inner_export;
+                let effective_unexport = inner_unexport;
                 let effective_private = is_private || inner_private;
                 if !potential_target.is_empty() && !potential_var.is_empty()
                     && !potential_var.contains('/')
@@ -328,6 +363,7 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                         flavor,
                         is_override: effective_override,
                         is_export: effective_export,
+                        is_unexport: effective_unexport,
                         is_private: effective_private,
                         target: Some(potential_target.to_string()),
                     });
@@ -353,6 +389,7 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                 flavor,
                 is_override,
                 is_export,
+                is_unexport: false,
                 is_private,
                 target: None,
             });
@@ -460,8 +497,8 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     for op in &ops {
         if let Some(pos) = find_assignment_op(prereq_part.trim(), op) {
             let raw_var_name = prereq_part.trim()[..pos].trim();
-            // Strip override/export/private prefixes from the variable name
-            let (is_override, is_export, is_private, var_name) = strip_var_prefixes(raw_var_name);
+            // Strip override/export/unexport/private prefixes from the variable name
+            let (is_override, is_export, is_unexport, is_private, var_name) = strip_var_prefixes(raw_var_name);
             let var_value = prereq_part.trim()[pos + op.len()..].trim_start().to_string();
             if !var_name.is_empty() && is_valid_variable_name(var_name) {
                 let flavor = match *op {
@@ -478,6 +515,7 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
                     flavor,
                     is_override,
                     is_export,
+                    is_unexport,
                     is_private,
                     target: Some(targets_str.to_string()),
                 });
@@ -790,13 +828,15 @@ fn is_valid_variable_name(name: &str) -> bool {
         && !name.contains('#')
 }
 
-/// Strip leading override/export/private prefixes from a variable name token.
-/// Returns (is_override, is_export, is_private, remaining_name).
-/// E.g. "override FOO" → (true, false, false, "FOO")
-///      "export override BAR" → (true, true, false, "BAR")
-pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, &str) {
+/// Strip leading override/export/unexport/private prefixes from a variable name token.
+/// Returns (is_override, is_export, is_unexport, is_private, remaining_name).
+/// E.g. "override FOO" → (true, false, false, false, "FOO")
+///      "export override BAR" → (true, true, false, false, "BAR")
+///      "unexport BAZ" → (false, false, true, false, "BAZ")
+pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, bool, &str) {
     let mut is_override = false;
     let mut is_export = false;
+    let mut is_unexport = false;
     let mut is_private = false;
     let mut rest = s.trim();
     loop {
@@ -804,6 +844,14 @@ pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, &str) {
             // Must be followed by whitespace or end of string (word boundary check)
             if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
                 is_override = true;
+                rest = r.trim_start();
+                continue;
+            }
+        }
+        // Check 'unexport' before 'export' to avoid prefix match issues
+        if let Some(r) = rest.strip_prefix("unexport") {
+            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
+                is_unexport = true;
                 rest = r.trim_start();
                 continue;
             }
@@ -824,7 +872,7 @@ pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, &str) {
         }
         break;
     }
-    (is_override, is_export, is_private, rest)
+    (is_override, is_export, is_unexport, is_private, rest)
 }
 
 pub fn split_words(s: &str) -> Vec<String> {

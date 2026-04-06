@@ -234,6 +234,10 @@ pub fn parse_args() -> MakeArgs {
                         result.load_average = s[eq+1..].parse().ok();
                     }
                 }
+                // Silently ignore options that GNU Make supports but jmake does not implement
+                s if s.starts_with("--shuffle") || s == "--no-keep-going" || s == "--sync-output" || s.starts_with("--output-sync") => {
+                    // Accepted but not implemented
+                }
                 _ => {
                     eprintln!("jmake: Unknown option '{}'", arg);
                 }

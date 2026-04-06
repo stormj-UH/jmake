@@ -277,6 +277,7 @@ pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
                 flavor,
                 is_override: false,
                 is_export: true,
+                is_unexport: false,
                 is_private: false,
                 target: None,
             };

@@ -170,6 +170,7 @@ pub enum ParsedLine {
         flavor: VarFlavor,
         is_override: bool,
         is_export: bool,
+        is_unexport: bool,
         is_private: bool,
         target: Option<String>,
     },
