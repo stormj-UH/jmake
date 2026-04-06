@@ -55,9 +55,13 @@ pub struct Rule {
     pub is_pattern: bool,
     pub is_double_colon: bool,
     pub is_terminal: bool, // pattern rule with no recipe terminates chain
-    pub target_specific_vars: IndexMap<String, Variable>,
+    /// Target-specific variable assignments, stored as a list to support
+    /// multiple += entries for the same variable name.
+    pub target_specific_vars: Vec<(String, Variable)>,
     /// The makefile file path where this rule was defined
     pub source_file: String,
+    /// Line number in the makefile where this rule was defined
+    pub lineno: usize,
     /// The stem computed when this rule was derived from a static pattern rule.
     /// Empty for rules that are not from static pattern rules, or for pattern
     /// rules (where the stem is computed at build time).
@@ -70,6 +74,10 @@ pub struct Rule {
     pub second_expansion_prereqs: Option<String>,
     /// Raw (post-first-expansion) order-only prerequisite text for second expansion.
     pub second_expansion_order_only: Option<String>,
+    /// For grouped target rules (`targets &: prereqs`): the other target names
+    /// in the group (excluding this rule's own target).  When this rule is built,
+    /// all grouped siblings are also built.  Empty for non-grouped rules.
+    pub grouped_siblings: Vec<String>,
 }
 
 impl Rule {
@@ -82,11 +90,13 @@ impl Rule {
             is_pattern: false,
             is_double_colon: false,
             is_terminal: false,
-            target_specific_vars: IndexMap::new(),
+            target_specific_vars: Vec::new(),
             source_file: String::new(),
+            lineno: 0,
             static_stem: String::new(),
             second_expansion_prereqs: None,
             second_expansion_order_only: None,
+            grouped_siblings: Vec::new(),
         }
     }
 }

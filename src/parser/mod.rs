@@ -395,13 +395,23 @@ fn find_assignment_op(line: &str, op: &str) -> Option<usize> {
 pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     // Find the colon that separates targets from prerequisites.
     // Handles: target: prereqs, target:: prereqs (double-colon),
+    //          target&: prereqs (grouped targets, GNU Make 4.3+),
     //          and static pattern rules: targets: target-pattern: prereq-patterns
     //          (and their double-colon variants).
 
     let colon_pos = find_rule_colon(line)?;
     let is_double_colon = line[colon_pos..].starts_with("::");
 
-    let targets_str = line[..colon_pos].trim();
+    // Check for grouped-target syntax: targets end with & before the colon.
+    // "15.x 1.x&: prereqs" means both targets are grouped.
+    // Strip the & from the targets string.
+    let raw_targets_str = line[..colon_pos].trim();
+    let (targets_str, _is_grouped) = if raw_targets_str.ends_with('&') {
+        (&raw_targets_str[..raw_targets_str.len()-1], true)
+    } else {
+        (raw_targets_str, false)
+    };
+
     let rest = if is_double_colon {
         &line[colon_pos+2..]
     } else {
@@ -494,11 +504,18 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     };
 
     let mut rule = Rule::new();
-    rule.targets = targets;
+    rule.targets = targets.clone();
     rule.prerequisites = prereqs;
     rule.order_only_prerequisites = order_only;
     rule.is_pattern = is_pattern;
     rule.is_double_colon = is_double_colon;
+    // For grouped targets (`&:`), compute grouped_siblings = all targets except this one.
+    // We store all targets here; register_rule will split them per target with proper siblings.
+    // We re-use `grouped_siblings` as a temporary "all targets" store; register_rule converts it.
+    if _is_grouped && targets.len() > 1 {
+        // Store ALL targets in grouped_siblings (register_rule will remove the self target).
+        rule.grouped_siblings = targets;
+    }
     // Store the raw (unsplit) prerequisite text for second expansion, but ONLY
     // when the text contains '$' (i.e., has deferred variable references that
     // need build-time re-expansion).  Plain prereqs like "bar baz" need no SE.

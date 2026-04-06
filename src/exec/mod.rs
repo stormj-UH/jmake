@@ -38,6 +38,8 @@ pub struct Executor<'a> {
     intermediate_built: HashSet<String>,
     /// Top-level targets (not subject to intermediate deletion even if .INTERMEDIATE).
     top_level_targets: HashSet<String>,
+    /// Targets/files marked as "infinitely new" via -W/--what-if.
+    what_if: Vec<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -56,6 +58,7 @@ impl<'a> Executor<'a> {
         always_make: bool,
         trace: bool,
         progname: String,
+        what_if: Vec<String>,
     ) -> Self {
         Executor {
             db,
@@ -79,6 +82,7 @@ impl<'a> Executor<'a> {
             any_recipe_ran: false,
             intermediate_built: HashSet::new(),
             top_level_targets: HashSet::new(),
+            what_if,
         }
     }
 
@@ -187,10 +191,29 @@ impl<'a> Executor<'a> {
         let rules = self.db.rules.get(target).cloned();
         let is_phony = self.db.is_phony(target);
 
+        // Collect any grouped siblings for this target.
+        // Grouped targets (&:) are built together: when any one is built, all
+        // siblings are also built (each with their own SE expansion context).
+        let grouped_siblings: Vec<String> = if let Some(ref rules) = rules {
+            rules.iter()
+                .flat_map(|r| r.grouped_siblings.iter().cloned())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .filter(|s| !self.built.contains_key(s.as_str()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // If we have explicit rules
         if let Some(rules) = &rules {
             if !rules.is_empty() {
-                return self.build_with_rules(target, rules, is_phony);
+                let result = self.build_with_rules(target, rules, is_phony);
+                // After building this grouped target, also build all siblings.
+                for sibling in &grouped_siblings {
+                    let _ = self.build_target(sibling);
+                }
+                return result;
             }
         }
 
@@ -206,6 +229,12 @@ impl<'a> Executor<'a> {
 
         // Try VPATH
         if let Some(found) = self.find_in_vpath(target) {
+            return Ok(false);
+        }
+
+        // A phony target with no recipe and no file is still "successfully built" - it's
+        // a no-op target. This allows .PHONY targets without recipes to be prerequisites.
+        if is_phony {
             return Ok(false);
         }
 
@@ -227,7 +256,9 @@ impl<'a> Executor<'a> {
     }
 
     /// Perform second expansion of a raw prerequisite text string.
-    /// Returns the list of prerequisite names after expansion and splitting.
+    /// Returns `(normal_prereqs, order_only_prereqs)` after expansion and splitting.
+    /// `|` in the expanded result separates normal prereqs from order-only prereqs.
+    /// `.WAIT` markers are filtered from both lists.
     /// `base_auto_vars` contains the automatic variables computed from the
     /// non-SE prerequisites ($@, $<, $^, $+, $*, $|).
     fn second_expand_prereqs(
@@ -235,14 +266,24 @@ impl<'a> Executor<'a> {
         raw_text: &str,
         base_auto_vars: &HashMap<String, String>,
         target: &str,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         // Expand the raw text using auto vars (second expansion).
         let expanded = self.state.expand_with_auto_vars(raw_text, base_auto_vars);
-        // Split the expanded result by whitespace.
-        expanded.split_whitespace()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
+        // Split on whitespace, handle '|' as separator for order-only prereqs.
+        let mut normal = Vec::new();
+        let mut order_only = Vec::new();
+        let mut is_order_only = false;
+        for token in expanded.split_whitespace() {
+            if token.is_empty() { continue; }
+            if token == "|" { is_order_only = true; continue; }
+            if token == ".WAIT" { continue; } // filter .WAIT markers
+            if is_order_only {
+                order_only.push(token.to_string());
+            } else {
+                normal.push(token.to_string());
+            }
+        }
+        (normal, order_only)
     }
 
     fn build_with_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
@@ -284,6 +325,10 @@ impl<'a> Executor<'a> {
                 recipe_source_file = rule.source_file.clone();
             }
         }
+
+        // Filter .WAIT markers early so they don't appear in auto vars ($^, $<, $+, $|).
+        all_prereqs.retain(|p| p != ".WAIT");
+        all_order_only.retain(|p| p != ".WAIT");
 
         // Build the auto-var set from the non-SE prereqs collected above.
         // This is used to compute $<, $^, $+ for second expansion.
@@ -330,6 +375,10 @@ impl<'a> Executor<'a> {
         all_prereqs.extend(se_expanded_prereqs);
         all_order_only.extend(se_expanded_order_only);
 
+        // Filter out .WAIT markers - they are synchronization hints, not real targets
+        all_prereqs.retain(|p| p != ".WAIT");
+        all_order_only.retain(|p| p != ".WAIT");
+
         // Build prerequisites
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
@@ -374,15 +423,56 @@ impl<'a> Executor<'a> {
         let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule(target) {
                 // Add the pattern rule's prerequisites/order-only to our lists and build them.
-                let pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
+                let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
                     .map(|p| p.replace('%', &stem))
                     .collect();
-                let pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
+                let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
                     .map(|p| p.replace('%', &stem))
                     .collect();
 
+                // Handle second expansion for the pattern rule.
+                // Auto vars are built from the ALREADY-accumulated explicit prereqs
+                // (all_prereqs at this point), giving $+ the value from the explicit
+                // rule(s) - which is what GNU Make uses for $+ in SE pattern rules.
+                if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
+                    let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                    let collected_target_vars = self.collect_target_vars(target);
+                    self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut pat_se_auto_vars);
+
+                    if let Some(ref text) = pattern_rule.second_expansion_prereqs {
+                        let stem_subst = text.replace('%', &stem);
+                        let expanded = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        for p in expanded {
+                            if !p.is_empty() {
+                                pat_prereqs.push(p);
+                            }
+                        }
+                    }
+                    if let Some(ref text) = pattern_rule.second_expansion_order_only {
+                        let stem_subst = text.replace('%', &stem);
+                        let expanded = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        for p in expanded {
+                            if !p.is_empty() {
+                                pat_order_only.push(p);
+                            }
+                        }
+                    }
+                }
+
+                // Build each unique pattern-rule prereq once, but add ALL occurrences
+                // (including duplicates) to all_prereqs so that $+ is computed correctly.
+                // The pattern rule's prereqs are prepended so they come first in $^/$+.
+                let mut already_built: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Also collect which prereqs were already in all_prereqs before pattern rule.
+                for p in &all_prereqs {
+                    already_built.insert(p.clone());
+                }
+                // Prepend pattern rule prereqs: they come first (pattern rule is primary).
+                let orig_explicit_prereqs = all_prereqs.clone();
+                all_prereqs.clear();
                 for prereq in &pat_prereqs {
-                    if !all_prereqs.contains(prereq) {
+                    if !already_built.contains(prereq) {
                         match self.build_target(prereq) {
                             Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
                             Err(e) => {
@@ -399,9 +489,13 @@ impl<'a> Executor<'a> {
                                 }
                             }
                         }
-                        all_prereqs.push(prereq.clone());
+                        already_built.insert(prereq.clone());
                     }
+                    all_prereqs.push(prereq.clone());
                 }
+                // Append original explicit rule prereqs after pattern rule prereqs.
+                all_prereqs.extend(orig_explicit_prereqs);
+
                 for prereq in &pat_order_only {
                     if !all_order_only.contains(prereq) {
                         let _ = self.build_target(prereq);
@@ -434,11 +528,6 @@ impl<'a> Executor<'a> {
             return Ok(false);
         }
 
-        if self.question {
-            self.question_out_of_date = true;
-            return Ok(true);
-        }
-
         // Set up automatic variables.
         let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
         let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
@@ -448,8 +537,19 @@ impl<'a> Executor<'a> {
         let collected_target_vars = self.collect_target_vars(target);
         self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
 
+        if self.question {
+            // In question mode: expand the recipe and run make-function side-effects,
+            // but don't execute any shell commands. A target is considered "out of date"
+            // only if real shell commands would run (not just make-functions like $(info)).
+            let has_real_cmds = self.recipe_has_real_commands(&recipe, &auto_vars);
+            if has_real_cmds {
+                self.question_out_of_date = true;
+            }
+            return Ok(has_real_cmds);
+        }
+
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
-        // Track if this is an intermediate target that was built
+        // Track if this is an intermediate target that was built.
         if let Ok(true) = &result {
             if self.db.is_intermediate(target) {
                 self.intermediate_built.insert(target.to_string());
@@ -557,11 +657,6 @@ impl<'a> Executor<'a> {
                 continue;
             }
 
-            if self.question {
-                self.question_out_of_date = true;
-                return Ok(true);
-            }
-
             let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
             let stem = if rule.static_stem.is_empty() { "" } else { &rule.static_stem };
             let mut auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
@@ -570,8 +665,19 @@ impl<'a> Executor<'a> {
             let collected_target_vars = self.collect_target_vars(target);
             self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
 
+            if self.question {
+                // In question mode: check if real shell commands would run.
+                let has_real_cmds = self.recipe_has_real_commands(&rule.recipe, &auto_vars);
+                if has_real_cmds {
+                    self.question_out_of_date = true;
+                    return Ok(true);
+                }
+                // Only make-functions would run; not "out of date" for shell work.
+                continue;
+            }
+
             match self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony) {
-                Ok(_) => { any_rebuilt = true; }
+                Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
                 Err(e) => {
                     if self.keep_going {
                         // continue to next double-colon rule
@@ -661,11 +767,6 @@ impl<'a> Executor<'a> {
             return Ok(false);
         }
 
-        if self.question {
-            self.question_out_of_date = true;
-            return Ok(true);
-        }
-
         let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
         let mut auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
 
@@ -673,17 +774,39 @@ impl<'a> Executor<'a> {
         let collected_target_vars = self.collect_target_vars(target);
         self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
 
+        if self.question {
+            // In question mode: check if real shell commands would run.
+            let has_real_cmds = self.recipe_has_real_commands(&rule.recipe, &auto_vars);
+            if has_real_cmds {
+                self.question_out_of_date = true;
+                return Ok(true);
+            }
+            // Only make-functions would run; not out-of-date in terms of shell work.
+            if !self.any_recipe_ran { self.any_recipe_ran = true; }
+            return Ok(true);
+        }
+
         let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
         // Track if this is an intermediate target that was built via pattern rule.
-        // Targets built by implicit rules are potentially intermediate.
+        // Targets built by implicit rules are potentially intermediate UNLESS they are:
+        // 1. Top-level targets
+        // 2. Explicitly mentioned in the makefile (as target or prereq of any rule)
+        // 3. Marked .PRECIOUS
+        // 4. Marked .NOTINTERMEDIATE
+        // 5. Marked .SECONDARY
         if let Ok(true) = &result {
             if self.db.is_intermediate(target) {
+                // Explicitly marked .INTERMEDIATE
                 self.intermediate_built.insert(target.to_string());
-            } else if !self.db.is_precious(target) && !self.db.is_notintermediate(target) {
-                // Targets built by implicit (pattern) rules are implicitly intermediate
-                // unless they are explicitly mentioned (top-level, precious, or .NOTINTERMEDIATE).
-                // Only mark as intermediate if it's a dependency (not top-level).
-                if !self.top_level_targets.contains(target) {
+            } else if !self.db.is_precious(target)
+                && !self.db.is_notintermediate(target)
+                && !self.db.is_secondary(target)
+            {
+                // Only mark as intermediate if the target is NOT explicitly mentioned
+                // in the makefile and NOT a top-level target.
+                let is_explicit = self.top_level_targets.contains(target)
+                    || self.db.is_explicitly_mentioned(target);
+                if !is_explicit {
                     self.intermediate_built.insert(target.to_string());
                 }
             }
@@ -692,19 +815,77 @@ impl<'a> Executor<'a> {
     }
 
     fn find_pattern_rule(&self, target: &str) -> Option<(Rule, String)> {
-        // Iterate in REVERSE order: user-defined rules are appended after built-in
-        // implicit rules, so reversing gives user rules the highest priority.
-        // This matches GNU Make's behaviour where user rules override built-ins.
+        // GNU Make implicit rule search uses two passes:
+        //
+        // Pass 1 ("without building"): Find a rule where ALL stem-substituted prerequisites
+        //   are immediately satisfiable: they exist on the filesystem, are in VPATH,
+        //   "ought to exist" (are explicit targets or phony), OR have empty prereqs.
+        //
+        // Pass 2 ("can be built"): Find a rule where all prereqs can be satisfied,
+        //   including by building them via other implicit rules (chaining).
+        //
+        // In both passes, iterate in REVERSE to give user-defined rules priority
+        // over built-in rules (built-ins are at the front of pattern_rules).
+        //
+        // Match-anything rules (pattern == "%") are only applied when the target
+        // is explicitly mentioned in the makefile (has an explicit rule, or is
+        // mentioned as a prereq in any rule).
+
+        let is_match_anything = |pattern: &str| pattern == "%";
+
+        // Pass 1: all prereqs immediately satisfiable (no building needed)
         for rule in self.db.pattern_rules.iter().rev() {
             if rule.recipe.is_empty() && !rule.is_terminal {
-                continue; // Skip pattern rules with no recipe (canceling rules)
+                continue; // Skip canceling rules
             }
             for pattern_target in &rule.targets {
                 if let Some(stem) = match_pattern(pattern_target, target) {
-                    // Check if prerequisites can be satisfied.
-                    // For rules with no explicit prerequisites (including SE rules where
-                    // prereqs were cleared and will be expanded at build time), treat
-                    // as satisfiable — the recipe exists and will run.
+                    // Match-anything rules: only apply to explicitly mentioned targets
+                    if is_match_anything(pattern_target) {
+                        if !self.db.is_explicitly_mentioned(target)
+                            && !Path::new(target).exists()
+                            && self.find_in_vpath(target).is_none()
+                        {
+                            continue;
+                        }
+                    }
+
+                    let prereqs_ok = if rule.prerequisites.is_empty() {
+                        true
+                    } else {
+                        rule.prerequisites.iter().all(|p| {
+                            let resolved = p.replace('%', &stem);
+                            // Immediately satisfiable: exists, in VPATH, ought to exist (phony or explicit target)
+                            Path::new(&resolved).exists()
+                                || self.db.is_phony(&resolved)
+                                || self.db.rules.contains_key(&resolved)
+                                || self.find_in_vpath(&resolved).is_some()
+                        })
+                    };
+                    if prereqs_ok {
+                        return Some((rule.clone(), stem));
+                    }
+                }
+            }
+        }
+
+        // Pass 2: prereqs can be satisfied by building (chaining through other implicit rules)
+        for rule in self.db.pattern_rules.iter().rev() {
+            if rule.recipe.is_empty() && !rule.is_terminal {
+                continue;
+            }
+            for pattern_target in &rule.targets {
+                if let Some(stem) = match_pattern(pattern_target, target) {
+                    // Match-anything rules: only apply to explicitly mentioned targets
+                    if is_match_anything(pattern_target) {
+                        if !self.db.is_explicitly_mentioned(target)
+                            && !Path::new(target).exists()
+                            && self.find_in_vpath(target).is_none()
+                        {
+                            continue;
+                        }
+                    }
+
                     let prereqs_ok = if rule.prerequisites.is_empty() {
                         true
                     } else {
@@ -712,6 +893,7 @@ impl<'a> Executor<'a> {
                             let resolved = p.replace('%', &stem);
                             Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
+                                || self.db.is_phony(&resolved)
                                 || self.find_pattern_rule_exists(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
                         })
@@ -722,18 +904,26 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+
         None
     }
 
     fn find_pattern_rule_exists(&self, target: &str) -> bool {
-        for rule in &self.db.pattern_rules {
+        for rule in self.db.pattern_rules.iter().rev() {
             if rule.recipe.is_empty() { continue; }
             for pattern_target in &rule.targets {
                 if let Some(stem) = match_pattern(pattern_target, target) {
-                    let prereqs_ok = rule.prerequisites.iter().all(|p| {
-                        let resolved = p.replace('%', &stem);
-                        Path::new(&resolved).exists()
-                    });
+                    let prereqs_ok = if rule.prerequisites.is_empty() {
+                        true
+                    } else {
+                        rule.prerequisites.iter().all(|p| {
+                            let resolved = p.replace('%', &stem);
+                            Path::new(&resolved).exists()
+                                || self.db.rules.contains_key(&resolved)
+                                || self.db.is_phony(&resolved)
+                                || self.find_in_vpath(&resolved).is_some()
+                        })
+                    };
                     if prereqs_ok {
                         return true;
                     }
@@ -782,10 +972,43 @@ impl<'a> Executor<'a> {
     /// Returns a map of variable name → (value, is_override).
     /// Pattern-specific variables are matched with shortest-stem semantics.
     fn collect_target_vars(&self, target: &str) -> HashMap<String, (String, bool)> {
-        let mut result: HashMap<String, (String, bool)> = HashMap::new();
+        // We use a two-pass approach for Recursive variables:
+        //  Pass 1: collect Simple/Conditional/Shell vars (expanded immediately) and
+        //          store Recursive/Append vars' raw values.
+        //  Pass 2: expand Recursive vars in the context of the already-collected vars.
+        //
+        // This allows `a = global: $(global) pattern: $(pattern)` to correctly
+        // see `pattern` set by a pattern-specific var when `a` is expanded.
+
+        // Internal representation: (raw_value, is_expanded, is_override, flavor)
+        // is_expanded=true  → value is already final (Simple, already-expanded Append)
+        // is_expanded=false → value is a raw Recursive template needing second pass
+        let mut staging: Vec<(String, String, bool, bool, VarFlavor)> = Vec::new();
+        // Map from var_name → index in staging (for quick lookup/update)
+        let mut staging_idx: HashMap<String, usize> = HashMap::new();
+
+        // Helper: get current expanded value for a var_name from staging (if any)
+        let get_staging_val = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
+                                staging_idx: &HashMap<String, usize>,
+                                var_name: &str| -> Option<String> {
+            staging_idx.get(var_name).and_then(|&i| {
+                let (_, val, is_expanded, _, _) = &staging[i];
+                if *is_expanded { Some(val.clone()) } else { None }
+            })
+        };
+
+        // Helper: expand a value using global state (for Simple vars and immediate Append)
+        // For Append: get the base from staging (if already expanded) or global db.
+        let expand_imm = |state: &MakeState, val: &str| -> String {
+            state.expand(val)
+        };
+        let get_global_val = |state: &MakeState, var_name: &str| -> Option<String> {
+            state.db.variables.get(var_name).map(|v| {
+                if v.flavor == VarFlavor::Simple { v.value.clone() } else { state.expand(&v.value) }
+            })
+        };
 
         // 1. Apply pattern-specific variables.
-        //    Build list of (stem_len, declaration_index, entry) for all matching patterns.
         let mut pattern_vars_with_stem: Vec<(usize, usize, &PatternSpecificVar)> = Vec::new();
         for (idx, psv) in self.db.pattern_specific_vars.iter().enumerate() {
             if let Some(stem) = match_pattern_simple(&psv.pattern, target) {
@@ -793,38 +1016,51 @@ impl<'a> Executor<'a> {
             }
         }
         // Sort: descending stem length (less-specific first), then ascending index.
-        // This way shorter-stem (more-specific) patterns overwrite longer-stem ones,
-        // and among same stem length, earlier declarations win (applied last).
         pattern_vars_with_stem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
         for (_, _, psv) in &pattern_vars_with_stem {
-            // Simple (:=) vars were already expanded at assignment time; don't re-expand.
-            let expanded = if psv.var.flavor == VarFlavor::Simple {
-                psv.var.value.clone()
-            } else {
-                self.state.expand(&psv.var.value)
-            };
-            let val = match psv.var.flavor {
+            match psv.var.flavor {
+                VarFlavor::Simple => {
+                    // Already expanded at assignment; use as-is.
+                    let val = psv.var.value.clone();
+                    let idx = staging.len();
+                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Simple));
+                    staging_idx.insert(psv.var_name.clone(), idx);
+                }
                 VarFlavor::Append => {
-                    let base = result.get(&psv.var_name)
-                        .map(|(v, _)| v.clone())
-                        .or_else(|| self.db.variables.get(&psv.var_name).and_then(|v| {
-                            if v.flavor == VarFlavor::Simple {
-                                Some(v.value.clone())
-                            } else {
-                                Some(self.state.expand(&v.value))
-                            }
-                        }))
+                    let rhs = expand_imm(&self.state, &psv.var.value);
+                    let base = get_staging_val(&staging, &staging_idx, &psv.var_name)
+                        .or_else(|| get_global_val(&self.state, &psv.var_name))
                         .unwrap_or_default();
-                    if base.is_empty() { expanded } else { format!("{} {}", base, expanded) }
+                    let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                    let idx = staging.len();
+                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Append));
+                    staging_idx.insert(psv.var_name.clone(), idx);
                 }
                 VarFlavor::Conditional => {
-                    if result.contains_key(&psv.var_name) { continue; }
-                    expanded
+                    // ?= : only set if not already set
+                    if !staging_idx.contains_key(&psv.var_name) {
+                        let val = expand_imm(&self.state, &psv.var.value);
+                        let idx = staging.len();
+                        staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Conditional));
+                        staging_idx.insert(psv.var_name.clone(), idx);
+                    }
                 }
-                _ => expanded,
-            };
-            result.insert(psv.var_name.clone(), (val, psv.is_override));
+                VarFlavor::Shell => {
+                    // Already-run shell command value; store as-is
+                    let val = psv.var.value.clone();
+                    let idx = staging.len();
+                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Shell));
+                    staging_idx.insert(psv.var_name.clone(), idx);
+                }
+                VarFlavor::Recursive => {
+                    // Store raw value for second-pass expansion
+                    let raw = psv.var.value.clone();
+                    let idx = staging.len();
+                    staging.push((psv.var_name.clone(), raw, false, psv.is_override, VarFlavor::Recursive));
+                    staging_idx.insert(psv.var_name.clone(), idx);
+                }
+            }
         }
 
         // 2. Apply target-specific variables (they override pattern-specific).
@@ -832,35 +1068,81 @@ impl<'a> Executor<'a> {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     let is_override = var.origin == VarOrigin::Override;
-                    // Simple (:=) vars were already expanded at assignment time; don't re-expand.
-                    let expanded = if var.flavor == VarFlavor::Simple {
-                        var.value.clone()
-                    } else {
-                        self.state.expand(&var.value)
-                    };
-                    let val = match var.flavor {
+                    match var.flavor {
+                        VarFlavor::Simple => {
+                            let val = var.value.clone();
+                            if let Some(&i) = staging_idx.get(var_name) {
+                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Simple);
+                            } else {
+                                let idx = staging.len();
+                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Simple));
+                                staging_idx.insert(var_name.clone(), idx);
+                            }
+                        }
                         VarFlavor::Append => {
-                            let base = result.get(var_name)
-                                .map(|(v, _)| v.clone())
-                                .or_else(|| self.db.variables.get(var_name).and_then(|v| {
-                                    if v.flavor == VarFlavor::Simple {
-                                        Some(v.value.clone())
-                                    } else {
-                                        Some(self.state.expand(&v.value))
-                                    }
-                                }))
+                            let rhs = expand_imm(&self.state, &var.value);
+                            let base = get_staging_val(&staging, &staging_idx, var_name)
+                                .or_else(|| get_global_val(&self.state, var_name))
                                 .unwrap_or_default();
-                            if base.is_empty() { expanded } else { format!("{} {}", base, expanded) }
+                            let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                            if let Some(&i) = staging_idx.get(var_name) {
+                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Append);
+                            } else {
+                                let idx = staging.len();
+                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Append));
+                                staging_idx.insert(var_name.clone(), idx);
+                            }
                         }
                         VarFlavor::Conditional => {
-                            if result.contains_key(var_name) { continue; }
-                            expanded
+                            if !staging_idx.contains_key(var_name) {
+                                let val = expand_imm(&self.state, &var.value);
+                                let idx = staging.len();
+                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Conditional));
+                                staging_idx.insert(var_name.clone(), idx);
+                            }
                         }
-                        _ => expanded,
-                    };
-                    result.insert(var_name.clone(), (val, is_override));
+                        VarFlavor::Shell => {
+                            let val = var.value.clone();
+                            if let Some(&i) = staging_idx.get(var_name) {
+                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Shell);
+                            } else {
+                                let idx = staging.len();
+                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Shell));
+                                staging_idx.insert(var_name.clone(), idx);
+                            }
+                        }
+                        VarFlavor::Recursive => {
+                            let raw = var.value.clone();
+                            if let Some(&i) = staging_idx.get(var_name) {
+                                staging[i] = (var_name.clone(), raw, false, is_override, VarFlavor::Recursive);
+                            } else {
+                                let idx = staging.len();
+                                staging.push((var_name.clone(), raw, false, is_override, VarFlavor::Recursive));
+                                staging_idx.insert(var_name.clone(), idx);
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // 3. Second pass: expand Recursive vars using all already-expanded vars as context.
+        //    Build an auto_vars map from the already-expanded staging entries.
+        let mut expansion_context: HashMap<String, String> = HashMap::new();
+        for (name, val, is_expanded, _, _) in &staging {
+            if *is_expanded {
+                expansion_context.insert(name.clone(), val.clone());
+            }
+        }
+        let mut result: HashMap<String, (String, bool)> = HashMap::new();
+        for (name, raw, is_expanded, is_override, _flavor) in &staging {
+            let val = if *is_expanded {
+                raw.clone()
+            } else {
+                // Recursive: expand using global state + already-expanded target vars as context
+                self.state.expand_with_auto_vars(raw, &expansion_context)
+            };
+            result.insert(name.clone(), (val, *is_override));
         }
 
         result
@@ -888,12 +1170,22 @@ impl<'a> Executor<'a> {
             return true;
         }
 
+        // -W/--what-if: if any prereq is in the what_if list, treat it as infinitely new
+        for prereq in prereqs {
+            if self.what_if.iter().any(|w| w == prereq) {
+                return true;
+            }
+        }
+
         let target_time = match get_mtime(target) {
             Some(t) => t,
             None => return true, // Target doesn't exist
         };
 
         for prereq in prereqs {
+            // Skip .WAIT markers (should already be filtered, but be safe)
+            if prereq == ".WAIT" { continue; }
+
             let prereq_time = match get_mtime(prereq) {
                 Some(t) => t,
                 None => {
@@ -906,6 +1198,10 @@ impl<'a> Executor<'a> {
                     } else if self.db.is_phony(prereq) {
                         return true; // Phony prereqs always trigger rebuild
                     } else {
+                        // Secondary files that don't exist don't trigger rebuilds
+                        if self.db.is_secondary(prereq) {
+                            continue;
+                        }
                         continue;
                     }
                 }
@@ -1006,6 +1302,20 @@ impl<'a> Executor<'a> {
         vars.insert("*F".to_string(), file_of(stem));
 
         vars
+    }
+
+    /// Check whether the recipe has any real shell commands (not just make-function side-effects).
+    /// Also runs make-function side-effects (like $(info)) as a side-effect of expansion.
+    /// Used in question mode to determine if the target is "out of date".
+    fn recipe_has_real_commands(&mut self, recipe: &[(usize, String)], auto_vars: &HashMap<String, String>) -> bool {
+        for (_lineno, line) in recipe {
+            let expanded = self.state.expand_with_auto_vars(line, auto_vars);
+            let cmd = strip_recipe_prefixes(&expanded);
+            if !cmd.trim().is_empty() {
+                return true;
+            }
+        }
+        false
     }
 
     fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
@@ -1117,9 +1427,12 @@ impl<'a> Executor<'a> {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
 
             // A recipe line may expand to multiple sub-lines when it contains a
-            // multi-line `define` variable.  Split on newlines and treat each
-            // sub-line as an independent recipe command with its own prefix chars.
-            let sub_lines: Vec<&str> = expanded.split('\n').collect();
+            // multi-line `define` variable.  Split on bare newlines (not preceded
+            // by a backslash) and treat each sub-line as an independent recipe
+            // command with its own prefix chars.  Backslash-newline sequences
+            // (shell line continuations) must NOT be split: they are passed as a
+            // single command to the shell, which handles the continuation itself.
+            let sub_lines: Vec<String> = split_recipe_sub_lines(&expanded);
 
             'sub_line_loop: for sub_line in &sub_lines {
                 let (display_line, line_silent, ignore_error, force) = parse_recipe_prefix(sub_line);
@@ -1158,26 +1471,38 @@ impl<'a> Executor<'a> {
 
                 // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
                 // otherwise fall back to the global defaults.
-                let eff_shell = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
+                let eff_shell_raw = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
                 let eff_flags = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
                     f.as_str()
                 } else {
                     self.shell_flags
                 };
 
-                // Split shell_flags by whitespace into separate arguments
-                let flags: Vec<&str> = eff_flags.split_whitespace().collect();
-                let mut child = Command::new(eff_shell);
-                for flag in &flags {
-                    child.arg(flag);
-                }
-                child.arg(&cmd);
-                child.env("MAKELEVEL", self.get_makelevel());
-
-                // Set up exported variables
-                self.setup_exports(&mut child);
-
-                let status = child.status();
+                // When SHELL contains spaces (e.g. "echo hi"), GNU Make composes the full
+                // invocation as a shell string and runs it through /bin/sh -c, so that
+                // shell quoting in .SHELLFLAGS is properly interpreted.
+                // Otherwise use direct execvp with the shell program.
+                let child_status = if eff_shell_raw.contains(' ') {
+                    // Compose full command string: "SHELL SHELLFLAGS cmd"
+                    let composed = format!("{} {} {}", eff_shell_raw, eff_flags, cmd);
+                    let mut c = Command::new("/bin/sh");
+                    c.arg("-c").arg(&composed);
+                    c.env("MAKELEVEL", self.get_makelevel());
+                    self.setup_exports(&mut c);
+                    c.status()
+                } else {
+                    // Direct exec: shell_prog [shell_flags] cmd
+                    let flags: Vec<&str> = eff_flags.split_whitespace().collect();
+                    let mut c = Command::new(eff_shell_raw);
+                    for flag in &flags {
+                        c.arg(flag);
+                    }
+                    c.arg(&cmd);
+                    c.env("MAKELEVEL", self.get_makelevel());
+                    self.setup_exports(&mut c);
+                    c.status()
+                };
+                let status = child_status;
 
                 match status {
                     Ok(s) if !s.success() => {
@@ -1219,16 +1544,26 @@ impl<'a> Executor<'a> {
     }
 
     fn target_has_recipe(&self, target: &str) -> bool {
+        // A "real" recipe has at least one non-empty line after stripping
+        // whitespace. An empty inline recipe (`target: prereqs ;` with nothing
+        // after the semicolon) does NOT count as having a recipe for the purposes
+        // of "is up to date" vs "Nothing to be done" messages.
+        let recipe_is_real = |recipe: &[(usize, String)]| -> bool {
+            recipe.iter().any(|(_, line)| {
+                let stripped = strip_recipe_prefixes(line);
+                !stripped.trim().is_empty()
+            })
+        };
         if let Some(rules) = self.db.rules.get(target) {
             for rule in rules {
-                if !rule.recipe.is_empty() {
+                if recipe_is_real(&rule.recipe) {
                     return true;
                 }
             }
         }
         // Check pattern rules
         if let Some((rule, _)) = self.find_pattern_rule(target) {
-            if !rule.recipe.is_empty() {
+            if recipe_is_real(&rule.recipe) {
                 return true;
             }
         }
@@ -1389,6 +1724,36 @@ fn strip_recipe_prefixes(line: &str) -> String {
     }
 
     line[i..].to_string()
+}
+
+/// Split a recipe line on bare newlines (i.e., `\n` NOT preceded by `\`).
+///
+/// When the parser joins backslash-newline continuations in recipe lines it
+/// stores them as a single string with an embedded `\\\n` (backslash followed
+/// by newline).  The shell is expected to handle that continuation itself, so
+/// we must NOT split there.  Plain `\n` characters (from multiline `define`
+/// variables expanded into a recipe) ARE split into separate sub-commands.
+fn split_recipe_sub_lines(s: &str) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            // Check if preceded by backslash (continuation): if so, keep together.
+            if current.ends_with('\\') {
+                current.push('\n');
+            } else {
+                result.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    result.push(current);
+    result
 }
 
 fn dir_of(path: &str) -> String {

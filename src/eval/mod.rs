@@ -41,6 +41,10 @@ struct IncludeRuleInfo {
 
 pub struct MakeState {
     pub args: MakeArgs,
+    /// Snapshot of args as parsed from the command line (before any makefile modifications).
+    /// Used by apply_makeflags_from_makefile to preserve cmdline flags even when the
+    /// makefile assigns directly to MAKEFLAGS (e.g. `MAKEFLAGS = B`).
+    pub cmdline_args: MakeArgs,
     pub db: MakeDatabase,
     pub shell: String,
     pub makefile_list: Vec<PathBuf>,
@@ -79,8 +83,10 @@ fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
 
 impl MakeState {
     pub fn new(args: MakeArgs) -> Self {
+        let cmdline_args = args.clone();
         let mut state = MakeState {
             args,
+            cmdline_args,
             db: MakeDatabase::new(),
             shell: "/bin/sh".to_string(),
             makefile_list: Vec::new(),
@@ -199,6 +205,7 @@ impl MakeState {
             self.args.always_make,
             self.args.trace,
             progname.clone(),
+            self.args.what_if.clone(),
         );
 
         let result = executor.build_targets(&targets);
@@ -328,14 +335,11 @@ impl MakeState {
         if self.args.print_directory { single_flags.push('w'); }
         if self.args.check_symlink_times { single_flags.push('L'); }
 
-        // Long options (no single-char equivalent)
+        // Build long_parts: options-with-args first, then no-arg long options.
+        // GNU Make orders them: -I, -l, -O, --debug=, then --trace, --no-print-directory, etc.
         let mut long_parts: Vec<String> = Vec::new();
-        if self.args.trace { long_parts.push("--trace".to_string()); }
-        if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
-        if self.args.no_silent { long_parts.push("--no-silent".to_string()); }
-        if self.args.warn_undefined_variables { long_parts.push("--warn-undefined-variables".to_string()); }
 
-        // Options with arguments
+        // Options with arguments (come first in long section)
         for dir in &self.args.include_dirs {
             long_parts.push(format!("-I{}", dir.display()));
         }
@@ -351,6 +355,12 @@ impl MakeState {
                 long_parts.push(format!("--debug={}", dbg));
             }
         }
+
+        // No-arg long options (come after options-with-args)
+        if self.args.trace { long_parts.push("--trace".to_string()); }
+        if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
+        if self.args.no_silent { long_parts.push("--no-silent".to_string()); }
+        if self.args.warn_undefined_variables { long_parts.push("--warn-undefined-variables".to_string()); }
 
         // Build the main flags portion
         let has_single = !single_flags.is_empty();
@@ -524,21 +534,22 @@ impl MakeState {
             *self.current_line.borrow_mut() = lineno;
             // Handle define/endef blocks
             if parser.in_define {
-                // Check for endef - must start with "endef" followed by whitespace, #, or end
-                // "endef$(VAR)" is NOT recognized as endef (no space between endef and $)
-                let trimmed_line = line.trim();
+                // Check for endef - must start at column 0 (no leading whitespace).
+                // GNU Make only recognizes "endef" when it appears at the start of the line.
+                // " endef" (with leading space/tab) is part of the define body.
+                // "endef$(VAR)" is NOT recognized ($ immediately after "endef" without space).
                 // Strip comment to get the non-comment part
-                let no_comment = parser::strip_comment(trimmed_line);
+                let no_comment = parser::strip_comment(&line);
                 let no_comment_trimmed = no_comment.trim();
-                // endef is recognized if:
-                // - exactly "endef"
-                // - "endef " or "endef\t" followed by anything (extraneous text warning)
-                // - line starts with "#" (comment only line inside define = content)
-                // Note: "endef#" (no space) is also recognized per GNU make behavior
-                let is_endef = no_comment_trimmed == "endef"
-                    || trimmed_line.starts_with("endef ")
-                    || trimmed_line.starts_with("endef\t")
-                    || trimmed_line.starts_with("endef#");
+                // endef is recognized only if the raw line starts with "endef" (no leading ws),
+                // followed by whitespace, '#', or end-of-string.
+                let is_endef = line.starts_with("endef") && {
+                    let after = &line["endef".len()..];
+                    after.is_empty()
+                        || after.starts_with(' ')
+                        || after.starts_with('\t')
+                        || after.starts_with('#')
+                };
                 if is_endef {
                     // Warn about extraneous text after endef (non-comment text)
                     if no_comment_trimmed != "endef" && !no_comment_trimmed.is_empty() {
@@ -768,8 +779,9 @@ impl MakeState {
                         rule.second_expansion_order_only = None;
                     }
 
-                    // Stamp the source file and fix up inline recipe line numbers
+                    // Stamp the source file, lineno, and fix up inline recipe line numbers
                     rule.source_file = parser.filename.to_string_lossy().to_string();
+                    rule.lineno = lineno;
                     for entry in rule.recipe.iter_mut() {
                         if entry.0 == 0 {
                             entry.0 = lineno;
@@ -1153,11 +1165,29 @@ impl MakeState {
         if rule.targets.len() == 1 {
             let target = &rule.targets[0];
             if is_suffix_rule(target, &self.db.suffixes) {
+                // Suffix rules with prerequisites are handled specially (SV 40657):
+                // In POSIX mode: treat as a normal explicit rule only (no pattern rule).
+                // In non-POSIX mode: emit a warning and still create a pattern rule,
+                //   but the pattern rule ignores the prerequisites.
+                let has_prereqs = !rule.prerequisites.is_empty();
+                if has_prereqs && !self.db.posix_mode {
+                    // Emit warning: ignoring prerequisites on suffix rule definition
+                    eprintln!("{}:{}: warning: ignoring prerequisites on suffix rule definition",
+                        rule.source_file, rule.lineno);
+                }
                 self.db.suffix_rules.push(rule.clone());
-                // Also register as pattern rule, using the actual current suffix list.
-                let suffixes_clone = self.db.suffixes.clone();
-                if let Some(pattern_rule) = suffix_to_pattern_rule(target, &rule, &suffixes_clone) {
-                    self.db.pattern_rules.push(pattern_rule);
+                // Create a pattern rule only if: no prerequisites, OR non-POSIX mode.
+                if !has_prereqs || !self.db.posix_mode {
+                    // Also register as pattern rule, using the actual current suffix list.
+                    // The pattern rule has no prerequisites (they're ignored per SV 40657).
+                    let suffixes_clone = self.db.suffixes.clone();
+                    if let Some(pattern_rule) = suffix_to_pattern_rule(target, &rule, &suffixes_clone) {
+                        // suffix_to_pattern_rule already sets the correct pattern
+                        // prerequisites (e.g. %.baz for .baz.biz target).
+                        // The explicit prerequisites of the suffix rule (e.g. foo.bar)
+                        // are intentionally NOT propagated to the pattern rule.
+                        self.db.pattern_rules.push(pattern_rule);
+                    }
                 }
             }
         }
@@ -1172,10 +1202,20 @@ impl MakeState {
         }
 
         // Register explicit rules
-        for target in &rule.targets {
+        for target in &rule.targets.clone() {
             if SpecialTarget::from_str(target).is_some() {
                 continue;
             }
+            // For grouped target rules, set grouped_siblings = all targets except this one.
+            // The parser stored ALL targets in grouped_siblings when is_grouped was set.
+            let mut rule_for_target = rule.clone();
+            if !rule.grouped_siblings.is_empty() {
+                rule_for_target.grouped_siblings = rule.grouped_siblings.iter()
+                    .filter(|t| *t != target)
+                    .cloned()
+                    .collect();
+            }
+            let rule = rule_for_target;
             let rules = self.db.rules.entry(target.clone()).or_insert_with(Vec::new);
             if rule.is_double_colon {
                 rules.push(rule.clone());
@@ -1376,42 +1416,27 @@ impl MakeState {
     /// Re-parse the current MAKEFLAGS value and apply any new settings to args/state.
     /// Called when MAKEFLAGS is modified from within a makefile.
     /// Rebuilds MAKEFLAGS in the canonical sorted format.
+    ///
+    /// GNU Make preserves command-line flags even when a makefile does a direct
+    /// assignment like `MAKEFLAGS = B`.  We implement this by starting from a
+    /// fresh clone of the original cmdline args (which already carry the cmdline
+    /// flags) and then layering the MAKEFLAGS variable value on top of that.
     fn apply_makeflags_from_makefile(&mut self) {
         let makeflags = match self.db.variables.get("MAKEFLAGS") {
             Some(v) => v.value.clone(),
             None => return,
         };
 
-        // Reset all settings that come from MAKEFLAGS before re-parsing.
-        // The MAKEFLAGS string value is the source of truth; we rebuild from it
-        // to prevent duplicates when MAKEFLAGS is updated (e.g. MAKEFLAGS += -Idir).
-        self.args.include_dirs.clear();
-        self.args.debug.clear();
-        self.args.variables.clear();
-        self.args.load_average = None;
-        self.args.output_sync = None;
-        self.args.debug_short = false;
-        self.args.always_make = false;
-        self.args.environment_overrides = false;
-        self.args.ignore_errors = false;
-        self.args.keep_going = false;
-        self.args.dry_run = false;
-        self.args.just_print = false;
-        self.args.question = false;
-        self.args.no_builtin_rules = false;
-        self.args.no_builtin_variables = false;
-        self.args.silent = false;
-        self.args.touch = false;
-        self.args.print_directory = false;
-        self.args.no_print_directory = false;
-        self.args.check_symlink_times = false;
-        self.args.trace = false;
-        self.args.warn_undefined_variables = false;
+        // Start from the original command-line args as a baseline.
+        // This preserves cmdline flags (e.g. -i from `-i` on cmdline) even when
+        // the makefile does a direct assignment like `MAKEFLAGS = B`.
+        self.args = self.cmdline_args.clone();
 
-        // Parse the full current MAKEFLAGS value into self.args (fresh start).
+        // Layer the MAKEFLAGS variable value on top of the cmdline baseline.
+        // parse_makeflags ORs flags into the args (boolean flags get set, lists get appended).
         crate::cli::parse_makeflags(&makeflags, &mut self.args);
 
-        // Rebuild include_dirs from the parsed args (deduplicating).
+        // Deduplicate include_dirs (cmdline dirs might now appear twice if also in MAKEFLAGS).
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deduped_dirs: Vec<std::path::PathBuf> = self.args.include_dirs.iter()
             .filter(|d| seen_dirs.insert(d.to_string_lossy().to_string()))
@@ -1419,6 +1444,18 @@ impl MakeState {
             .collect();
         self.args.include_dirs = deduped_dirs;
         self.include_dirs = self.args.include_dirs.clone();
+
+        // Deduplicate variables (keep last occurrence: cmdline beat env since cmdline is added last).
+        let mut seen_var_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut deduped_vars: Vec<(String, String)> = Vec::new();
+        for (name, value) in self.args.variables.iter().rev() {
+            let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
+            if seen_var_names.insert(key.to_string()) {
+                deduped_vars.push((name.clone(), value.clone()));
+            }
+        }
+        deduped_vars.reverse();
+        self.args.variables = deduped_vars;
 
         // Rebuild MAKEFLAGS from the updated args in canonical format.
         // This ensures single-char flags are sorted and properly bundled.
@@ -1436,6 +1473,16 @@ impl MakeState {
             .join(" ");
         self.db.variables.insert(".INCLUDE_DIRS".into(),
             Variable::new(include_dirs_str, VarFlavor::Simple, VarOrigin::Default));
+
+        // If -r (no_builtin_rules) was activated via MAKEFLAGS inside the makefile,
+        // remove the built-in pattern rules now (they were loaded at startup).
+        if self.args.no_builtin_rules {
+            let n = self.db.builtin_pattern_rules_count;
+            if n > 0 && self.db.pattern_rules.len() >= n {
+                self.db.pattern_rules.drain(..n);
+                self.db.builtin_pattern_rules_count = 0;
+            }
+        }
     }
 
     pub fn evaluate_condition(&self, kind: &ConditionalKind) -> bool {
@@ -1555,6 +1602,7 @@ impl MakeState {
                             &shell,
                             &shell_flags,
                             silent,
+                            pi.ignore_missing,
                             &mut visited,
                         );
 
@@ -1584,6 +1632,8 @@ impl MakeState {
                                         &shell,
                                         &shell_flags,
                                         silent,
+                                        &source_file,
+                                        pi.ignore_missing,
                                     );
                                     match built {
                                         Ok(()) => {
@@ -1637,6 +1687,7 @@ impl MakeState {
     /// Returns Ok(()) if all prerequisites exist or were successfully built.
     /// Only follows explicit (non-pattern) rules to avoid infinite recursion
     /// through implicit rule chains.
+    /// `ignore_missing`: if true, suppress error printing (for optional include chains).
     fn build_include_prerequisites(
         &self,
         prerequisites: &[String],
@@ -1644,6 +1695,7 @@ impl MakeState {
         shell: &str,
         shell_flags: &str,
         silent: bool,
+        ignore_missing: bool,
         visited: &mut HashSet<String>,
     ) -> Result<(), String> {
         for prereq in prerequisites {
@@ -1684,12 +1736,17 @@ impl MakeState {
                             shell,
                             shell_flags,
                             silent,
+                            ignore_missing,
                             visited,
                         )?;
                     }
                     // Run the recipe
                     if !rule.recipe.is_empty() {
-                        self.run_include_recipe(prereq, &rule.recipe.clone(), shell, shell_flags, silent)?;
+                        let src = rule.source_file.clone();
+                        self.run_include_recipe(
+                            prereq, &rule.recipe.clone(), shell, shell_flags, silent,
+                            &src, ignore_missing,
+                        )?;
                     }
                 }
             }
@@ -1726,19 +1783,19 @@ impl MakeState {
                 }
             }
         }
-        // Check pattern rules
+        // Check pattern rules - but skip built-in (implicit) rules which have empty source_file.
+        // GNU Make only uses makefile-defined rules to rebuild include files, not the default
+        // implicit rules (which would cause chains like %: %.o → inc2.o etc.).
         for rule in &self.db.pattern_rules {
+            // Skip built-in rules (they have empty source_file)
+            if rule.source_file.is_empty() {
+                continue;
+            }
             for pat in &rule.targets {
                 if let Some(stem) = parser::match_pattern(target, pat) {
                     if !rule.recipe.is_empty() {
                         let recipe: Vec<(usize, String)> = rule.recipe.iter()
-                            .map(|(ln, cmd)| {
-                                // Substitute automatic variables in recipe at this point
-                                let cmd_expanded = cmd
-                                    .replace("$*", &stem)
-                                    .replace("$@", target);
-                                (*ln, cmd_expanded)
-                            })
+                            .map(|(ln, cmd)| (*ln, cmd.clone()))
                             .collect();
                         let src = rule.source_file.clone();
                         let ln = recipe.first().map(|(l, _)| *l).unwrap_or(0);
@@ -1760,9 +1817,13 @@ impl MakeState {
         None
     }
 
+    /// Run the recipe commands for building an include file.
+    /// `source_file`: the makefile that defined the recipe (for error messages).
+    /// `ignore_missing`: if true, suppress error printing (optional include).
     fn run_include_recipe(
         &self, target: &str, recipe: &[(usize, String)],
         shell: &str, shell_flags: &str, silent: bool,
+        source_file: &str, ignore_missing: bool,
     ) -> Result<(), String> {
         let progname = env::args().next().unwrap_or_else(|| "make".to_string());
         // Set up automatic variables for recipe expansion ($@ = target)
@@ -1793,9 +1854,17 @@ impl MakeState {
                 Ok(s) if s.success() => {}
                 Ok(s) => {
                     let code = s.code().unwrap_or(1);
-                    eprintln!("{}: *** [{}:{}] Error {}", progname, target, lineno, code);
+                    // Error format: [source_file:lineno: target] Error N
+                    let err_loc = if source_file.is_empty() {
+                        format!("{}:{}", target, lineno)
+                    } else {
+                        format!("{}:{}: {}", source_file, lineno, target)
+                    };
+                    if !ignore_missing {
+                        eprintln!("{}: *** [{}] Error {}", progname, err_loc, code);
+                    }
                     if !ignore_error {
-                        return Err(format!("[{}:{}] Error {}", target, lineno, code));
+                        return Err(format!("[{}] Error {}", err_loc, code));
                     }
                 }
                 Err(e) => {

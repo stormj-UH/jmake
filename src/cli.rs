@@ -263,6 +263,18 @@ pub fn parse_args() -> MakeArgs {
                         result.debug_short = true;
                         result.debug.push("b".to_string());
                     }
+                    'E' => {
+                        let rest: String = chars[j+1..].iter().collect();
+                        if !rest.is_empty() {
+                            result.eval_strings.push(rest);
+                        } else {
+                            i += 1;
+                            let val = require_arg(&args, i, "E");
+                            result.eval_strings.push(val);
+                        }
+                        j = chars.len();
+                        continue;
+                    }
                     'e' => result.environment_overrides = true,
                     'f' => {
                         let rest: String = chars[j+1..].iter().collect();
@@ -369,7 +381,7 @@ pub fn parse_args() -> MakeArgs {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => result.silent = true,
+                    's' => { result.silent = true; result.no_silent = false; }
                     'S' => result.keep_going = false, // --no-keep-going
                     't' => result.touch = true,
                     'v' => result.version = true,
@@ -561,7 +573,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => result.silent = true,
+                    's' => { result.silent = true; result.no_silent = false; }
                     'S' => result.keep_going = false,
                     't' => result.touch = true,
                     'w' => {
@@ -608,7 +620,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         'q' => result.question = true,
                         'r' => result.no_builtin_rules = true,
                         'R' => result.no_builtin_variables = true,
-                        's' => result.silent = true,
+                        's' => { result.silent = true; result.no_silent = false; }
                         'S' => result.keep_going = false,
                         't' => result.touch = true,
                         'w' => {
