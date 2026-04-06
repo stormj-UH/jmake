@@ -141,6 +141,16 @@ impl MakeState {
             }
         }
 
+        // Print entering-directory if needed (for -w without -C)
+        // Must be before resolve_pending_includes so include-rebuild output is wrapped.
+        let progname = make_progname();
+        let print_dir = should_print_directory(&self.args);
+        if print_dir && self.args.directory.is_none() {
+            // Already printed at startup for -C; print here for -w without -C
+            let cwd = env::current_dir().unwrap_or_default();
+            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+        }
+
         // Resolve pending includes (rebuild include files if rules exist)
         self.resolve_pending_includes()?;
 
@@ -171,15 +181,6 @@ impl MakeState {
             if self.args.question || self.args.targets.is_empty() {
                 return Ok(());
             }
-        }
-
-        // Print entering-directory if needed (for -w without -C)
-        let progname = make_progname();
-        let print_dir = should_print_directory(&self.args);
-        if print_dir && self.args.directory.is_none() {
-            // Already printed at startup for -C; print here for -w without -C
-            let cwd = env::current_dir().unwrap_or_default();
-            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
         }
 
         // Build targets
@@ -1132,6 +1133,18 @@ impl MakeState {
 
         // Register pattern rules
         if rule.is_pattern {
+            // For pattern rules, track literal (non-%) prerequisites as explicitly mentioned.
+            // E.g., in `%.tsk: %.z test.z`, `test.z` is explicitly mentioned.
+            for prereq in &rule.prerequisites {
+                if !prereq.contains('%') {
+                    self.db.explicitly_mentioned.insert(prereq.clone());
+                }
+            }
+            for prereq in &rule.order_only_prerequisites {
+                if !prereq.contains('%') {
+                    self.db.explicitly_mentioned.insert(prereq.clone());
+                }
+            }
             self.db.pattern_rules.push(rule.clone());
             return;
         }
@@ -1147,6 +1160,15 @@ impl MakeState {
                     self.db.pattern_rules.push(pattern_rule);
                 }
             }
+        }
+
+        // Mark all explicit-rule prerequisites as explicitly mentioned.
+        // This prevents targets that appear as prereqs from being considered intermediate.
+        for prereq in &rule.prerequisites {
+            self.db.explicitly_mentioned.insert(prereq.clone());
+        }
+        for prereq in &rule.order_only_prerequisites {
+            self.db.explicitly_mentioned.insert(prereq.clone());
         }
 
         // Register explicit rules
@@ -1177,16 +1199,41 @@ impl MakeState {
                         .cloned()
                         .collect();
 
-                    existing.prerequisites.extend(rule.prerequisites.clone());
+                    // When a new rule has a recipe, its prerequisites are "primary"
+                    // and placed BEFORE the existing accumulated prerequisites.
+                    // GNU Make uses the recipe rule to determine the primary ordering.
+                    let new_has_recipe = !rule.recipe.is_empty();
+                    if new_has_recipe && !rule.prerequisites.is_empty() {
+                        // Prepend new rule's prereqs, then append existing ones (avoiding dups)
+                        let mut new_prereqs = rule.prerequisites.clone();
+                        for p in &existing.prerequisites {
+                            if !new_prereqs.contains(p) {
+                                new_prereqs.push(p.clone());
+                            }
+                        }
+                        existing.prerequisites = new_prereqs;
+                    } else {
+                        existing.prerequisites.extend(rule.prerequisites.clone());
+                    }
                     existing.order_only_prerequisites.extend(filtered_order_only);
                     // Merge second-expansion raw prerequisite text.
+                    // When new rule has recipe, its SE text comes first.
                     if let Some(ref new_text) = rule.second_expansion_prereqs {
                         match existing.second_expansion_prereqs {
                             Some(ref mut existing_text) => {
-                                if !existing_text.is_empty() {
-                                    existing_text.push(' ');
+                                if new_has_recipe {
+                                    let old = existing_text.clone();
+                                    *existing_text = if old.is_empty() {
+                                        new_text.clone()
+                                    } else {
+                                        format!("{} {}", new_text, old)
+                                    };
+                                } else {
+                                    if !existing_text.is_empty() {
+                                        existing_text.push(' ');
+                                    }
+                                    existing_text.push_str(new_text);
                                 }
-                                existing_text.push_str(new_text);
                             }
                             None => {
                                 existing.second_expansion_prereqs = Some(new_text.clone());
@@ -1206,7 +1253,7 @@ impl MakeState {
                             }
                         }
                     }
-                    if !rule.recipe.is_empty() {
+                    if new_has_recipe {
                         if !existing.recipe.is_empty() {
                             eprintln!("make: warning: overriding recipe for target '{}'", target);
                         }

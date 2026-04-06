@@ -114,10 +114,10 @@ impl Parser {
     }
 
     pub fn parse_line(&self, line: &str, state: &MakeState) -> ParsedLine {
-        let trimmed = line.trim();
+        let trimmed = line.trim_start();
 
         // Empty line
-        if trimmed.is_empty() {
+        if trimmed.trim_end().is_empty() {
             return ParsedLine::Empty;
         }
 
@@ -249,7 +249,7 @@ pub fn strip_comment(line: &str) -> String {
         result.push(ch);
     }
 
-    result.trim_end().to_string()
+    result
 }
 
 pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
@@ -276,7 +276,7 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
         }
     }
 
-    let work = work.trim();
+    let work = work.trim_start();
 
     // Check for target-specific variable: target: var = value
     // But don't confuse with rules - target-specific has a known assignment op after the colon part

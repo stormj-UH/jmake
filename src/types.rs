@@ -226,6 +226,12 @@ pub struct MakeDatabase {
     pub posix_mode: bool,
     pub not_parallel: bool,
     pub default_rule: Option<Rule>,
+    /// Set of names that are explicitly mentioned in the makefile as either:
+    /// - Targets of explicit (non-pattern) rules
+    /// - Prerequisites of explicit (non-pattern) rules
+    /// - Literal (non-% containing) prerequisites of pattern rules
+    /// Targets built by implicit rules are NOT intermediate if they appear here.
+    pub explicitly_mentioned: HashSet<String>,
     /// Names of variables that were originally imported from the process environment.
     /// Even if overridden by the Makefile, these are still exported to child processes.
     pub env_var_names: HashSet<String>,
@@ -269,7 +275,15 @@ impl MakeDatabase {
             default_rule: None,
             pattern_specific_vars: Vec::new(),
             builtin_pattern_rules_count: 0,
+            explicitly_mentioned: HashSet::new(),
         }
+    }
+
+    /// Check if a name is explicitly mentioned in the makefile (either as a target
+    /// or as a prerequisite of a non-pattern rule, or as a literal prereq in a pattern rule).
+    pub fn is_explicitly_mentioned(&self, name: &str) -> bool {
+        self.explicitly_mentioned.contains(name)
+            || self.rules.contains_key(name)
     }
 
     pub fn is_phony(&self, target: &str) -> bool {

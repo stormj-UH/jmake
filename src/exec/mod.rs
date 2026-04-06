@@ -967,14 +967,19 @@ impl<'a> Executor<'a> {
             .collect();
         vars.insert("+".to_string(), all_prereqs.join(" "));
 
-        // $? - prerequisites newer than target
+        // $? - prerequisites that are newer than target (or target doesn't exist).
+        // Only files that actually exist on disk are included; non-existent prereqs
+        // (that still need to be built) are NOT included in $?.
         let target_time = get_mtime(target);
         let newer: Vec<String> = prereqs.iter()
             .filter(|p| {
-                if let Some(tt) = target_time {
-                    get_mtime(p).map_or(true, |pt| pt > tt)
-                } else {
-                    true
+                let prereq_mtime = get_mtime(p).or_else(|| {
+                    self.find_in_vpath(p).and_then(|found| get_mtime(&found))
+                });
+                match (target_time, prereq_mtime) {
+                    (_, None) => false,           // prereq doesn't exist: not newer
+                    (None, Some(_)) => true,      // target doesn't exist, prereq exists: newer
+                    (Some(tt), Some(pt)) => pt > tt, // both exist: compare times
                 }
             })
             .cloned()
@@ -984,8 +989,12 @@ impl<'a> Executor<'a> {
         // $* - stem (for pattern rules)
         vars.insert("*".to_string(), stem.to_string());
 
-        // $| - order-only prerequisites
-        let oo_list: Vec<String> = order_only.iter().map(|s| s.to_string()).collect();
+        // $| - order-only prerequisites (deduplicated, preserving first occurrence order)
+        let mut oo_seen = HashSet::new();
+        let oo_list: Vec<String> = order_only.iter()
+            .filter(|s| oo_seen.insert(s.to_string()))
+            .map(|s| s.to_string())
+            .collect();
         vars.insert("|".to_string(), oo_list.join(" "));
 
         // $(@D) $(@F) etc - directory and file parts
@@ -1106,93 +1115,101 @@ impl<'a> Executor<'a> {
         let mut any_cmd_ran = false;
         for (lineno, line) in recipe {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-            let (display_line, line_silent, ignore_error, force) = parse_recipe_prefix(&expanded);
 
-            let effective_silent = line_silent || self.silent || is_silent_target;
-            let effective_ignore = ignore_error || self.ignore_errors;
+            // A recipe line may expand to multiple sub-lines when it contains a
+            // multi-line `define` variable.  Split on newlines and treat each
+            // sub-line as an independent recipe command with its own prefix chars.
+            let sub_lines: Vec<&str> = expanded.split('\n').collect();
 
-            // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
-            let cmd = strip_recipe_prefixes(&expanded);
+            'sub_line_loop: for sub_line in &sub_lines {
+                let (display_line, line_silent, ignore_error, force) = parse_recipe_prefix(sub_line);
 
-            if cmd.trim().is_empty() {
-                // Empty command after expansion (e.g., $(info ...) expands to nothing).
-                // Don't count this as a real shell command, and don't echo it.
-                continue;
-            }
+                let effective_silent = line_silent || self.silent || is_silent_target;
+                let effective_ignore = ignore_error || self.ignore_errors;
 
-            // Echo the command BEFORE executing it (unless silenced)
-            if !effective_silent {
-                println!("{}", display_line);
-            }
+                // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
+                let cmd = strip_recipe_prefixes(sub_line);
 
-            if self.dry_run {
-                // In dry-run mode, lines are printed but not executed, EXCEPT:
-                // 1. Lines with '+' prefix (force execution)
-                // 2. Lines that contain $(MAKE) or ${MAKE} - recursive make invocations
-                let contains_make_var = line.contains("$(MAKE)") || line.contains("${MAKE}");
-                if !force && !contains_make_var {
-                    // Count as a command that would run in normal mode
-                    any_cmd_ran = true;
-                    continue;
+                if cmd.trim().is_empty() {
+                    // Empty command after expansion (e.g., $(info ...) expands to nothing).
+                    // Don't count this as a real shell command, and don't echo it.
+                    continue 'sub_line_loop;
                 }
-            }
 
-            any_cmd_ran = true;
-            self.any_recipe_ran = true;
+                // Echo the command BEFORE executing it (unless silenced)
+                if !effective_silent {
+                    println!("{}", display_line);
+                }
 
-            // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
-            // otherwise fall back to the global defaults.
-            let eff_shell = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
-            let eff_flags = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
-                f.as_str()
-            } else {
-                self.shell_flags
-            };
+                if self.dry_run {
+                    // In dry-run mode, lines are printed but not executed, EXCEPT:
+                    // 1. Lines with '+' prefix (force execution)
+                    // 2. Lines that contain $(MAKE) or ${MAKE} - recursive make invocations
+                    let contains_make_var = line.contains("$(MAKE)") || line.contains("${MAKE}");
+                    if !force && !contains_make_var {
+                        // Count as a command that would run in normal mode
+                        any_cmd_ran = true;
+                        continue 'sub_line_loop;
+                    }
+                }
 
-            // Split shell_flags by whitespace into separate arguments
-            let flags: Vec<&str> = eff_flags.split_whitespace().collect();
-            let mut child = Command::new(eff_shell);
-            for flag in &flags {
-                child.arg(flag);
-            }
-            child.arg(&cmd);
-            child.env("MAKELEVEL", self.get_makelevel());
+                any_cmd_ran = true;
+                self.any_recipe_ran = true;
 
-            // Set up exported variables
-            self.setup_exports(&mut child);
+                // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
+                // otherwise fall back to the global defaults.
+                let eff_shell = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
+                let eff_flags = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
+                    f.as_str()
+                } else {
+                    self.shell_flags
+                };
 
-            let status = child.status();
+                // Split shell_flags by whitespace into separate arguments
+                let flags: Vec<&str> = eff_flags.split_whitespace().collect();
+                let mut child = Command::new(eff_shell);
+                for flag in &flags {
+                    child.arg(flag);
+                }
+                child.arg(&cmd);
+                child.env("MAKELEVEL", self.get_makelevel());
 
-            match status {
-                Ok(s) if !s.success() => {
-                    let code = s.code().unwrap_or(1);
-                    let loc = make_location(source_file, *lineno);
-                    if effective_ignore {
-                        eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
-                    } else {
-                        eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
-                        if !self.db.is_precious(target) && !self.db.is_phony(target) {
-                            // Delete target on error unless .PRECIOUS
-                            if Path::new(target).exists() {
-                                eprintln!("{}: Deleting file '{}'", self.progname, target);
-                                let _ = fs::remove_file(target);
+                // Set up exported variables
+                self.setup_exports(&mut child);
+
+                let status = child.status();
+
+                match status {
+                    Ok(s) if !s.success() => {
+                        let code = s.code().unwrap_or(1);
+                        let loc = make_location(source_file, *lineno);
+                        if effective_ignore {
+                            eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
+                        } else {
+                            eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
+                            if !self.db.is_precious(target) && !self.db.is_phony(target) {
+                                // Delete target on error unless .PRECIOUS
+                                if Path::new(target).exists() {
+                                    eprintln!("{}: Deleting file '{}'", self.progname, target);
+                                    let _ = fs::remove_file(target);
+                                }
                             }
+                            return Err(String::new());
                         }
-                        return Err(String::new());
                     }
-                }
-                Err(e) => {
-                    if effective_ignore {
-                        let loc = make_location(source_file, *lineno);
-                        eprintln!("{}: [{}{}] Error: {} (ignored)", self.progname, loc, target, e);
-                    } else {
-                        let loc = make_location(source_file, *lineno);
-                        eprintln!("{}: *** [{}{}] Error: {}", self.progname, loc, target, e);
-                        return Err(String::new());
+                    Err(e) => {
+                        if effective_ignore {
+                            let loc = make_location(source_file, *lineno);
+                            eprintln!("{}: [{}{}] Error: {} (ignored)", self.progname, loc, target, e);
+                        } else {
+                            let loc = make_location(source_file, *lineno);
+                            eprintln!("{}: *** [{}{}] Error: {}", self.progname, loc, target, e);
+                            return Err(String::new());
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
+            } // end sub_lines loop
         }
 
         // Return true (rebuilt) only if actual shell commands ran.

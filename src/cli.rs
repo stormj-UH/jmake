@@ -157,8 +157,8 @@ pub fn parse_args() -> MakeArgs {
                 "--keep-going" => result.keep_going = true,
                 "--no-builtin-rules" => result.no_builtin_rules = true,
                 "--no-builtin-variables" => result.no_builtin_variables = true,
-                "--no-print-directory" => result.no_print_directory = true,
-                "--print-directory" => result.print_directory = true,
+                "--no-print-directory" => { result.no_print_directory = true; result.print_directory = false; }
+                "--print-directory" => { result.print_directory = true; result.no_print_directory = false; }
                 "--print-data-base" => result.print_data_base = true,
                 "--question" => result.question = true,
                 "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; }
@@ -373,7 +373,7 @@ pub fn parse_args() -> MakeArgs {
                     'S' => result.keep_going = false, // --no-keep-going
                     't' => result.touch = true,
                     'v' => result.version = true,
-                    'w' => result.print_directory = true,
+                    'w' => { result.print_directory = true; result.no_print_directory = false; }
                     'W' => {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
