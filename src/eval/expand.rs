@@ -189,10 +189,36 @@ impl MakeState {
         match name {
             "eval" => {
                 let expanded = self.expand_with_auto_vars(args_str, auto_vars);
-                // We can't mutate self here, so we'll need to handle this differently
-                // For now, return empty and schedule eval
-                // In practice, $(eval) needs special handling in the main loop
+                // Push to eval_pending (processed after expansion via RefCell)
+                self.eval_pending.borrow_mut().push(expanded);
                 return String::new();
+            }
+            "info" => {
+                let text = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
+                println!("{}", text);
+                return String::new();
+            }
+            "warning" => {
+                let text = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
+                let file = self.current_file.borrow();
+                let line = *self.current_line.borrow();
+                if file.is_empty() {
+                    eprintln!("{}", text);
+                } else {
+                    eprintln!("{}:{}: {}", file, line, text);
+                }
+                return String::new();
+            }
+            "error" => {
+                let text = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
+                let file = self.current_file.borrow();
+                let line = *self.current_line.borrow();
+                if file.is_empty() {
+                    eprintln!("*** {}.  Stop.", text);
+                } else {
+                    eprintln!("{}:{}: *** {}.  Stop.", file, line, text);
+                }
+                std::process::exit(2);
             }
             "value" => {
                 let var_name = args_str.trim();

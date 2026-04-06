@@ -14,6 +14,7 @@ use crate::parser::{self, Parser};
 use crate::types::*;
 
 use indexmap::IndexMap;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,10 @@ pub struct MakeState {
     pub shell: String,
     pub makefile_list: Vec<PathBuf>,
     pub include_dirs: Vec<PathBuf>,
-    pub eval_pending: Vec<String>, // pending $(eval ...) strings
+    pub eval_pending: RefCell<Vec<String>>, // pending $(eval ...) strings
+    /// Current file and line for error/warning/info context (updated during parsing)
+    pub current_file: RefCell<String>,
+    pub current_line: RefCell<usize>,
 }
 
 impl MakeState {
@@ -35,7 +39,9 @@ impl MakeState {
             shell: "/bin/sh".to_string(),
             makefile_list: Vec::new(),
             include_dirs: Vec::new(),
-            eval_pending: Vec::new(),
+            eval_pending: RefCell::new(Vec::new()),
+            current_file: RefCell::new(String::new()),
+            current_line: RefCell::new(0),
         };
 
         // Change directory if requested
@@ -76,8 +82,11 @@ impl MakeState {
         }
 
         // Process pending $(eval) calls
-        while !self.eval_pending.is_empty() {
-            let pending = std::mem::take(&mut self.eval_pending);
+        loop {
+            let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
+            if pending.is_empty() {
+                break;
+            }
             for s in pending {
                 self.eval_string(&s)?;
             }
@@ -261,6 +270,9 @@ impl MakeState {
         let mut current_rule: Option<Rule> = None;
 
         while let Some((line, lineno)) = parser.next_logical_line() {
+            // Update current file/line context for $(error)/$(warning)/$(info)
+            *self.current_file.borrow_mut() = parser.filename.to_string_lossy().to_string();
+            *self.current_line.borrow_mut() = lineno;
             // Handle define/endef blocks
             if parser.in_define {
                 if line.trim() == "endef" {
@@ -272,23 +284,31 @@ impl MakeState {
                         VarOrigin::File,
                     );
                     if parser.define_override {
-                        self.db.variables.insert(parser.define_name.clone(), var);
+                        // override define always wins, even over command-line variables
+                        let mut v = var;
+                        v.origin = VarOrigin::Override;
+                        self.db.variables.insert(parser.define_name.clone(), v);
                     } else {
                         let name = parser.define_name.clone();
-                        match parser.define_flavor {
-                            VarFlavor::Append => {
-                                if let Some(existing) = self.db.variables.get_mut(&name) {
-                                    existing.value.push('\n');
-                                    existing.value.push_str(&parser.define_lines.join("\n"));
-                                } else {
+                        // Without override, a command-line variable cannot be replaced
+                        let is_cmdline = self.db.variables.get(&name)
+                            .map_or(false, |v| v.origin == VarOrigin::CommandLine);
+                        if !is_cmdline {
+                            match parser.define_flavor {
+                                VarFlavor::Append => {
+                                    if let Some(existing) = self.db.variables.get_mut(&name) {
+                                        existing.value.push('\n');
+                                        existing.value.push_str(&parser.define_lines.join("\n"));
+                                    } else {
+                                        self.db.variables.insert(name, var);
+                                    }
+                                }
+                                VarFlavor::Conditional => {
+                                    self.db.variables.entry(name).or_insert(var);
+                                }
+                                _ => {
                                     self.db.variables.insert(name, var);
                                 }
-                            }
-                            VarFlavor::Conditional => {
-                                self.db.variables.entry(name).or_insert(var);
-                            }
-                            _ => {
-                                self.db.variables.insert(name, var);
                             }
                         }
                     }
@@ -486,6 +506,15 @@ impl MakeState {
                         }
                     }
                 }
+                ParsedLine::Undefine { name, is_override } => {
+                    // Remove the variable from the database entirely.
+                    // Without override, a command-line variable cannot be undefined.
+                    let is_cmdline = self.db.variables.get(&name)
+                        .map_or(false, |v| v.origin == VarOrigin::CommandLine);
+                    if is_override || !is_cmdline {
+                        self.db.variables.shift_remove(&name);
+                    }
+                }
                 ParsedLine::Define { name, flavor, is_override, is_export } => {
                     parser.in_define = true;
                     parser.define_name = name;
@@ -495,10 +524,10 @@ impl MakeState {
                     parser.define_lines.clear();
                 }
                 ParsedLine::Empty | ParsedLine::Comment => {
-                    if let Some(ref mut rule) = current_rule {
-                        // An empty line can end a rule's recipe context
-                        // But in GNU Make, empty lines between recipe lines are allowed
-                    }
+                    // Empty lines and comments do NOT end the recipe context.
+                    // GNU Make allows blank lines between recipe lines; only a
+                    // non-empty, non-recipe line (rule, assignment, directive)
+                    // should clear in_recipe / current_rule.
                 }
                 _ => {}
             }

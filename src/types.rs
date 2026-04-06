@@ -162,6 +162,10 @@ pub enum ParsedLine {
     UnExport {
         names: Vec<String>,
     },
+    Undefine {
+        name: String,
+        is_override: bool,
+    },
     Recipe(String),
     Comment,
     Empty,

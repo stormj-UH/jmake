@@ -251,21 +251,26 @@ pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
 }
 
 pub fn parse_define_start(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("define").unwrap().trim();
-
     let mut is_override = false;
     let mut is_export = false;
-    let mut work = rest.to_string();
+    let mut work = line.trim().to_string();
 
-    // Check for modifiers
-    if work.starts_with("override ") {
-        is_override = true;
-        work = work["override ".len()..].to_string();
+    // Strip leading modifiers before "define"
+    loop {
+        if work.starts_with("override ") {
+            is_override = true;
+            work = work["override ".len()..].trim_start().to_string();
+        } else if work.starts_with("export ") {
+            is_export = true;
+            work = work["export ".len()..].trim_start().to_string();
+        } else {
+            break;
+        }
     }
-    if work.starts_with("export ") {
-        is_export = true;
-        work = work["export ".len()..].to_string();
-    }
+
+    // Now strip "define"
+    let rest = work.strip_prefix("define").unwrap_or("").trim();
+    let work = rest.to_string();
 
     // Check for assignment operator at end
     let ops = ["::=", "!=", "?=", "+=", ":=", "="];

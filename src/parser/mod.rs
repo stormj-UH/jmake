@@ -105,9 +105,19 @@ impl Parser {
             return ParsedLine::Comment;
         }
 
-        // Recipe line (starts with tab)
-        if line.starts_with('\t') || (line.starts_with(' ') && self.in_recipe) {
-            return ParsedLine::Recipe(line[1..].to_string());
+        // Recipe line: check for tab (always a recipe line when in recipe context,
+        // and tab-prefixed lines are always recipes per GNU Make semantics)
+        // Also support .RECIPEPREFIX for a custom prefix character.
+        let recipe_prefix: char = state.db.variables.get(".RECIPEPREFIX")
+            .and_then(|v| v.value.chars().next())
+            .unwrap_or('\t');
+
+        // A tab-prefixed line is always treated as a recipe line (GNU Make rule).
+        // A custom RECIPEPREFIX line is also a recipe line.
+        if line.starts_with('\t') || (recipe_prefix != '\t' && line.starts_with(recipe_prefix)) {
+            // Strip exactly the one prefix character
+            let stripped = &line[recipe_prefix.len_utf8()..];
+            return ParsedLine::Recipe(stripped.to_string());
         }
 
         // Strip inline comments (not in recipe context)
@@ -138,8 +148,23 @@ impl Parser {
             return ParsedLine::Else(None);
         }
 
-        // define directive
-        if effective.starts_with("define ") || effective == "define" {
+        // undefine directive (must be checked before define)
+        if effective.starts_with("undefine ") || effective.starts_with("override undefine ") {
+            let is_override = effective.starts_with("override ");
+            let rest = if is_override {
+                effective.strip_prefix("override ").unwrap()
+            } else {
+                &effective
+            };
+            let name = rest.strip_prefix("undefine").unwrap().trim().to_string();
+            return ParsedLine::Undefine { name, is_override };
+        }
+
+        // define directive (also handles "override define" and "export define")
+        if effective.starts_with("define ") || effective == "define"
+            || effective.starts_with("override define ")
+            || effective.starts_with("export define ")
+        {
             return parse_define_start(&effective);
         }
 
@@ -368,8 +393,9 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
         return None;
     }
 
-    // Split prerequisites and order-only prerequisites (after |)
-    let (prereqs, order_only) = split_prerequisites(rest.trim());
+    // Split prerequisites and order-only prerequisites (after |), and extract
+    // any inline recipe that appears after a bare `;`.
+    let (prereqs, order_only, inline_recipe) = split_prerequisites(rest.trim());
     let is_pattern = targets.iter().any(|t| t.contains('%'));
 
     let mut rule = Rule::new();
@@ -378,6 +404,11 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     rule.order_only_prerequisites = order_only;
     rule.is_pattern = is_pattern;
     rule.is_double_colon = is_double_colon;
+
+    // If there was an inline recipe after the `;`, add it as the first recipe line.
+    if let Some(recipe_line) = inline_recipe {
+        rule.recipe.push(recipe_line);
+    }
 
     Some(ParsedLine::Rule(rule))
 }
@@ -443,36 +474,66 @@ pub fn split_words(s: &str) -> Vec<String> {
     s.split_whitespace().map(String::from).collect()
 }
 
-pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>) {
-    // Split on | for order-only prerequisites
-    // But be careful not to split inside variable references
+pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>) {
+    // First, find a bare `;` (not inside variable references).
+    // Everything before it is the prereq/order-only part; everything after is
+    // the inline recipe.
+    let semi_pos = find_semicolon(s);
+
+    let (prereq_part, inline_recipe): (&str, Option<String>) = if let Some(pos) = semi_pos {
+        let recipe_text = s[pos + 1..].to_string();
+        (&s[..pos], Some(recipe_text))
+    } else {
+        (s, None)
+    };
+
+    // Split on | for order-only prerequisites inside the prereq part.
     let mut prereqs = Vec::new();
     let mut order_only = Vec::new();
 
-    if let Some(pipe_pos) = find_pipe(s) {
-        let normal = &s[..pipe_pos];
-        let oo = &s[pipe_pos+1..];
+    if let Some(pipe_pos) = find_pipe(prereq_part) {
+        let normal = &prereq_part[..pipe_pos];
+        let oo = &prereq_part[pipe_pos + 1..];
         prereqs = split_words(normal.trim());
         order_only = split_words(oo.trim());
     } else {
-        prereqs = split_words(s);
+        prereqs = split_words(prereq_part.trim());
     }
 
-    // Handle semicolons in prerequisites - text after ; is a recipe line
-    if let Some(last) = prereqs.last() {
-        if let Some(semi_pos) = last.find(';') {
-            let before = last[..semi_pos].to_string();
-            // The rest after ; would be handled as an inline recipe
-            if !before.is_empty() {
-                let len = prereqs.len();
-                prereqs[len - 1] = before;
-            } else {
-                prereqs.pop();
+    (prereqs, order_only, inline_recipe)
+}
+
+/// Find the byte position of the first bare `;` in `s`, skipping over
+/// `$(...)` / `${...}` variable references and single-char `$x` refs.
+fn find_semicolon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut paren_depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' => {
+                if i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'(' | b'{' => {
+                            paren_depth += 1;
+                            i += 2;
+                            continue;
+                        }
+                        _ => {
+                            i += 2; // single-char variable reference like `$@`
+                            continue;
+                        }
+                    }
+                }
             }
+            b'(' | b'{' if paren_depth > 0 => paren_depth += 1,
+            b')' | b'}' if paren_depth > 0 => paren_depth -= 1,
+            b';' if paren_depth == 0 => return Some(i),
+            _ => {}
         }
+        i += 1;
     }
-
-    (prereqs, order_only)
+    None
 }
 
 fn find_pipe(s: &str) -> Option<usize> {
