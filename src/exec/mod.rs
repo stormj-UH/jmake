@@ -43,7 +43,7 @@ pub struct Executor<'a> {
     /// Stack of inherited target-specific variables from parent targets.
     /// When building a target's prerequisites, the parent's collected target vars
     /// are pushed here so that prereqs can inherit them.
-    inherited_vars_stack: Vec<HashMap<String, (String, bool)>>,
+    inherited_vars_stack: Vec<HashMap<String, (String, bool, bool)>>,
 }
 
 impl<'a> Executor<'a> {
@@ -204,7 +204,8 @@ impl<'a> Executor<'a> {
                 .flat_map(|r| r.grouped_siblings.iter().cloned())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
-                .filter(|s| !self.built.contains_key(s.as_str()))
+                .filter(|s| !self.built.contains_key(s.as_str())
+                         && !self.building.contains(s.as_str()))
                 .collect()
         } else {
             Vec::new()
@@ -213,11 +214,10 @@ impl<'a> Executor<'a> {
         // If we have explicit rules
         if let Some(rules) = &rules {
             if !rules.is_empty() {
-                let result = self.build_with_rules(target, rules, is_phony);
-                // After building this grouped target, also build all siblings.
-                for sibling in &grouped_siblings {
-                    let _ = self.build_target(sibling);
-                }
+                // For grouped targets (&:): pass the siblings to build_with_rules so it
+                // can build their prerequisites BEFORE running the recipe, and mark them
+                // as built afterward. The recipe runs ONCE for the primary target only.
+                let result = self.build_with_rules_grouped(target, rules, is_phony, &grouped_siblings);
                 return result;
             }
         }
@@ -977,9 +977,9 @@ impl<'a> Executor<'a> {
     }
 
     /// Collect all applicable target-specific and pattern-specific variables for a target.
-    /// Returns a map of variable name → (value, is_override).
+    /// Returns a map of variable name → (value, is_override, is_private).
     /// Pattern-specific variables are matched with shortest-stem semantics.
-    fn collect_target_vars(&self, target: &str) -> HashMap<String, (String, bool)> {
+    fn collect_target_vars(&self, target: &str) -> HashMap<String, (String, bool, bool)> {
         // We use a two-pass approach for Recursive variables:
         //  Pass 1: collect Simple/Conditional/Shell vars (expanded immediately) and
         //          store Recursive/Append vars' raw values.
@@ -994,13 +994,16 @@ impl<'a> Executor<'a> {
         let mut staging: Vec<(String, String, bool, bool, VarFlavor)> = Vec::new();
         // Map from var_name → index in staging (for quick lookup/update)
         let mut staging_idx: HashMap<String, usize> = HashMap::new();
+        // Track which vars are private (not inherited by prerequisites).
+        let mut private_flags: HashSet<String> = HashSet::new();
 
         // 0. Seed with inherited vars from parent target (lowest priority).
         // Target-specific variables are inherited by prerequisites unless marked private.
         // The inherited vars come from the parent target's collected vars pushed onto
         // inherited_vars_stack before building this target as a prerequisite.
         if let Some(inherited) = self.inherited_vars_stack.last() {
-            for (name, (val, is_override)) in inherited {
+            for (name, (val, is_override, is_private_flag)) in inherited {
+                if *is_private_flag { continue; } // private vars are not inherited
                 let idx = staging.len();
                 staging.push((name.clone(), val.clone(), true, *is_override, VarFlavor::Simple));
                 staging_idx.insert(name.clone(), idx);
@@ -1051,6 +1054,11 @@ impl<'a> Executor<'a> {
         pattern_vars_with_stem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
         for (_, _, psv) in &pattern_vars_with_stem {
+            if psv.var.is_private {
+                private_flags.insert(psv.var_name.clone());
+            } else {
+                private_flags.remove(&psv.var_name);
+            }
             match psv.var.flavor {
                 VarFlavor::Simple => {
                     // Already expanded at assignment; use as-is.
@@ -1060,14 +1068,23 @@ impl<'a> Executor<'a> {
                     staging_idx.insert(psv.var_name.clone(), idx);
                 }
                 VarFlavor::Append => {
-                    let rhs = expand_imm(&self.state, &psv.var.value);
-                    let base = get_staging_val(&staging, &staging_idx, &psv.var_name)
-                        .or_else(|| get_global_val(&self.state, &psv.var_name))
-                        .unwrap_or_default();
-                    let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
-                    let idx = staging.len();
-                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Append));
-                    staging_idx.insert(psv.var_name.clone(), idx);
+                    // A non-override Append is blocked if the existing var has override flag.
+                    let existing_is_override = staging_idx.get(&psv.var_name)
+                        .map_or(false, |&i| staging[i].3);
+                    if !psv.is_override && existing_is_override {
+                        // Skip this non-override append; preserve existing override value.
+                    } else {
+                        let rhs = expand_imm(&self.state, &psv.var.value);
+                        let base = get_staging_val(&staging, &staging_idx, &psv.var_name)
+                            .or_else(|| get_global_val(&self.state, &psv.var_name))
+                            .unwrap_or_default();
+                        let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                        // Preserve override flag if existing entry was override.
+                        let new_is_override = psv.is_override || existing_is_override;
+                        let idx = staging.len();
+                        staging.push((psv.var_name.clone(), val, true, new_is_override, VarFlavor::Append));
+                        staging_idx.insert(psv.var_name.clone(), idx);
+                    }
                 }
                 VarFlavor::Conditional => {
                     // ?= : only set if not already set
@@ -1113,6 +1130,12 @@ impl<'a> Executor<'a> {
                         raw_var_name.as_str()
                     };
                     let is_override = var.origin == VarOrigin::Override;
+                    // Track private flag for this variable.
+                    if var.is_private {
+                        private_flags.insert(var_name.to_string());
+                    } else {
+                        private_flags.remove(var_name);
+                    }
                     match var.flavor {
                         VarFlavor::Simple => {
                             let val = var.value.clone();
@@ -1125,17 +1148,25 @@ impl<'a> Executor<'a> {
                             }
                         }
                         VarFlavor::Append => {
-                            let rhs = expand_imm(&self.state, &var.value);
-                            let base = get_staging_val(&staging, &staging_idx, var_name)
-                                .or_else(|| get_global_val(&self.state, var_name))
-                                .unwrap_or_default();
-                            let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
-                            if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Append);
+                            // A non-override Append is blocked if the existing var has override flag.
+                            let existing_is_override = staging_idx.get(var_name)
+                                .map_or(false, |&i| staging[i].3);
+                            if !is_override && existing_is_override {
+                                // Skip this non-override append.
                             } else {
-                                let idx = staging.len();
-                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Append));
-                                staging_idx.insert(var_name.to_string(), idx);
+                                let rhs = expand_imm(&self.state, &var.value);
+                                let base = get_staging_val(&staging, &staging_idx, var_name)
+                                    .or_else(|| get_global_val(&self.state, var_name))
+                                    .unwrap_or_default();
+                                let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                                let new_is_override = is_override || existing_is_override;
+                                if let Some(&i) = staging_idx.get(var_name) {
+                                    staging[i] = (var_name.to_string(), val, true, new_is_override, VarFlavor::Append);
+                                } else {
+                                    let idx = staging.len();
+                                    staging.push((var_name.to_string(), val, true, new_is_override, VarFlavor::Append));
+                                    staging_idx.insert(var_name.to_string(), idx);
+                                }
                             }
                         }
                         VarFlavor::Conditional => {
@@ -1179,7 +1210,7 @@ impl<'a> Executor<'a> {
                 expansion_context.insert(name.clone(), val.clone());
             }
         }
-        let mut result: HashMap<String, (String, bool)> = HashMap::new();
+        let mut result: HashMap<String, (String, bool, bool)> = HashMap::new();
         for (name, raw, is_expanded, is_override, _flavor) in &staging {
             let val = if *is_expanded {
                 raw.clone()
@@ -1187,7 +1218,8 @@ impl<'a> Executor<'a> {
                 // Recursive: expand using global state + already-expanded target vars as context
                 self.state.expand_with_auto_vars(raw, &expansion_context)
             };
-            result.insert(name.clone(), (val, *is_override));
+            let is_priv = private_flags.contains(name.as_str());
+            result.insert(name.clone(), (val, *is_override, is_priv));
         }
 
         result
@@ -1196,10 +1228,10 @@ impl<'a> Executor<'a> {
     /// Apply collected target vars to auto_vars, respecting command-line variable priority.
     fn apply_target_vars_to_auto_vars(
         &self,
-        target_vars: &HashMap<String, (String, bool)>,
+        target_vars: &HashMap<String, (String, bool, bool)>,
         auto_vars: &mut HashMap<String, String>,
     ) {
-        for (var_name, (value, is_override)) in target_vars {
+        for (var_name, (value, is_override, _is_private)) in target_vars {
             // Non-override target-specific vars don't override command-line vars
             let is_cmdline = self.db.variables.get(var_name.as_str())
                 .map_or(false, |v| v.origin == VarOrigin::CommandLine);

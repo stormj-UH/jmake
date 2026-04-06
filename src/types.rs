@@ -31,6 +31,8 @@ pub struct Variable {
     pub flavor: VarFlavor,
     pub origin: VarOrigin,
     pub export: Option<bool>, // None = inherit, Some(true) = export, Some(false) = unexport
+    /// When true, this target-specific variable is private and NOT inherited by prerequisites.
+    pub is_private: bool,
 }
 
 impl Variable {
@@ -40,6 +42,7 @@ impl Variable {
             flavor,
             origin,
             export: None,
+            is_private: false,
         }
     }
 }

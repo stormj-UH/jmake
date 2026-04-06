@@ -534,23 +534,43 @@ impl MakeState {
             *self.current_line.borrow_mut() = lineno;
             // Handle define/endef blocks
             if parser.in_define {
-                // Check for endef - must start at column 0 (no leading whitespace).
-                // GNU Make only recognizes "endef" when it appears at the start of the line.
-                // " endef" (with leading space/tab) is part of the define body.
-                // "endef$(VAR)" is NOT recognized ($ immediately after "endef" without space).
-                // Strip comment to get the non-comment part
-                let no_comment = parser::strip_comment(&line);
+                // GNU Make supports nested define/endef blocks.
+                // endef is recognized after trimming whitespace (" endef" IS a valid endef).
+                // But "endef$(VAR)" is NOT recognized ($ immediately follows "endef").
+                // Nested 'define ...' inside a body increments depth; matching endef decrements.
+                // Only when depth == 0 does the outer define actually end.
+
+                let trimmed_line = line.trim();
+                // Check if this is a nested define start
+                let eff_no_comment = parser::strip_comment(trimmed_line);
+                let eff_trim = eff_no_comment.trim();
+                let is_nested_define = eff_trim.starts_with("define ") || eff_trim.starts_with("define\t")
+                    || eff_trim == "define"
+                    || eff_trim.starts_with("override define ")
+                    || eff_trim.starts_with("export define ");
+                if is_nested_define {
+                    parser.define_depth += 1;
+                    parser.define_lines.push(line);
+                    continue;
+                }
+
+                // Check for endef after whitespace trimming
+                let no_comment = parser::strip_comment(trimmed_line);
                 let no_comment_trimmed = no_comment.trim();
-                // endef is recognized only if the raw line starts with "endef" (no leading ws),
-                // followed by whitespace, '#', or end-of-string.
-                let is_endef = line.starts_with("endef") && {
-                    let after = &line["endef".len()..];
+                let is_endef = trimmed_line.starts_with("endef") && {
+                    let after = &trimmed_line["endef".len()..];
                     after.is_empty()
                         || after.starts_with(' ')
                         || after.starts_with('\t')
                         || after.starts_with('#')
                 };
                 if is_endef {
+                    if parser.define_depth > 0 {
+                        // This endef closes a nested define inside the body - accumulate it
+                        parser.define_depth -= 1;
+                        parser.define_lines.push(line);
+                        continue;
+                    }
                     // Warn about extraneous text after endef (non-comment text)
                     if no_comment_trimmed != "endef" && !no_comment_trimmed.is_empty() {
                         let fname = parser.filename.to_string_lossy();
@@ -622,7 +642,19 @@ impl MakeState {
             // must NOT have their value expanded at parse time -- the unexpanded text
             // is stored as the variable value and expanded lazily when referenced.
             // Only simple (:= / ::=) assignments expand the value immediately.
-            let expanded = if line.starts_with('\t') {
+            // Determine if this line is a recipe line for a custom .RECIPEPREFIX.
+            // Tab-prefixed lines and custom-prefix lines must NOT be pre-expanded
+            // (they are handed verbatim to parse_line and then to the executor).
+            let custom_recipe_prefix: Option<char> = {
+                let pfx = self.db.variables.get(".RECIPEPREFIX")
+                    .and_then(|v| v.value.chars().next());
+                if pfx == Some('\t') { None } else { pfx }
+            };
+            let is_custom_recipe_line = custom_recipe_prefix
+                .map(|c| line.starts_with(c))
+                .unwrap_or(false);
+
+            let expanded = if line.starts_with('\t') || is_custom_recipe_line {
                 line.clone()
             } else if let Some(semi_pos) = parser::find_semicolon(&line) {
                 // Check whether the part before `;` contains a `:` (rule colon).
@@ -882,7 +914,8 @@ impl MakeState {
                         for t in targets {
                             if t.contains('%') {
                                 // Pattern-specific variable: stored separately for lookup at build time
-                                let var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                var.is_private = is_private;
                                 self.db.pattern_specific_vars.push(PatternSpecificVar {
                                     pattern: t,
                                     var_name: name.clone(),
@@ -892,7 +925,8 @@ impl MakeState {
                             } else {
                                 // Target-specific variable: stored in the rule as a Vec
                                 // to support multiple += entries for the same variable.
-                                let var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                var.is_private = is_private;
                                 let rules = self.db.rules.entry(t.clone()).or_insert_with(Vec::new);
                                 // Add to all rules for this target
                                 for r in rules.iter_mut() {
@@ -1042,6 +1076,7 @@ impl MakeState {
                     parser.define_override = is_override;
                     parser.define_export = is_export;
                     parser.define_lineno = lineno;
+                    parser.define_depth = 0;
                     parser.define_lines.clear();
                 }
                 ParsedLine::Empty | ParsedLine::Comment => {
