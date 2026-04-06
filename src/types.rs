@@ -180,6 +180,7 @@ pub enum ParsedLine {
         flavor: VarFlavor,
         is_override: bool,
         is_export: bool,
+        has_extraneous: bool,  // true if there was extra text after the operator
     },
     Endef,
     UnExport {
@@ -231,6 +232,9 @@ pub struct MakeDatabase {
     /// Pattern-specific variable assignments (e.g. `%.o: CFLAGS += -Wall`).
     /// Applied to any target matching the pattern, with correct override semantics.
     pub pattern_specific_vars: Vec<PatternSpecificVar>,
+    /// Number of built-in (default) pattern rules at the start of pattern_rules.
+    /// When .SUFFIXES: clears all suffixes, these built-in rules are also removed.
+    pub builtin_pattern_rules_count: usize,
 }
 
 impl MakeDatabase {
@@ -264,6 +268,7 @@ impl MakeDatabase {
             env_var_names: HashSet::new(),
             default_rule: None,
             pattern_specific_vars: Vec::new(),
+            builtin_pattern_rules_count: 0,
         }
     }
 

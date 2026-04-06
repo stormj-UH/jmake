@@ -158,6 +158,10 @@ pub fn register_implicit_rules(db: &mut MakeDatabase) {
     ));
 
     // Archive member rule: (%.o): %.o  -- handled specially
+
+    // Record how many built-in rules we just added so that .SUFFIXES: (clear)
+    // can remove them.
+    db.builtin_pattern_rules_count = db.pattern_rules.len();
 }
 
 fn make_pattern_rule(target: &str, prereqs: &[&str], recipe: &[&str]) -> Rule {

@@ -301,7 +301,12 @@ impl<'a> Executor<'a> {
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
             let oo_refs: Vec<&str> = auto_var_order_only.iter().map(|s| s.as_str()).collect();
-            let base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
+            let mut base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
+
+            // Merge target-specific and pattern-specific variables into the SE
+            // auto vars, so that e.g. `foo: a := bar; foo: $$a` can see `a`.
+            let collected_target_vars = self.collect_target_vars(target);
+            self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut base_auto_vars);
 
             for text in &se_prereq_texts {
                 let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
@@ -456,46 +461,74 @@ impl<'a> Executor<'a> {
     fn build_with_double_colon_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
         // Each double-colon rule is an independent rule. Build its prerequisites
         // independently and run its recipe if needed.
+        //
+        // For double-colon rules with second expansion: each rule is independent,
+        // so the auto vars used during SE are per-rule.  For the 1st rule, $< etc.
+        // are empty (as in single-colon 1st-rule SE).  But in contrast to single-
+        // colon rules, even the 2nd double-colon rule has empty $</$^/etc because
+        // there is no "accumulated" context from sibling rules.
         let mut any_rebuilt = false;
 
         for rule in rules {
             let rule = rule.clone();
-            let prereqs = rule.prerequisites.clone();
-            let order_only = rule.order_only_prerequisites.clone();
+            // non-SE prerequisites are already expanded
+            let mut prereqs = rule.prerequisites.clone();
+            let mut order_only = rule.order_only_prerequisites.clone();
+
+            // Handle second expansion: for double-colon rules all auto vars except
+            // $@ are empty (each rule is independent).
+            if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some() {
+                let stem = if rule.static_stem.is_empty() { "" } else { &rule.static_stem };
+                // Build auto vars with empty prereqs (per GNU Make semantics for :: rules)
+                let empty_prereqs: Vec<String> = Vec::new();
+                let empty_oo: Vec<&str> = Vec::new();
+                let base_auto_vars = self.make_auto_vars(target, &empty_prereqs, &empty_oo, stem);
+
+                if let Some(ref text) = rule.second_expansion_prereqs {
+                    let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
+                    for p in expanded {
+                        if !p.is_empty() {
+                            prereqs.push(p);
+                        }
+                    }
+                }
+                if let Some(ref text) = rule.second_expansion_order_only {
+                    let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
+                    for p in expanded {
+                        if !p.is_empty() {
+                            order_only.push(p);
+                        }
+                    }
+                }
+            }
 
             // Build this rule's prerequisites
             let mut any_prereq_rebuilt = false;
             let mut prereq_errors = Vec::new();
 
             for prereq in &prereqs {
-                let expanded = self.state.expand(prereq);
-                for p in expanded.split_whitespace() {
-                    match self.build_target(p) {
-                        Ok(rebuilt) => {
-                            if rebuilt { any_prereq_rebuilt = true; }
-                        }
-                        Err(e) => {
-                            let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
-                                let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                                format!("{}, needed by '{}'.  Stop.", base, target)
-                            } else {
-                                e
-                            };
-                            if self.keep_going {
-                                prereq_errors.push(propagated);
-                            } else {
-                                return Err(propagated);
-                            }
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_prereq_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            prereq_errors.push(propagated);
+                        } else {
+                            return Err(propagated);
                         }
                     }
                 }
             }
 
             for prereq in &order_only {
-                let expanded = self.state.expand(prereq);
-                for p in expanded.split_whitespace() {
-                    let _ = self.build_target(p);
-                }
+                let _ = self.build_target(prereq);
             }
 
             if !prereq_errors.is_empty() {
@@ -765,13 +798,23 @@ impl<'a> Executor<'a> {
         pattern_vars_with_stem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
         for (_, _, psv) in &pattern_vars_with_stem {
-            let expanded = self.state.expand(&psv.var.value);
+            // Simple (:=) vars were already expanded at assignment time; don't re-expand.
+            let expanded = if psv.var.flavor == VarFlavor::Simple {
+                psv.var.value.clone()
+            } else {
+                self.state.expand(&psv.var.value)
+            };
             let val = match psv.var.flavor {
                 VarFlavor::Append => {
                     let base = result.get(&psv.var_name)
                         .map(|(v, _)| v.clone())
-                        .or_else(|| self.db.variables.get(&psv.var_name)
-                            .map(|v| self.state.expand(&v.value)))
+                        .or_else(|| self.db.variables.get(&psv.var_name).and_then(|v| {
+                            if v.flavor == VarFlavor::Simple {
+                                Some(v.value.clone())
+                            } else {
+                                Some(self.state.expand(&v.value))
+                            }
+                        }))
                         .unwrap_or_default();
                     if base.is_empty() { expanded } else { format!("{} {}", base, expanded) }
                 }
@@ -789,13 +832,23 @@ impl<'a> Executor<'a> {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     let is_override = var.origin == VarOrigin::Override;
-                    let expanded = self.state.expand(&var.value);
+                    // Simple (:=) vars were already expanded at assignment time; don't re-expand.
+                    let expanded = if var.flavor == VarFlavor::Simple {
+                        var.value.clone()
+                    } else {
+                        self.state.expand(&var.value)
+                    };
                     let val = match var.flavor {
                         VarFlavor::Append => {
                             let base = result.get(var_name)
                                 .map(|(v, _)| v.clone())
-                                .or_else(|| self.db.variables.get(var_name)
-                                    .map(|v| self.state.expand(&v.value)))
+                                .or_else(|| self.db.variables.get(var_name).and_then(|v| {
+                                    if v.flavor == VarFlavor::Simple {
+                                        Some(v.value.clone())
+                                    } else {
+                                        Some(self.state.expand(&v.value))
+                                    }
+                                }))
                                 .unwrap_or_default();
                             if base.is_empty() { expanded } else { format!("{} {}", base, expanded) }
                         }
@@ -1087,9 +1140,18 @@ impl<'a> Executor<'a> {
             any_cmd_ran = true;
             self.any_recipe_ran = true;
 
+            // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
+            // otherwise fall back to the global defaults.
+            let eff_shell = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
+            let eff_flags = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
+                f.as_str()
+            } else {
+                self.shell_flags
+            };
+
             // Split shell_flags by whitespace into separate arguments
-            let flags: Vec<&str> = self.shell_flags.split_whitespace().collect();
-            let mut child = Command::new(self.shell);
+            let flags: Vec<&str> = eff_flags.split_whitespace().collect();
+            let mut child = Command::new(eff_shell);
             for flag in &flags {
                 child.arg(flag);
             }

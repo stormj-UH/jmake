@@ -317,37 +317,65 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
     let rest = work.strip_prefix("define").unwrap_or("").trim();
     let work = rest.to_string();
 
-    // Check for assignment operator at end
+    // Find assignment operator in the name part.
+    // The define syntax is: define NAME [OP]
+    // where OP is =, :=, ::=, :::=, +=, ?=, !=
+    // The operator may be attached to the name or separated by whitespace.
+    // Any text after the operator is "extraneous".
     let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     let mut flavor = VarFlavor::Recursive;
-    let mut name = work.clone();
+    let mut name = work.trim().to_string();
+    let mut has_extraneous = false;
 
-    for op in &ops {
-        if work.ends_with(op) {
-            name = work[..work.len() - op.len()].trim().to_string();
-            flavor = match *op {
-                "=" => VarFlavor::Recursive,
-                ":=" | "::=" | ":::=" => VarFlavor::Simple,
-                "+=" => VarFlavor::Append,
-                "?=" => VarFlavor::Conditional,
-                "!=" => VarFlavor::Shell,
-                _ => VarFlavor::Recursive,
-            };
-            break;
+    // Try to find the op using split on whitespace approach
+    // The name and op may be adjacent (define multi=) or separated (define multi =)
+    // We split on whitespace and look for an op token
+    let tokens: Vec<&str> = work.split_whitespace().collect();
+    if !tokens.is_empty() {
+        // Check if first token ends with an op
+        let first = tokens[0];
+        let mut found = false;
+        for op in &ops {
+            if first.ends_with(op) {
+                let var_name = first[..first.len() - op.len()].trim();
+                name = var_name.to_string();
+                flavor = op_to_flavor(op);
+                // Any remaining tokens are extraneous
+                if tokens.len() > 1 {
+                    has_extraneous = true;
+                }
+                found = true;
+                break;
+            }
         }
-        // Also check with space before op
-        let with_space = format!(" {}", op);
-        if work.ends_with(&with_space) {
-            name = work[..work.len() - with_space.len()].trim().to_string();
-            flavor = match *op {
-                "=" => VarFlavor::Recursive,
-                ":=" | "::=" | ":::=" => VarFlavor::Simple,
-                "+=" => VarFlavor::Append,
-                "?=" => VarFlavor::Conditional,
-                "!=" => VarFlavor::Shell,
-                _ => VarFlavor::Recursive,
-            };
-            break;
+        if !found && tokens.len() >= 2 {
+            // Check if second token is an op
+            let second = tokens[1];
+            let mut found2 = false;
+            for op in &ops {
+                if second == *op {
+                    name = first.to_string();
+                    flavor = op_to_flavor(op);
+                    // Any tokens after the op are extraneous
+                    if tokens.len() > 2 {
+                        has_extraneous = true;
+                    }
+                    found2 = true;
+                    break;
+                }
+                // Op may be the start of second token (e.g., "=foo" → extraneous)
+                if second.starts_with(op) && second.len() > op.len() {
+                    name = first.to_string();
+                    flavor = op_to_flavor(op);
+                    has_extraneous = true;
+                    found2 = true;
+                    break;
+                }
+            }
+            if !found2 {
+                // No op found - just use whole work as name, recursive flavor
+                name = work.trim().to_string();
+            }
         }
     }
 
@@ -356,5 +384,17 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
         flavor,
         is_override,
         is_export,
+        has_extraneous,
+    }
+}
+
+fn op_to_flavor(op: &str) -> VarFlavor {
+    match op {
+        "=" => VarFlavor::Recursive,
+        ":=" | "::=" | ":::=" => VarFlavor::Simple,
+        "+=" => VarFlavor::Append,
+        "?=" => VarFlavor::Conditional,
+        "!=" => VarFlavor::Shell,
+        _ => VarFlavor::Recursive,
     }
 }

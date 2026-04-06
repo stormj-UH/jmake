@@ -235,6 +235,10 @@ impl MakeState {
             "origin" => {
                 let var_name = args_str.trim();
                 let expanded_name = self.expand_with_auto_vars(var_name, auto_vars);
+                // Automatic variables ($@, $<, $^, etc.) are in auto_vars
+                if auto_vars.contains_key(&expanded_name) {
+                    return "automatic".into();
+                }
                 if let Some(var) = self.db.variables.get(&expanded_name) {
                     return match var.origin {
                         VarOrigin::Default => "default".into(),

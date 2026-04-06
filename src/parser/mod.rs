@@ -25,6 +25,7 @@ pub struct Parser {
     pub define_override: bool,
     pub define_export: bool,
     pub define_lines: Vec<String>,
+    pub define_lineno: usize,  // line number where define started
     pub conditional_stack: Vec<ConditionalState>,
 }
 
@@ -49,6 +50,7 @@ impl Parser {
             define_override: false,
             define_export: false,
             define_lines: Vec::new(),
+            define_lineno: 0,
             conditional_stack: Vec::new(),
         }
     }

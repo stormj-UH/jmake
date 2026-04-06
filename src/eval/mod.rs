@@ -545,9 +545,22 @@ impl MakeState {
                         eprintln!("{}:{}: extraneous text after 'endef' directive", fname, lineno);
                     }
                     parser.in_define = false;
-                    let value = parser.define_lines.join("\n");
+                    let raw_value = parser.define_lines.join("\n");
+                    // For simple (:= / ::=) assignments, expand value immediately.
+                    // For shell (!=), run the shell command and store result.
+                    // For recursive/append/conditional, store value verbatim.
+                    let value = match parser.define_flavor {
+                        VarFlavor::Simple => self.expand(&raw_value),
+                        VarFlavor::Shell => {
+                            let expanded_cmd = self.expand(&raw_value);
+                            let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
+                            *self.last_shell_status.borrow_mut() = status;
+                            result
+                        }
+                        _ => raw_value.clone(),
+                    };
                     let var = Variable::new(
-                        value,
+                        value.clone(),
                         parser.define_flavor.clone(),
                         VarOrigin::File,
                     );
@@ -566,7 +579,7 @@ impl MakeState {
                                 VarFlavor::Append => {
                                     if let Some(existing) = self.db.variables.get_mut(&name) {
                                         existing.value.push('\n');
-                                        existing.value.push_str(&parser.define_lines.join("\n"));
+                                        existing.value.push_str(&raw_value);
                                     } else {
                                         self.db.variables.insert(name, var);
                                     }
@@ -997,12 +1010,24 @@ impl MakeState {
                         self.db.variables.shift_remove(&name);
                     }
                 }
-                ParsedLine::Define { name, flavor, is_override, is_export } => {
+                ParsedLine::Define { name, flavor, is_override, is_export, has_extraneous } => {
+                    // Warn about extraneous text after define directive
+                    if has_extraneous {
+                        let fname = parser.filename.to_string_lossy();
+                        eprintln!("{}:{}: extraneous text after 'define' directive", fname, lineno);
+                    }
+                    // Empty variable name is a fatal error
+                    if name.is_empty() {
+                        let fname = parser.filename.to_string_lossy();
+                        eprintln!("{}:{}: *** empty variable name.  Stop.", fname, lineno);
+                        return Err(String::new());
+                    }
                     parser.in_define = true;
                     parser.define_name = name;
                     parser.define_flavor = flavor;
                     parser.define_override = is_override;
                     parser.define_export = is_export;
+                    parser.define_lineno = lineno;
                     parser.define_lines.clear();
                 }
                 ParsedLine::Empty | ParsedLine::Comment => {
@@ -1013,6 +1038,13 @@ impl MakeState {
                 }
                 _ => {}
             }
+        }
+
+        // Check for unterminated define block (missing endef)
+        if parser.in_define {
+            let fname = parser.filename.to_string_lossy();
+            eprintln!("{}:{}: *** missing 'endef', unterminated 'define'.  Stop.", fname, parser.define_lineno);
+            return Err(String::new());
         }
 
         // Register the last rule (and any static-pattern siblings).
@@ -1056,7 +1088,18 @@ impl MakeState {
                     }
                     SpecialTarget::Suffixes => {
                         if rule.prerequisites.is_empty() {
+                            // .SUFFIXES: with no prereqs clears the suffix list AND
+                            // removes all built-in (default) implicit rules.
                             self.db.suffixes.clear();
+                            // Remove built-in pattern rules (the first
+                            // builtin_pattern_rules_count entries).
+                            let n = self.db.builtin_pattern_rules_count;
+                            if n > 0 && self.db.pattern_rules.len() >= n {
+                                self.db.pattern_rules.drain(..n);
+                                self.db.builtin_pattern_rules_count = 0;
+                            }
+                            // Also clear any suffix rules.
+                            self.db.suffix_rules.clear();
                         } else {
                             self.db.suffixes.extend(rule.prerequisites.clone());
                         }
@@ -1098,8 +1141,9 @@ impl MakeState {
             let target = &rule.targets[0];
             if is_suffix_rule(target, &self.db.suffixes) {
                 self.db.suffix_rules.push(rule.clone());
-                // Also register as pattern rule
-                if let Some(pattern_rule) = suffix_to_pattern_rule(target, &rule) {
+                // Also register as pattern rule, using the actual current suffix list.
+                let suffixes_clone = self.db.suffixes.clone();
+                if let Some(pattern_rule) = suffix_to_pattern_rule(target, &rule, &suffixes_clone) {
                     self.db.pattern_rules.push(pattern_rule);
                 }
             }
@@ -1817,18 +1861,22 @@ fn is_suffix_rule(target: &str, suffixes: &[String]) -> bool {
     false
 }
 
-fn suffix_to_pattern_rule(target: &str, rule: &Rule) -> Option<Rule> {
-    // Convert .c.o to %.o: %.c
-    let suffixes_db = vec![
-        ".out", ".a", ".ln", ".o", ".c", ".cc", ".C", ".cpp",
-        ".p", ".f", ".F", ".m", ".r", ".y", ".l", ".s", ".S",
-        ".h", ".sh",
-    ];
-
-    for s1 in &suffixes_db {
-        if target.starts_with(s1) {
+fn suffix_to_pattern_rule(target: &str, rule: &Rule, suffixes: &[String]) -> Option<Rule> {
+    // Convert double-suffix rule .s1.s2 to %.s2: %.s1
+    // Convert single-suffix rule .s1    to %: %.s1
+    // Uses the actual current suffix list.
+    for s1 in suffixes {
+        if target.starts_with(s1.as_str()) {
             let s2 = &target[s1.len()..];
-            if !s2.is_empty() && suffixes_db.contains(&s2) {
+            if s2.is_empty() {
+                // Single-suffix rule: .s1: → %: %.s1
+                let mut pattern_rule = rule.clone();
+                pattern_rule.targets = vec!["%".to_string()];
+                pattern_rule.prerequisites = vec![format!("%{}", s1)];
+                pattern_rule.is_pattern = true;
+                return Some(pattern_rule);
+            } else if suffixes.iter().any(|s| s.as_str() == s2) {
+                // Double-suffix rule: .s1.s2 → %.s2: %.s1
                 let mut pattern_rule = rule.clone();
                 pattern_rule.targets = vec![format!("%{}", s2)];
                 pattern_rule.prerequisites = vec![format!("%{}", s1)];
