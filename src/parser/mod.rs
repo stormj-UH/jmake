@@ -55,6 +55,8 @@ impl Parser {
 
     pub fn load_file(&mut self) -> io::Result<()> {
         let content = fs::read_to_string(&self.filename)?;
+        // Strip UTF-8 BOM if present
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
         self.lines = content.lines().map(String::from).collect();
         self.pos = 0;
         self.lineno = 0;
@@ -62,6 +64,8 @@ impl Parser {
     }
 
     pub fn load_string(&mut self, content: &str) {
+        // Strip UTF-8 BOM if present
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
         self.lines = content.lines().map(String::from).collect();
         self.pos = 0;
         self.lineno = 0;
@@ -81,10 +85,25 @@ impl Parser {
         self.pos += 1;
 
         // Handle backslash line continuations
+        // For recipe lines (tab-prefixed), preserve the backslash-newline so the
+        // shell can handle continuation. For other lines, collapse to a single space.
         while line.ends_with('\\') && self.pos < self.lines.len() {
-            line.pop(); // remove backslash
-            line.push(' ');
-            line.push_str(self.lines[self.pos].trim_start());
+            if line.starts_with('\t') {
+                // Recipe line: preserve \<newline> for the shell
+                line.push('\n');
+                // Strip the leading tab from the continuation line
+                let next = &self.lines[self.pos];
+                let stripped = if next.starts_with('\t') {
+                    &next[1..]
+                } else {
+                    next.trim_start()
+                };
+                line.push_str(stripped);
+            } else {
+                line.pop(); // remove backslash
+                line.push(' ');
+                line.push_str(self.lines[self.pos].trim_start());
+            }
             self.pos += 1;
         }
 
@@ -261,14 +280,14 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
     // But don't confuse with rules - target-specific has a known assignment op after the colon part
 
     // Find assignment operator
-    let ops = ["::=", "!=", "?=", "+=", ":=", "="];
+    let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     for op in &ops {
         if let Some(pos) = find_assignment_op(work, op) {
             let name = work[..pos].trim().to_string();
             let value = work[pos + op.len()..].trim_start().to_string();
             let flavor = match *op {
                 "=" => VarFlavor::Recursive,
-                ":=" | "::=" => VarFlavor::Simple,
+                ":=" | "::=" | ":::=" => VarFlavor::Simple,
                 "+=" => VarFlavor::Append,
                 "?=" => VarFlavor::Conditional,
                 "!=" => VarFlavor::Shell,
@@ -276,23 +295,45 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
             };
 
             // Check if this is a target-specific variable
+            // But NOT if the name contains `;` (which indicates an inline recipe)
             if let Some(colon_pos) = name.find(':') {
                 let potential_target = name[..colon_pos].trim();
-                let potential_var = name[colon_pos+1..].trim();
+                let raw_var_part = name[colon_pos+1..].trim();
+                // Strip override/export/private prefixes from the variable part
+                let (inner_override, inner_export, inner_private, potential_var) =
+                    strip_var_prefixes(raw_var_part);
+                let effective_override = is_override || inner_override;
+                let effective_export = is_export || inner_export;
+                let effective_private = is_private || inner_private;
                 if !potential_target.is_empty() && !potential_var.is_empty()
-                    && !potential_target.contains('%')
                     && !potential_var.contains('/')
+                    && !potential_var.contains(';')
+                    && !potential_target.contains(';')
+                    && is_valid_variable_name(potential_var)
                 {
                     return Some(ParsedLine::VariableAssignment {
                         name: potential_var.to_string(),
                         value,
                         flavor,
-                        is_override,
-                        is_export,
-                        is_private,
+                        is_override: effective_override,
+                        is_export: effective_export,
+                        is_private: effective_private,
                         target: Some(potential_target.to_string()),
                     });
                 }
+            }
+
+            // Don't treat as variable assignment if name contains `:` followed by `;`
+            // That's a rule with an inline recipe like: target:;recipe=value
+            if name.contains(':') && (name.contains(';') || name.contains('\t')) {
+                // This is likely a rule, not a variable assignment
+                return None;
+            }
+
+            // Valid variable name check (no colons in plain variable names;
+            // colons indicate it could be a rule)
+            if name.contains(':') {
+                return None;
             }
 
             return Some(ParsedLine::VariableAssignment {
@@ -337,6 +378,11 @@ fn find_assignment_op(line: &str, op: &str) -> Option<usize> {
                     _ => {}
                 }
             }
+            // For '::=', make sure it's not part of ':::='
+            if op == "::=" && i > 0 && bytes[i-1] == b':' {
+                i += 1;
+                continue;
+            }
             return Some(i);
         }
         i += 1;
@@ -345,9 +391,10 @@ fn find_assignment_op(line: &str, op: &str) -> Option<usize> {
 }
 
 pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
-    // Find the colon that separates targets from prerequisites
-    // Must handle target: prereqs, target:: prereqs (double colon)
-    // Also handle pattern rules with %
+    // Find the colon that separates targets from prerequisites.
+    // Handles: target: prereqs, target:: prereqs (double-colon),
+    //          and static pattern rules: targets: target-pattern: prereq-patterns
+    //          (and their double-colon variants).
 
     let colon_pos = find_rule_colon(line)?;
     let is_double_colon = line[colon_pos..].starts_with("::");
@@ -359,35 +406,58 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
         &line[colon_pos+1..]
     };
 
+    // Detect static pattern rule: the text after the first colon (or ::)
+    // contains a second bare colon, and the part before that second colon
+    // (the target-pattern) contains a `%`.
+    // Example:  "foo.o bar.o: %.o: %.c"
+    //           rest = " %.o: %.c"  →  second colon found at "%.o"
+    let rest_trimmed = rest.trim();
+    if let Some(second_colon) = find_bare_colon(rest_trimmed) {
+        let target_pattern_str = rest_trimmed[..second_colon].trim();
+        if target_pattern_str.contains('%') {
+            let after_second = rest_trimmed[second_colon + 1..].trim();
+            let targets: Vec<String> = split_words(targets_str);
+            if !targets.is_empty() {
+                return Some(expand_static_pattern_rule(
+                    targets,
+                    target_pattern_str,
+                    after_second,
+                    is_double_colon,
+                ));
+            }
+        }
+    }
+
     // Check for target-specific variable assignment in rest, but only in the
     // part before any inline recipe (i.e., before a bare `;`).
     // e.g., "target: VAR = value" but NOT "target: ; @echo $(VAR=x)"
-    let rest_trimmed = rest.trim();
     let prereq_part = match find_semicolon(rest_trimmed) {
         Some(semi) => &rest_trimmed[..semi],
         None => rest_trimmed,
     };
-    let ops = ["::=", "!=", "?=", "+=", ":=", "="];
+    let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     for op in &ops {
         if let Some(pos) = find_assignment_op(prereq_part.trim(), op) {
-            let var_name = prereq_part.trim()[..pos].trim().to_string();
+            let raw_var_name = prereq_part.trim()[..pos].trim();
+            // Strip override/export/private prefixes from the variable name
+            let (is_override, is_export, is_private, var_name) = strip_var_prefixes(raw_var_name);
             let var_value = prereq_part.trim()[pos + op.len()..].trim_start().to_string();
-            if !var_name.is_empty() && is_valid_variable_name(&var_name) {
+            if !var_name.is_empty() && is_valid_variable_name(var_name) {
                 let flavor = match *op {
                     "=" => VarFlavor::Recursive,
-                    ":=" | "::=" => VarFlavor::Simple,
+                    ":=" | "::=" | ":::=" => VarFlavor::Simple,
                     "+=" => VarFlavor::Append,
                     "?=" => VarFlavor::Conditional,
                     "!=" => VarFlavor::Shell,
                     _ => VarFlavor::Recursive,
                 };
                 return Some(ParsedLine::VariableAssignment {
-                    name: var_name,
+                    name: var_name.to_string(),
                     value: var_value,
                     flavor,
-                    is_override: false,
-                    is_export: false,
-                    is_private: false,
+                    is_override,
+                    is_export,
+                    is_private,
                     target: Some(targets_str.to_string()),
                 });
             }
@@ -401,8 +471,25 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
 
     // Split prerequisites and order-only prerequisites (after |), and extract
     // any inline recipe that appears after a bare `;`.
-    let (prereqs, order_only, inline_recipe) = split_prerequisites(rest.trim());
+    let rest_trimmed2 = rest.trim();
+    let (prereqs, order_only, inline_recipe) = split_prerequisites(rest_trimmed2);
     let is_pattern = targets.iter().any(|t| t.contains('%'));
+
+    // Also compute the raw (unsplit) prerequisite text for second expansion.
+    // This is the text before the `;` (if any) and before `|` for order-only.
+    let (raw_prereq_text, raw_order_only_text) = {
+        let prereq_part = match find_semicolon(rest_trimmed2) {
+            Some(pos) => &rest_trimmed2[..pos],
+            None => rest_trimmed2,
+        };
+        if let Some(pipe_pos) = find_pipe(prereq_part) {
+            let normal = prereq_part[..pipe_pos].trim().to_string();
+            let oo = prereq_part[pipe_pos + 1..].trim().to_string();
+            (normal, oo)
+        } else {
+            (prereq_part.trim().to_string(), String::new())
+        }
+    };
 
     let mut rule = Rule::new();
     rule.targets = targets;
@@ -410,6 +497,15 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     rule.order_only_prerequisites = order_only;
     rule.is_pattern = is_pattern;
     rule.is_double_colon = is_double_colon;
+    // Store the raw (unsplit) prerequisite text for second expansion, but ONLY
+    // when the text contains '$' (i.e., has deferred variable references that
+    // need build-time re-expansion).  Plain prereqs like "bar baz" need no SE.
+    if raw_prereq_text.contains('$') {
+        rule.second_expansion_prereqs = Some(raw_prereq_text);
+    }
+    if raw_order_only_text.contains('$') {
+        rule.second_expansion_order_only = Some(raw_order_only_text);
+    }
 
     // If there was an inline recipe after the `;`, add it as the first recipe line.
     // Line number will be stamped by the caller (process_parsed_lines) which has the lineno.
@@ -418,6 +514,167 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     }
 
     Some(ParsedLine::Rule(rule))
+}
+
+/// Find the byte position of the first bare `:` in `s` that is NOT part of
+/// the operator `::=`.  Variable references (`$(...)`, `${...}`, `$x`) are
+/// skipped.  Returns `None` if no such colon exists.
+///
+/// Used to locate the second colon in a static pattern rule after the first
+/// colon (and the potential `::`) have already been consumed by the caller.
+fn find_bare_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut paren_depth = 0i32;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' => {
+                if i + 1 < bytes.len() {
+                    match bytes[i + 1] {
+                        b'(' | b'{' => {
+                            paren_depth += 1;
+                            i += 2;
+                            continue;
+                        }
+                        _ => {
+                            i += 2; // single-char reference like `$@`
+                            continue;
+                        }
+                    }
+                }
+            }
+            b'(' | b'{' if paren_depth > 0 => paren_depth += 1,
+            b')' | b'}' if paren_depth > 0 => paren_depth -= 1,
+            b':' if paren_depth == 0 => {
+                // Skip ::= (it is a variable-assignment operator, not a rule separator)
+                if i + 2 < bytes.len() && bytes[i + 1] == b':' && bytes[i + 2] == b'=' {
+                    return None;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match `target` against `pattern` (which contains at most one `%`) and
+/// return the stem — the substring that `%` stands for — or `None` if the
+/// target does not match.
+///
+/// GNU Make rules:
+///   - The literal text before `%` must be a prefix of `target`.
+///   - The literal text after  `%` must be a suffix of `target`.
+///   - The prefix and suffix together must not exceed `target.len()`.
+pub fn match_pattern(target: &str, pattern: &str) -> Option<String> {
+    match pattern.find('%') {
+        None => {
+            // Literal pattern — only matches an identical target.
+            if target == pattern {
+                Some(String::new())
+            } else {
+                None
+            }
+        }
+        Some(pct) => {
+            let prefix = &pattern[..pct];
+            let suffix = &pattern[pct + 1..];
+
+            if target.len() < prefix.len() + suffix.len() {
+                return None;
+            }
+            if !target.starts_with(prefix) {
+                return None;
+            }
+            let stem_end = target.len() - suffix.len();
+            if !target[stem_end..].ends_with(suffix) {
+                return None;
+            }
+            if stem_end < prefix.len() {
+                return None;
+            }
+            Some(target[prefix.len()..stem_end].to_string())
+        }
+    }
+}
+
+/// Replace the **first** occurrence of `%` in `pattern` with `stem`.
+/// Subsequent `%` characters are left unchanged (GNU Make semantics).
+pub fn apply_stem(pattern: &str, stem: &str) -> String {
+    match pattern.find('%') {
+        None => pattern.to_string(),
+        Some(pct) => {
+            let mut result = String::with_capacity(pattern.len() + stem.len());
+            result.push_str(&pattern[..pct]);
+            result.push_str(stem);
+            result.push_str(&pattern[pct + 1..]);
+            result
+        }
+    }
+}
+
+/// Expand a static pattern rule into a [`ParsedLine::StaticPatternExpansion`].
+///
+/// For each target in `targets`:
+///   1. Match against `target_pattern` to extract the stem.
+///   2. Substitute the stem into each prerequisite pattern.
+///   3. Build an explicit `Rule` for that (target, resolved prerequisites) pair.
+///
+/// Targets that do not match the target pattern are skipped (GNU Make ignores
+/// them silently, just as unmatched implicit rules are ignored).
+fn expand_static_pattern_rule(
+    targets: Vec<String>,
+    target_pattern: &str,
+    prereq_str: &str,
+    is_double_colon: bool,
+) -> ParsedLine {
+    let (prereq_patterns, order_only_patterns, inline_recipe) =
+        split_prerequisites(prereq_str);
+
+    let mut rules: Vec<Rule> = Vec::new();
+
+    for target in targets {
+        let stem = match match_pattern(&target, target_pattern) {
+            Some(s) => s,
+            None => continue, // target doesn't match pattern — skip
+        };
+
+        // Substitute the stem into every prerequisite pattern.
+        // Empty results (e.g. when the pattern is just `%` and the stem is
+        // empty, or after substitution the word becomes empty) are kept — GNU
+        // Make keeps them; filtering them out would change semantics.
+        let prereqs: Vec<String> = prereq_patterns
+            .iter()
+            .map(|p| apply_stem(p, &stem))
+            .collect();
+
+        let order_only: Vec<String> = order_only_patterns
+            .iter()
+            .map(|p| apply_stem(p, &stem))
+            .collect();
+
+        let mut rule = Rule::new();
+        rule.targets = vec![target];
+        rule.prerequisites = prereqs;
+        rule.order_only_prerequisites = order_only;
+        // Static pattern rules create explicit (non-pattern) rules.
+        rule.is_pattern = false;
+        rule.is_double_colon = is_double_colon;
+        // Store the stem so the executor can provide a correct `$*`.
+        rule.static_stem = stem;
+
+        // Inline recipe after `;` is propagated to every generated rule.
+        // The caller will stamp the real line number (entry.0 == 0 is the cue).
+        if let Some(ref recipe_line) = inline_recipe {
+            rule.recipe.push((0, recipe_line.clone()));
+        }
+
+        rules.push(rule);
+    }
+
+    ParsedLine::StaticPatternExpansion(rules)
 }
 
 fn find_rule_colon(line: &str) -> Option<usize> {
@@ -473,8 +730,45 @@ fn is_valid_variable_name(name: &str) -> bool {
         && !name.contains(' ')
         && !name.contains('\t')
         && !name.contains('#')
-        && !name.contains('/')
-        && !name.contains('\\')
+}
+
+/// Strip leading override/export/private prefixes from a variable name token.
+/// Returns (is_override, is_export, is_private, remaining_name).
+/// E.g. "override FOO" → (true, false, false, "FOO")
+///      "export override BAR" → (true, true, false, "BAR")
+pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, &str) {
+    let mut is_override = false;
+    let mut is_export = false;
+    let mut is_private = false;
+    let mut rest = s.trim();
+    loop {
+        if let Some(r) = rest.strip_prefix("override") {
+            let r = r.trim_start();
+            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+                is_override = true;
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(r) = rest.strip_prefix("export") {
+            let r = r.trim_start();
+            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+                is_export = true;
+                rest = r;
+                continue;
+            }
+        }
+        if let Some(r) = rest.strip_prefix("private") {
+            let r = r.trim_start();
+            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+                is_private = true;
+                rest = r;
+                continue;
+            }
+        }
+        break;
+    }
+    (is_override, is_export, is_private, rest)
 }
 
 pub fn split_words(s: &str) -> Vec<String> {

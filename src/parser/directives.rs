@@ -3,6 +3,48 @@
 
 use crate::types::*;
 
+/// Find the position of assignment operator `op` in `line`, respecting
+/// parenthesis depth and `$` escaping (same logic as `find_assignment_op` in
+/// `parser/mod.rs`).  Returns `None` if the operator is not found.
+fn find_assignment_op_in(line: &str, op: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut i = 0;
+    let mut paren_depth = 0i32;
+
+    while i + op_bytes.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' | b'{' => paren_depth += 1,
+            b')' | b'}' => paren_depth -= 1,
+            b'$' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if paren_depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
+            // For bare '=', make sure it's not part of ':=', '!=', '?=', '+='
+            if op == "=" && i > 0 {
+                match bytes[i - 1] {
+                    b':' | b'!' | b'?' | b'+' => {
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // For '::=', make sure it's not part of ':::='
+            if op == "::=" && i > 0 && bytes[i-1] == b':' {
+                i += 1;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn parse_conditional(line: &str) -> Option<ParsedLine> {
     let trimmed = line.trim();
 
@@ -207,29 +249,32 @@ pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
         }
     }
 
-    // Check if it's `export VAR = value` (variable assignment with export)
-    let ops = ["::=", "!=", "?=", "+=", ":=", "="];
+    // Check if it's `export VAR = value` or even `export = value` (where the
+    // variable name IS "export").
+    let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     for op in &ops {
-        if rest.contains(op) {
-            // This is an export with assignment - delegate to variable parsing
-            // but mark it as export
+        if let Some(pos) = find_assignment_op_in(rest, op) {
+            let var_name_raw = rest[..pos].trim();
+            // If the name portion is empty, the keyword itself is the variable name
+            // (e.g. `export = 123` defines a variable literally named "export").
+            let var_name = if var_name_raw.is_empty() {
+                keyword.to_string()
+            } else {
+                var_name_raw.to_string()
+            };
+            let var_value = rest[pos + op.len()..].trim_start().to_string();
+            let flavor = match *op {
+                "=" => VarFlavor::Recursive,
+                ":=" | "::=" | ":::=" => VarFlavor::Simple,
+                "+=" => VarFlavor::Append,
+                "?=" => VarFlavor::Conditional,
+                "!=" => VarFlavor::Shell,
+                _ => VarFlavor::Recursive,
+            };
             return ParsedLine::VariableAssignment {
-                name: {
-                    let pos = rest.find(op).unwrap();
-                    rest[..pos].trim().to_string()
-                },
-                value: {
-                    let pos = rest.find(op).unwrap();
-                    rest[pos + op.len()..].trim_start().to_string()
-                },
-                flavor: match *op {
-                    "=" => VarFlavor::Recursive,
-                    ":=" | "::=" => VarFlavor::Simple,
-                    "+=" => VarFlavor::Append,
-                    "?=" => VarFlavor::Conditional,
-                    "!=" => VarFlavor::Shell,
-                    _ => VarFlavor::Recursive,
-                },
+                name: var_name,
+                value: var_value,
+                flavor,
                 is_override: false,
                 is_export: true,
                 is_private: false,
@@ -273,7 +318,7 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
     let work = rest.to_string();
 
     // Check for assignment operator at end
-    let ops = ["::=", "!=", "?=", "+=", ":=", "="];
+    let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     let mut flavor = VarFlavor::Recursive;
     let mut name = work.clone();
 
@@ -282,7 +327,7 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
             name = work[..work.len() - op.len()].trim().to_string();
             flavor = match *op {
                 "=" => VarFlavor::Recursive,
-                ":=" | "::=" => VarFlavor::Simple,
+                ":=" | "::=" | ":::=" => VarFlavor::Simple,
                 "+=" => VarFlavor::Append,
                 "?=" => VarFlavor::Conditional,
                 "!=" => VarFlavor::Shell,
@@ -296,7 +341,7 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
             name = work[..work.len() - with_space.len()].trim().to_string();
             flavor = match *op {
                 "=" => VarFlavor::Recursive,
-                ":=" | "::=" => VarFlavor::Simple,
+                ":=" | "::=" | ":::=" => VarFlavor::Simple,
                 "+=" => VarFlavor::Append,
                 "?=" => VarFlavor::Conditional,
                 "!=" => VarFlavor::Shell,

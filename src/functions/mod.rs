@@ -300,17 +300,23 @@ fn fn_abspath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 
 fn normalize_path(path: &Path) -> String {
     let mut components = Vec::new();
+    let mut is_absolute = false;
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::RootDir => { is_absolute = true; }
+            std::path::Component::ParentDir => {
+                if !components.is_empty() {
+                    components.pop();
+                }
+            }
             std::path::Component::CurDir => {}
             c => components.push(c.as_os_str().to_string_lossy().to_string()),
         }
     }
-    if components.is_empty() {
-        "/".to_string()
-    } else if path.is_absolute() {
+    if is_absolute {
         format!("/{}", components.join("/"))
+    } else if components.is_empty() {
+        ".".to_string()
     } else {
         components.join("/")
     }

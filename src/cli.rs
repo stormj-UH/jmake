@@ -22,6 +22,7 @@ pub struct MakeArgs {
     pub no_builtin_variables: bool,
     pub print_data_base: bool,
     pub debug: Vec<String>,
+    pub debug_short: bool, // true if -d was given (short flag), shows as 'd' in MAKEFLAGS
     pub directory: Option<PathBuf>,
     pub include_dirs: Vec<PathBuf>,
     pub old_file: Vec<String>,
@@ -59,6 +60,7 @@ impl Default for MakeArgs {
             no_builtin_variables: false,
             print_data_base: false,
             debug: Vec::new(),
+            debug_short: false,
             directory: None,
             include_dirs: Vec::new(),
             old_file: Vec::new(),
@@ -75,6 +77,16 @@ impl Default for MakeArgs {
             eval_strings: Vec::new(),
             what_if: Vec::new(),
         }
+    }
+}
+
+fn require_arg(args: &[String], i: usize, opt: &str) -> String {
+    if i < args.len() {
+        args[i].clone()
+    } else {
+        let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
+        eprintln!("{}: option requires an argument -- '{}'", progname, opt);
+        std::process::exit(2);
     }
 }
 
@@ -122,9 +134,8 @@ pub fn parse_args() -> MakeArgs {
                 "--environment-overrides" => result.environment_overrides = true,
                 "--file" | "--makefile" => {
                     i += 1;
-                    if i < args.len() {
-                        result.makefiles.push(PathBuf::from(&args[i]));
-                    }
+                    let val = require_arg(&args, i, if arg == "--file" { "file" } else { "makefile" });
+                    result.makefiles.push(PathBuf::from(val));
                 }
                 "--ignore-errors" => result.ignore_errors = true,
                 "--include-dir" => {
@@ -243,7 +254,10 @@ pub fn parse_args() -> MakeArgs {
                         j = chars.len(); // consumed rest
                         continue;
                     }
-                    'd' => result.debug.push("b".to_string()),
+                    'd' => {
+                        result.debug_short = true;
+                        result.debug.push("b".to_string());
+                    }
                     'e' => result.environment_overrides = true,
                     'f' => {
                         let rest: String = chars[j+1..].iter().collect();
@@ -251,9 +265,8 @@ pub fn parse_args() -> MakeArgs {
                             result.makefiles.push(PathBuf::from(rest));
                         } else {
                             i += 1;
-                            if i < args.len() {
-                                result.makefiles.push(PathBuf::from(&args[i]));
-                            }
+                            let val = require_arg(&args, i, "f");
+                            result.makefiles.push(PathBuf::from(val));
                         }
                         j = chars.len();
                         continue;
@@ -306,6 +319,19 @@ pub fn parse_args() -> MakeArgs {
                     'n' => {
                         result.dry_run = true;
                         result.just_print = true;
+                    }
+                    'O' => {
+                        let rest: String = chars[j+1..].iter().collect();
+                        if !rest.is_empty() {
+                            result.output_sync = Some(rest);
+                        } else {
+                            i += 1;
+                            if i < args.len() {
+                                result.output_sync = Some(args[i].clone());
+                            }
+                        }
+                        j = chars.len();
+                        continue;
                     }
                     'o' => {
                         let rest: String = chars[j+1..].iter().collect();
@@ -364,33 +390,219 @@ pub fn parse_args() -> MakeArgs {
     result
 }
 
-fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
-    // MAKEFLAGS can contain single-letter flags bundled, or --long-options
-    let parts: Vec<&str> = flags.split_whitespace().collect();
-    for part in parts {
-        if part.starts_with("--") {
-            // handled similarly to main args
+pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
+    // MAKEFLAGS format:
+    //   - May start with single-letter flags bundled (no leading '-'), e.g. "erR"
+    //   - Followed by long options: "--trace --no-print-directory"
+    //   - Options with args like "-Idir", "-l2.5", "-Onone", "--debug=b"
+    //   - Variable assignments after "--": "-- FOO=bar"
+    //
+    // We tokenize and parse similarly to command-line args, but the first token
+    // (if it doesn't start with '-') is treated as bundled single-char flags.
+
+    let trimmed = flags.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Split into tokens by whitespace but respect that "-I" args may be attached
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut i = 0;
+    let mut past_dashdash = false;
+    let mut first_token = true;
+
+    while i < tokens.len() {
+        let token = tokens[i];
+
+        if past_dashdash {
+            // Variable assignment: NAME=value or NAME:=value etc.
+            // Add to variables so they're included in MAKEFLAGS output
+            // and applied as command-line-level overrides in sub-makes.
+            if let Some(eq_pos) = token.find('=') {
+                let name = token[..eq_pos].to_string();
+                let value = token[eq_pos+1..].to_string();
+                result.variables.push((name, value));
+            }
+            i += 1;
             continue;
         }
-        // Single letter flags (may not have leading -)
-        for ch in part.chars() {
-            match ch {
-                '-' => {}
-                'k' => result.keep_going = true,
-                's' => result.silent = true,
-                'i' => result.ignore_errors = true,
-                'n' => {
+
+        if token == "--" {
+            past_dashdash = true;
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with("--") {
+            first_token = false;
+            match token {
+                "--always-make" => result.always_make = true,
+                "--environment-overrides" => result.environment_overrides = true,
+                "--ignore-errors" => result.ignore_errors = true,
+                "--keep-going" => result.keep_going = true,
+                "--no-keep-going" | "--stop" => result.keep_going = false,
+                "--dry-run" | "--just-print" | "--recon" => {
                     result.dry_run = true;
                     result.just_print = true;
                 }
-                'r' => result.no_builtin_rules = true,
-                'R' => result.no_builtin_variables = true,
-                'B' => result.always_make = true,
-                'e' => result.environment_overrides = true,
-                'w' => result.print_directory = true,
+                "--no-builtin-rules" => result.no_builtin_rules = true,
+                "--no-builtin-variables" => result.no_builtin_variables = true,
+                "--no-print-directory" => {
+                    result.no_print_directory = true;
+                    result.print_directory = false;
+                }
+                "--print-directory" => {
+                    result.print_directory = true;
+                    result.no_print_directory = false;
+                }
+                "--silent" | "--quiet" => result.silent = true,
+                "--no-silent" => result.silent = false,
+                "--touch" => result.touch = true,
+                "--trace" => result.trace = true,
+                "--warn-undefined-variables" => result.warn_undefined_variables = true,
+                "--check-symlink-times" => result.check_symlink_times = true,
+                _ if token.starts_with("--debug=") => {
+                    result.debug.push(token[8..].to_string());
+                }
+                _ if token.starts_with("--jobs=") => {
+                    result.jobs = token[7..].parse().unwrap_or(1);
+                }
+                _ if token.starts_with("--output-sync=") => {
+                    result.output_sync = Some(token[14..].to_string());
+                }
+                _ if token.starts_with("--include-dir=") => {
+                    result.include_dirs.push(std::path::PathBuf::from(&token[14..]));
+                }
+                _ if token.starts_with("--load-average=") => {
+                    result.load_average = token[15..].parse().ok();
+                }
                 _ => {}
             }
+            i += 1;
+            continue;
         }
+
+        if token.starts_with('-') {
+            first_token = false;
+            // Short options with '-' prefix (like -Idir, -l2.5, -Onone)
+            let rest = &token[1..];
+            if rest.is_empty() {
+                i += 1;
+                continue;
+            }
+            let chars: Vec<char> = rest.chars().collect();
+            let mut j = 0;
+            while j < chars.len() {
+                match chars[j] {
+                    'B' => result.always_make = true,
+                    'e' => result.environment_overrides = true,
+                    'i' => result.ignore_errors = true,
+                    'I' => {
+                        let arg: String = chars[j+1..].iter().collect();
+                        if !arg.is_empty() {
+                            result.include_dirs.push(std::path::PathBuf::from(arg));
+                        } else if i + 1 < tokens.len() {
+                            i += 1;
+                            result.include_dirs.push(std::path::PathBuf::from(tokens[i]));
+                        }
+                        j = chars.len();
+                        continue;
+                    }
+                    'k' => result.keep_going = true,
+                    'l' | 'L' => {
+                        let arg: String = chars[j+1..].iter().collect();
+                        if !arg.is_empty() {
+                            result.load_average = arg.parse().ok();
+                        } else if i + 1 < tokens.len() {
+                            i += 1;
+                            result.load_average = tokens[i].parse().ok();
+                        }
+                        j = chars.len();
+                        continue;
+                    }
+                    'n' => {
+                        result.dry_run = true;
+                        result.just_print = true;
+                    }
+                    'O' => {
+                        let arg: String = chars[j+1..].iter().collect();
+                        if !arg.is_empty() {
+                            result.output_sync = Some(arg);
+                        } else if i + 1 < tokens.len() {
+                            i += 1;
+                            result.output_sync = Some(tokens[i].to_string());
+                        }
+                        j = chars.len();
+                        continue;
+                    }
+                    'q' => result.question = true,
+                    'r' => result.no_builtin_rules = true,
+                    'R' => result.no_builtin_variables = true,
+                    's' => result.silent = true,
+                    'S' => result.keep_going = false,
+                    't' => result.touch = true,
+                    'w' => {
+                        result.print_directory = true;
+                        result.no_print_directory = false;
+                    }
+                    'd' => {
+                        result.debug_short = true;
+                        result.debug.push("b".to_string());
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // First token without '-' prefix: either bundled single-char flags (e.g. "erR")
+        // OR a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
+        // Check if it contains '=' to distinguish variable from flags.
+        if first_token {
+            first_token = false;
+            if token.contains('=') {
+                // This is a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
+                // Add to variables so it's included in MAKEFLAGS output.
+                if let Some(eq_pos) = token.find('=') {
+                    let name = token[..eq_pos].to_string();
+                    let value = token[eq_pos+1..].to_string();
+                    result.variables.push((name, value));
+                }
+            } else {
+                // Bundled single-char flags
+                for ch in token.chars() {
+                    match ch {
+                        'B' => result.always_make = true,
+                        'e' => result.environment_overrides = true,
+                        'i' => result.ignore_errors = true,
+                        'k' => result.keep_going = true,
+                        'n' => {
+                            result.dry_run = true;
+                            result.just_print = true;
+                        }
+                        'q' => result.question = true,
+                        'r' => result.no_builtin_rules = true,
+                        'R' => result.no_builtin_variables = true,
+                        's' => result.silent = true,
+                        'S' => result.keep_going = false,
+                        't' => result.touch = true,
+                        'w' => {
+                            result.print_directory = true;
+                            result.no_print_directory = false;
+                        }
+                        'd' => {
+                            result.debug_short = true;
+                            result.debug.push("b".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        i += 1;
     }
 }
 

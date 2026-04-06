@@ -171,5 +171,8 @@ fn make_pattern_rule(target: &str, prereqs: &[&str], recipe: &[&str]) -> Rule {
         is_terminal: false,
         target_specific_vars: indexmap::IndexMap::new(),
         source_file: String::new(),
+        static_stem: String::new(),
+        second_expansion_prereqs: None,
+        second_expansion_order_only: None,
     }
 }

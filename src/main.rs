@@ -28,8 +28,10 @@ fn main() {
     match state.run() {
         Ok(()) => process::exit(0),
         Err(e) => {
-            let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
-            eprintln!("{}: *** {}", progname, e);
+            if !e.is_empty() {
+                let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                eprintln!("{}: *** {}", progname, e);
+            }
             process::exit(2);
         }
     }

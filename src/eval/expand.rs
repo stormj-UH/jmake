@@ -41,8 +41,8 @@ impl MakeState {
                             i += 1;
                         }
                     }
-                    b'@' | b'<' | b'^' | b'+' | b'*' | b'?' | b'%' => {
-                        // Single-character automatic variables
+                    b'@' | b'<' | b'^' | b'+' | b'*' | b'?' | b'%' | b'|' => {
+                        // Single-character automatic variables (including $| for order-only)
                         let var_name = (bytes[i + 1] as char).to_string();
                         if let Some(val) = auto_vars.get(&var_name) {
                             result.push_str(val);
@@ -266,7 +266,7 @@ impl MakeState {
                 return self.expand_foreach(args_str, auto_vars);
             }
             "if" => {
-                let args = split_function_args(args_str);
+                let args = split_function_args_max(args_str, 3);
                 if args.is_empty() { return String::new(); }
                 let condition = self.expand_with_auto_vars(&args[0], auto_vars);
                 if !condition.trim().is_empty() {
@@ -309,13 +309,52 @@ impl MakeState {
             _ => {}
         }
 
-        // Standard function handling
-        let raw_args = split_function_args(args_str);
-        let expanded_args: Vec<String> = raw_args.iter()
-            .map(|a| self.expand_with_auto_vars(a, auto_vars))
-            .collect();
+        // Validate word/wordlist numeric arguments before dispatching
+        if name == "word" || name == "wordlist" {
+            let raw_args = split_function_args_max(args_str, if name == "word" { 2 } else { 3 });
+            let expanded_args: Vec<String> = raw_args.iter()
+                .map(|a| self.expand_with_auto_vars(a, auto_vars))
+                .collect();
+            let file = self.current_file.borrow();
+            let line = *self.current_line.borrow();
+            let loc = if file.is_empty() { String::new() } else { format!("{}:{}: ", file, line) };
 
-        if let Some((handler, min_args, max_args)) = builtins.get(name) {
+            let validate_numeric_arg = |arg: &str, func_name: &str, ordinal: &str, allow_zero: bool| {
+                let trimmed = arg.trim();
+                if trimmed.is_empty() {
+                    eprintln!("{}*** invalid {} argument to '{}' function: empty value.  Stop.", loc, ordinal, func_name);
+                    std::process::exit(2);
+                }
+                match trimmed.parse::<i64>() {
+                    Ok(n) if n < 0 || (!allow_zero && n == 0) => {
+                        eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg.trim_start());
+                        std::process::exit(2);
+                    }
+                    Err(_) => {
+                        if trimmed.chars().all(|c| c.is_ascii_digit()) {
+                            eprintln!("{}*** invalid {} argument to '{}' function: '{}' out of range.  Stop.", loc, ordinal, func_name, trimmed);
+                        } else {
+                            eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg.trim_start());
+                        }
+                        std::process::exit(2);
+                    }
+                    _ => {}
+                }
+            };
+            if name == "word" && expanded_args.len() >= 2 {
+                validate_numeric_arg(&expanded_args[0], "word", "first", false);
+            } else if name == "wordlist" && expanded_args.len() >= 3 {
+                validate_numeric_arg(&expanded_args[0], "wordlist", "first", false);
+                validate_numeric_arg(&expanded_args[1], "wordlist", "second", true);
+            }
+        }
+
+        // Standard function handling
+        if let Some((handler, _min_args, max_args)) = builtins.get(name) {
+            let raw_args = split_function_args_max(args_str, *max_args);
+            let expanded_args: Vec<String> = raw_args.iter()
+                .map(|a| self.expand_with_auto_vars(a, auto_vars))
+                .collect();
             let expand_fn = |s: &str| -> String {
                 self.expand_with_auto_vars(s, auto_vars)
             };
@@ -434,6 +473,10 @@ fn find_subst_ref_colon(content: &str) -> Option<usize> {
 }
 
 pub fn split_function_args(s: &str) -> Vec<String> {
+    split_function_args_max(s, usize::MAX)
+}
+
+pub fn split_function_args_max(s: &str, max_args: usize) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let bytes = s.as_bytes();
@@ -458,7 +501,7 @@ pub fn split_function_args(s: &str) -> Vec<String> {
                 current.push(bytes[i] as char);
                 i += 1;
             }
-            b',' if depth == 0 => {
+            b',' if depth == 0 && args.len() + 1 < max_args => {
                 args.push(current.clone());
                 current.clear();
                 i += 1;

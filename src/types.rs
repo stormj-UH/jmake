@@ -58,6 +58,18 @@ pub struct Rule {
     pub target_specific_vars: IndexMap<String, Variable>,
     /// The makefile file path where this rule was defined
     pub source_file: String,
+    /// The stem computed when this rule was derived from a static pattern rule.
+    /// Empty for rules that are not from static pattern rules, or for pattern
+    /// rules (where the stem is computed at build time).
+    pub static_stem: String,
+    /// Raw (post-first-expansion) prerequisite text for second expansion.
+    /// If this is Some, the prerequisites field holds already-expanded values
+    /// and this field holds the text that should be re-expanded at build time.
+    /// The string contains whitespace-separated prerequisite tokens but is NOT
+    /// split, so that function calls like $(addsuffix .3,foo) are kept intact.
+    pub second_expansion_prereqs: Option<String>,
+    /// Raw (post-first-expansion) order-only prerequisite text for second expansion.
+    pub second_expansion_order_only: Option<String>,
 }
 
 impl Rule {
@@ -72,6 +84,9 @@ impl Rule {
             is_terminal: false,
             target_specific_vars: IndexMap::new(),
             source_file: String::new(),
+            static_stem: String::new(),
+            second_expansion_prereqs: None,
+            second_expansion_order_only: None,
         }
     }
 }
@@ -170,10 +185,22 @@ pub enum ParsedLine {
         name: String,
         is_override: bool,
     },
+    /// Expanded static pattern rule: one Rule per target, already resolved.
+    StaticPatternExpansion(Vec<Rule>),
     Recipe(String),
     Comment,
     Empty,
     LoadDirective(String),
+}
+
+/// A pattern-specific variable assignment entry.
+/// E.g. `%.o: CFLAGS += -Wall` produces PatternSpecificVar { pattern: "%.o", var_name: "CFLAGS", ... }
+#[derive(Debug, Clone)]
+pub struct PatternSpecificVar {
+    pub pattern: String,
+    pub var_name: String,
+    pub var: Variable,
+    pub is_override: bool,
 }
 
 /// Database of all rules, variables, etc.
@@ -194,6 +221,12 @@ pub struct MakeDatabase {
     pub posix_mode: bool,
     pub not_parallel: bool,
     pub default_rule: Option<Rule>,
+    /// Names of variables that were originally imported from the process environment.
+    /// Even if overridden by the Makefile, these are still exported to child processes.
+    pub env_var_names: HashSet<String>,
+    /// Pattern-specific variable assignments (e.g. `%.o: CFLAGS += -Wall`).
+    /// Applied to any target matching the pattern, with correct override semantics.
+    pub pattern_specific_vars: Vec<PatternSpecificVar>,
 }
 
 impl MakeDatabase {
@@ -224,7 +257,9 @@ impl MakeDatabase {
             export_all: false,
             posix_mode: false,
             not_parallel: false,
+            env_var_names: HashSet::new(),
             default_rule: None,
+            pattern_specific_vars: Vec::new(),
         }
     }
 
