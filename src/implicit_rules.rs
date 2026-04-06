@@ -165,10 +165,11 @@ fn make_pattern_rule(target: &str, prereqs: &[&str], recipe: &[&str]) -> Rule {
         targets: vec![target.to_string()],
         prerequisites: prereqs.iter().map(|s| s.to_string()).collect(),
         order_only_prerequisites: Vec::new(),
-        recipe: recipe.iter().map(|s| s.to_string()).collect(),
+        recipe: recipe.iter().map(|s| (0usize, s.to_string())).collect(),
         is_pattern: true,
         is_double_colon: false,
         is_terminal: false,
         target_specific_vars: indexmap::IndexMap::new(),
+        source_file: String::new(),
     }
 }

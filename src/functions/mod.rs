@@ -263,11 +263,15 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let patterns: Vec<&str> = args[0].split_whitespace().collect();
     let mut results = Vec::new();
     for pattern in patterns {
+        let mut matches = Vec::new();
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
-                results.push(entry.to_string_lossy().to_string());
+                matches.push(entry.to_string_lossy().to_string());
             }
         }
+        // GNU Make sorts wildcard results lexicographically
+        matches.sort();
+        results.extend(matches);
     }
     results.join(" ")
 }
@@ -356,9 +360,12 @@ fn fn_foreach(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
     let body = &args[2];
 
     let results: Vec<String> = list.iter().map(|word| {
-        // Replace $(var) and ${var} in body with word, then expand
-        let substituted = body.replace(&format!("$({})", var), word)
-                             .replace(&format!("${{{}}}", var), word);
+        // Replace $(var), ${var}, and $v (single-char) in body with word, then expand
+        let mut substituted = body.replace(&format!("$({})", var), word)
+                                  .replace(&format!("${{{}}}", var), word);
+        if var.len() == 1 {
+            substituted = substituted.replace(&format!("${}", var), word);
+        }
         expand(&substituted)
     }).collect();
     results.join(" ")
@@ -425,7 +432,10 @@ fn fn_flavor(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     args[0].clone()
 }
 
-pub fn fn_shell_exec(cmd: &str) -> String {
+/// Execute a shell command, returning (stdout_processed, exit_code).
+/// stdout is processed per GNU Make rules: internal newlines replaced with spaces,
+/// trailing whitespace stripped.
+pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
@@ -433,16 +443,26 @@ pub fn fn_shell_exec(cmd: &str) -> String {
 
     match output {
         Ok(out) => {
-            let mut result = String::from_utf8_lossy(&out.stdout).to_string();
-            // Replace newlines with spaces, trim trailing
-            result = result.replace('\n', " ");
-            while result.ends_with(' ') {
-                result.pop();
-            }
-            result
+            let exit_code = out.status.code().unwrap_or(-1);
+            let raw = String::from_utf8_lossy(&out.stdout).to_string();
+            // GNU Make: replace internal newlines with spaces, strip trailing whitespace
+            let result = process_shell_output(&raw);
+            (result, exit_code)
         }
-        Err(_) => String::new(),
+        Err(_) => (String::new(), 127),
     }
+}
+
+/// Process shell output: replace newlines with spaces, trim trailing whitespace.
+fn process_shell_output(raw: &str) -> String {
+    // Replace all newlines with spaces
+    let with_spaces = raw.replace('\n', " ");
+    // Trim trailing whitespace (spaces that came from newlines or actual trailing spaces)
+    with_spaces.trim_end().to_string()
+}
+
+pub fn fn_shell_exec(cmd: &str) -> String {
+    fn_shell_exec_with_status(cmd).0
 }
 
 fn fn_shell(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -477,18 +497,19 @@ fn fn_let(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
 
     let mut substituted = body.clone();
     for (i, var) in vars.iter().enumerate() {
-        if i == vars.len() - 1 {
+        let val: String = if i == vars.len() - 1 {
             // Last variable gets all remaining words
-            let remaining: Vec<&str> = words[i..].to_vec();
-            let val = remaining.join(" ");
-            substituted = substituted.replace(&format!("$({})", var), &val)
-                                    .replace(&format!("${{{}}}", var), &val);
+            let remaining: Vec<&str> = if i < words.len() { words[i..].to_vec() } else { vec![] };
+            remaining.join(" ")
         } else if i < words.len() {
-            substituted = substituted.replace(&format!("$({})", var), words[i])
-                                    .replace(&format!("${{{}}}", var), words[i]);
+            words[i].to_string()
         } else {
-            substituted = substituted.replace(&format!("$({})", var), "")
-                                    .replace(&format!("${{{}}}", var), "");
+            String::new()
+        };
+        substituted = substituted.replace(&format!("$({})", var), &val)
+                                 .replace(&format!("${{{}}}", var), &val);
+        if var.len() == 1 {
+            substituted = substituted.replace(&format!("${}", var), &val);
         }
     }
     expand(&substituted)

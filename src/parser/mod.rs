@@ -359,13 +359,19 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
         &line[colon_pos+1..]
     };
 
-    // Check for target-specific variable assignment in rest
-    // e.g., "target: VAR = value"
+    // Check for target-specific variable assignment in rest, but only in the
+    // part before any inline recipe (i.e., before a bare `;`).
+    // e.g., "target: VAR = value" but NOT "target: ; @echo $(VAR=x)"
+    let rest_trimmed = rest.trim();
+    let prereq_part = match find_semicolon(rest_trimmed) {
+        Some(semi) => &rest_trimmed[..semi],
+        None => rest_trimmed,
+    };
     let ops = ["::=", "!=", "?=", "+=", ":=", "="];
     for op in &ops {
-        if let Some(pos) = find_assignment_op(rest.trim(), op) {
-            let var_name = rest.trim()[..pos].trim().to_string();
-            let var_value = rest.trim()[pos + op.len()..].trim_start().to_string();
+        if let Some(pos) = find_assignment_op(prereq_part.trim(), op) {
+            let var_name = prereq_part.trim()[..pos].trim().to_string();
+            let var_value = prereq_part.trim()[pos + op.len()..].trim_start().to_string();
             if !var_name.is_empty() && is_valid_variable_name(&var_name) {
                 let flavor = match *op {
                     "=" => VarFlavor::Recursive,
@@ -406,8 +412,9 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     rule.is_double_colon = is_double_colon;
 
     // If there was an inline recipe after the `;`, add it as the first recipe line.
+    // Line number will be stamped by the caller (process_parsed_lines) which has the lineno.
     if let Some(recipe_line) = inline_recipe {
-        rule.recipe.push(recipe_line);
+        rule.recipe.push((0, recipe_line));
     }
 
     Some(ParsedLine::Rule(rule))
@@ -481,7 +488,7 @@ pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>
     let semi_pos = find_semicolon(s);
 
     let (prereq_part, inline_recipe): (&str, Option<String>) = if let Some(pos) = semi_pos {
-        let recipe_text = s[pos + 1..].to_string();
+        let recipe_text = s[pos + 1..].trim_start().to_string();
         (&s[..pos], Some(recipe_text))
     } else {
         (s, None)
@@ -505,7 +512,7 @@ pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>
 
 /// Find the byte position of the first bare `;` in `s`, skipping over
 /// `$(...)` / `${...}` variable references and single-char `$x` refs.
-fn find_semicolon(s: &str) -> Option<usize> {
+pub fn find_semicolon(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut paren_depth = 0i32;
     let mut i = 0;

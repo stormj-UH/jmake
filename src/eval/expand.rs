@@ -129,6 +129,10 @@ impl MakeState {
         if let Some(val) = auto_vars.get(&expanded_name) {
             return val.clone();
         }
+        // .SHELLSTATUS is dynamically maintained from the last $(shell) call
+        if expanded_name == ".SHELLSTATUS" {
+            return self.last_shell_status.borrow().to_string();
+        }
         if let Some(var) = self.db.variables.get(&expanded_name) {
             return self.expand_var_value(var, auto_vars);
         }
@@ -295,6 +299,13 @@ impl MakeState {
                 }
                 return last;
             }
+            "shell" => {
+                let cmd = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
+                let (output, status) = functions::fn_shell_exec_with_status(&cmd);
+                // Store exit code; variable lookup for .SHELLSTATUS checks this field.
+                *self.last_shell_status.borrow_mut() = status;
+                return output;
+            }
             _ => {}
         }
 
@@ -350,11 +361,18 @@ impl MakeState {
 
         let words: Vec<&str> = list.split_whitespace().collect();
         let results: Vec<String> = words.iter().map(|word| {
+            // Replace all forms of the variable reference in the body before expanding:
+            //   $(var), ${var}, and $v (single-char only)
+            let mut substituted = body.replace(&format!("$({})", var), word)
+                                      .replace(&format!("${{{}}}", var), word);
+            // Handle single-character variable form $v (only when var is exactly one char)
+            if var.len() == 1 {
+                substituted = substituted.replace(&format!("${}", var), word);
+            }
+            // Pass the current word in auto_vars so nested expansions that reference
+            // the loop variable by name (after substitution) work correctly.
             let mut loop_auto_vars = auto_vars.clone();
-            // We need to temporarily set the variable
-            // Since we can't mutate self, we'll do string replacement
-            let substituted = body.replace(&format!("$({})", var), word)
-                                 .replace(&format!("${{{}}}", var), word);
+            loop_auto_vars.insert(var.clone(), word.to_string());
             self.expand_with_auto_vars(&substituted, &loop_auto_vars)
         }).collect();
         results.join(" ")

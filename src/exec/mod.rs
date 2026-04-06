@@ -30,6 +30,7 @@ pub struct Executor<'a> {
     building: HashSet<String>,    // cycle detection
     question_out_of_date: bool,
     errors: Vec<String>,
+    progname: String,
 }
 
 impl<'a> Executor<'a> {
@@ -47,6 +48,7 @@ impl<'a> Executor<'a> {
         shell_flags: &'a str,
         always_make: bool,
         trace: bool,
+        progname: String,
     ) -> Self {
         Executor {
             db,
@@ -66,6 +68,7 @@ impl<'a> Executor<'a> {
             building: HashSet::new(),
             question_out_of_date: false,
             errors: Vec::new(),
+            progname,
         }
     }
 
@@ -103,7 +106,7 @@ impl<'a> Executor<'a> {
 
         // Cycle detection
         if self.building.contains(target) {
-            eprintln!("jmake: Circular {} <- {} dependency dropped.", target, target);
+            eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, target, target);
             return Ok(false);
         }
         self.building.insert(target.to_string());
@@ -159,7 +162,7 @@ impl<'a> Executor<'a> {
                 auto_vars.insert("+".to_string(), String::new());
                 auto_vars.insert("?".to_string(), String::new());
                 auto_vars.insert("*".to_string(), String::new());
-                return self.execute_recipe(target, &default_rule.recipe, &auto_vars, false);
+                return self.execute_recipe(target, &default_rule.recipe, &default_rule.source_file, &auto_vars, false);
             }
         }
 
@@ -170,6 +173,7 @@ impl<'a> Executor<'a> {
         let mut all_prereqs = Vec::new();
         let mut all_order_only = Vec::new();
         let mut recipe = Vec::new();
+        let mut recipe_source_file = String::new();
         let mut target_vars: HashMap<String, String> = HashMap::new();
 
         for rule in rules {
@@ -177,6 +181,7 @@ impl<'a> Executor<'a> {
             all_order_only.extend(rule.order_only_prerequisites.clone());
             if !rule.recipe.is_empty() {
                 recipe = rule.recipe.clone();
+                recipe_source_file = rule.source_file.clone();
             }
             for (k, v) in &rule.target_specific_vars {
                 target_vars.insert(k.clone(), v.value.clone());
@@ -241,9 +246,16 @@ impl<'a> Executor<'a> {
 
         // Set up automatic variables
         let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-        let auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
+        let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
 
-        self.execute_recipe(target, &recipe, &auto_vars, is_phony)
+        // Merge target-specific variables into auto_vars (they shadow global vars during recipe execution).
+        // Expand values through the normal expansion mechanism so they can contain $(...)  references.
+        for (k, v) in &target_vars {
+            let expanded_val = self.state.expand(v);
+            auto_vars.insert(k.clone(), expanded_val);
+        }
+
+        self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony)
     }
 
     fn build_with_pattern_rule(&mut self, target: &str, rule: &Rule, stem: &str, is_phony: bool) -> Result<bool, String> {
@@ -284,7 +296,7 @@ impl<'a> Executor<'a> {
 
         let auto_vars = self.make_auto_vars(target, &prereqs, &[], stem);
 
-        self.execute_recipe(target, &rule.recipe, &auto_vars, is_phony)
+        self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony)
     }
 
     fn find_pattern_rule(&self, target: &str) -> Option<(Rule, String)> {
@@ -476,7 +488,7 @@ impl<'a> Executor<'a> {
         vars
     }
 
-    fn execute_recipe(&mut self, target: &str, recipe: &[String], auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
+    fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
         if self.touch {
             // Just touch the target
             if !self.silent {
@@ -494,18 +506,18 @@ impl<'a> Executor<'a> {
         if one_shell {
             // Execute all recipe lines as one shell script
             let mut script = String::new();
-            for line in recipe {
+            for (_lineno, line) in recipe {
                 let expanded = self.state.expand_with_auto_vars(line, auto_vars);
                 script.push_str(&expanded);
                 script.push('\n');
             }
 
             if !self.silent && !is_silent_target {
-                // Print the script (or first line)
-                for line in recipe {
+                // Print each recipe line (respecting @ prefix)
+                for (_lineno, line) in recipe {
                     let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-                    let (display, _, _) = parse_recipe_prefix(&expanded);
-                    if !display.is_empty() {
+                    let (display, line_silent, _) = parse_recipe_prefix(&expanded);
+                    if !line_silent && !display.is_empty() {
                         println!("{}", display);
                     }
                 }
@@ -521,12 +533,13 @@ impl<'a> Executor<'a> {
                 match status {
                     Ok(s) if !s.success() => {
                         let code = s.code().unwrap_or(1);
-                        if !self.ignore_errors {
-                            let msg = format!("[{}] Error {} (ignored)", target, code);
-                            if !self.ignore_errors {
-                                return Err(format!("recipe for target '{}' failed", target));
-                            }
-                            eprintln!("jmake: {}", msg);
+                        if self.ignore_errors {
+                            let loc = make_location(source_file, 0);
+                            eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
+                        } else {
+                            let loc = make_location(source_file, 0);
+                            eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
+                            return Err(format!("recipe for target '{}' failed", target));
                         }
                     }
                     Err(e) => {
@@ -540,27 +553,35 @@ impl<'a> Executor<'a> {
         }
 
         // Execute each recipe line separately
-        for line in recipe {
+        for (lineno, line) in recipe {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-            let (display_line, silent, ignore_error) = parse_recipe_prefix(&expanded);
+            // parse_recipe_prefix returns:
+            //   display_line: the line with @ stripped but - and + kept (what gets echoed)
+            //   silent: whether @ was present (suppress echoing this line)
+            //   ignore_error: whether - was present (ignore non-zero exit)
+            let (display_line, line_silent, ignore_error) = parse_recipe_prefix(&expanded);
 
-            let effective_silent = silent || self.silent || is_silent_target;
+            let effective_silent = line_silent || self.silent || is_silent_target;
             let effective_ignore = ignore_error || self.ignore_errors;
 
-            if !effective_silent && !self.dry_run {
-                println!("{}", display_line);
-            } else if !effective_silent {
+            // Echo the command BEFORE executing it (unless silenced)
+            if !effective_silent {
                 println!("{}", display_line);
             }
 
             if self.dry_run {
-                // In dry-run, still execute lines starting with +
-                if !expanded.trim_start().starts_with('+') {
+                // In dry-run mode, lines are printed but not executed, EXCEPT:
+                // 1. Lines that start with '+' (force execution prefix)
+                // 2. Lines that contain $(MAKE) or ${MAKE} - recursive make invocations
+                //    are always executed so sub-makes can propagate flags like -n
+                let is_forced = expanded.trim_start().starts_with('+');
+                let contains_make_var = line.contains("$(MAKE)") || line.contains("${MAKE}");
+                if !is_forced && !contains_make_var {
                     continue;
                 }
             }
 
-            // Get the actual command (strip @, -, + prefixes)
+            // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
             let cmd = strip_recipe_prefixes(&expanded);
 
             if cmd.trim().is_empty() {
@@ -579,14 +600,15 @@ impl<'a> Executor<'a> {
             match status {
                 Ok(s) if !s.success() => {
                     let code = s.code().unwrap_or(1);
+                    let loc = make_location(source_file, *lineno);
                     if effective_ignore {
-                        eprintln!("jmake: [{}] Error {} (ignored)", target, code);
+                        eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
                     } else {
-                        eprintln!("jmake: *** [{}] Error {}", target, code);
+                        eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
                         if !self.db.is_precious(target) && !self.db.is_phony(target) {
                             // Delete target on error unless .PRECIOUS
                             if Path::new(target).exists() {
-                                eprintln!("jmake: Deleting file '{}'", target);
+                                eprintln!("{}: Deleting file '{}'", self.progname, target);
                                 let _ = fs::remove_file(target);
                             }
                         }
@@ -595,7 +617,8 @@ impl<'a> Executor<'a> {
                 }
                 Err(e) => {
                     if effective_ignore {
-                        eprintln!("jmake: [{}] Error: {} (ignored)", target, e);
+                        let loc = make_location(source_file, *lineno);
+                        eprintln!("{}: [{}{}] Error: {} (ignored)", self.progname, loc, target, e);
                     } else {
                         return Err(format!("Error executing recipe for '{}': {}", target, e));
                     }
@@ -609,7 +632,13 @@ impl<'a> Executor<'a> {
 
     fn setup_exports(&self, cmd: &mut Command) {
         for (name, var) in &self.db.variables {
-            let should_export = match var.export {
+            // MAKELEVEL is handled separately (incremented), skip it here
+            if name == "MAKELEVEL" {
+                continue;
+            }
+            // These special make variables are always exported to sub-makes
+            let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
+            let should_export = always_export || match var.export {
                 Some(true) => true,
                 Some(false) => false,
                 None => self.db.export_all && var.origin != VarOrigin::Default,
@@ -622,10 +651,24 @@ impl<'a> Executor<'a> {
     }
 
     fn get_makelevel(&self) -> String {
+        // The MAKELEVEL env var for sub-make processes is the current level + 1.
+        // The current level is stored in the MAKELEVEL variable (0 for top-level).
         let level: u32 = self.state.db.variables.get("MAKELEVEL")
             .and_then(|v| v.value.parse().ok())
             .unwrap_or(0);
         (level + 1).to_string()
+    }
+}
+
+/// Format a "file:line: " location prefix for error messages.
+/// If source_file is empty or lineno is 0, returns an empty string.
+fn make_location(source_file: &str, lineno: usize) -> String {
+    if source_file.is_empty() {
+        String::new()
+    } else if lineno == 0 {
+        format!("{}: ", source_file)
+    } else {
+        format!("{}:{}: ", source_file, lineno)
     }
 }
 
@@ -667,25 +710,56 @@ fn touch_file(path: &str) {
     }
 }
 
+/// Parse the leading prefix characters of a recipe line.
+///
+/// Returns (display_line, silent, ignore_error) where:
+///   display_line: the line with `@` stripped but `-` and `+` kept (what gets echoed)
+///   silent: true if `@` was present (suppresses echoing this line)
+///   ignore_error: true if `-` was present (non-zero exit is ignored)
+///
+/// Note: `+` is NOT stripped from display_line since it is echoed. The command
+/// executed by the shell (`strip_recipe_prefixes`) removes all three prefixes.
 fn parse_recipe_prefix(line: &str) -> (String, bool, bool) {
     let mut silent = false;
     let mut ignore = false;
-    let mut i = 0;
     let bytes = line.as_bytes();
+    let mut i = 0;
 
+    // Scan prefix characters: @, -, + (and optional leading whitespace before them)
+    // GNU Make allows whitespace before prefix chars per POSIX but only tabs normally start recipe.
+    // We keep scanning as long as we see @, -, or +.
     while i < bytes.len() {
         match bytes[i] {
-            b'@' => silent = true,
-            b'-' => ignore = true,
-            b'+' => {} // force execution even in dry-run
-            b' ' | b'\t' => {}
+            b'@' => {
+                silent = true;
+                i += 1;
+            }
+            b'-' => {
+                ignore = true;
+                i += 1;
+            }
+            b'+' => {
+                // '+' means force execution in dry-run; it is kept in display but not executed
+                i += 1;
+            }
             _ => break,
         }
-        i += 1;
     }
 
-    let cmd = &line[i..];
-    (cmd.to_string(), silent, ignore)
+    // display_line: reconstruct without '@' but keep '-' and '+'
+    // Build display by keeping the original prefixes except '@'
+    let mut display = String::new();
+    let mut j = 0;
+    while j < i {
+        match bytes[j] {
+            b'@' => {} // skip @
+            c => display.push(c as char),
+        }
+        j += 1;
+    }
+    display.push_str(&line[i..]);
+
+    (display, silent, ignore)
 }
 
 fn strip_recipe_prefixes(line: &str) -> String {

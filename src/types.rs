@@ -50,11 +50,14 @@ pub struct Rule {
     pub targets: Vec<String>,
     pub prerequisites: Vec<String>,
     pub order_only_prerequisites: Vec<String>,
-    pub recipe: Vec<String>,
+    /// Each recipe line stored as (line_number_in_makefile, text)
+    pub recipe: Vec<(usize, String)>,
     pub is_pattern: bool,
     pub is_double_colon: bool,
     pub is_terminal: bool, // pattern rule with no recipe terminates chain
     pub target_specific_vars: IndexMap<String, Variable>,
+    /// The makefile file path where this rule was defined
+    pub source_file: String,
 }
 
 impl Rule {
@@ -68,6 +71,7 @@ impl Rule {
             is_double_colon: false,
             is_terminal: false,
             target_specific_vars: IndexMap::new(),
+            source_file: String::new(),
         }
     }
 }

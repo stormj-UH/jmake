@@ -29,6 +29,8 @@ pub struct MakeState {
     /// Current file and line for error/warning/info context (updated during parsing)
     pub current_file: RefCell<String>,
     pub current_line: RefCell<usize>,
+    /// Exit status of the last $(shell ...) call, used to set .SHELLSTATUS
+    pub last_shell_status: RefCell<i32>,
 }
 
 impl MakeState {
@@ -42,18 +44,20 @@ impl MakeState {
             eval_pending: RefCell::new(Vec::new()),
             current_file: RefCell::new(String::new()),
             current_line: RefCell::new(0),
+            last_shell_status: RefCell::new(0),
         };
 
         // Change directory if requested
+        let progname = env::args().next().unwrap_or_else(|| "make".to_string());
         if let Some(ref dir) = state.args.directory {
             if let Err(e) = env::set_current_dir(dir) {
-                eprintln!("jmake: Entering directory '{}'", dir.display());
-                eprintln!("jmake: *** {}: {}.  Stop.", dir.display(), e);
+                eprintln!("{}: Entering directory '{}'", progname, dir.display());
+                eprintln!("{}: *** {}: {}.  Stop.", progname, dir.display(), e);
                 std::process::exit(2);
             }
             if state.args.print_directory || !state.args.no_print_directory {
                 let cwd = env::current_dir().unwrap_or_default();
-                eprintln!("jmake: Entering directory '{}'", cwd.display());
+                eprintln!("{}: Entering directory '{}'", progname, cwd.display());
             }
         }
 
@@ -122,6 +126,7 @@ impl MakeState {
         }
 
         // Build targets
+        let progname = env::args().next().unwrap_or_else(|| "make".to_string());
         let mut executor = exec::Executor::new(
             &self.db,
             self,
@@ -136,15 +141,17 @@ impl MakeState {
             &shell_flags,
             self.args.always_make,
             self.args.trace,
+            progname,
         );
 
         let result = executor.build_targets(&targets);
 
         // Print directory on exit if needed
-        if let Some(ref dir) = self.args.directory {
+        if let Some(ref _dir) = self.args.directory {
             if self.args.print_directory || !self.args.no_print_directory {
                 let cwd = env::current_dir().unwrap_or_default();
-                eprintln!("jmake: Leaving directory '{}'", cwd.display());
+                let progname = env::args().next().unwrap_or_else(|| "make".to_string());
+                eprintln!("{}: Leaving directory '{}'", progname, cwd.display());
             }
         }
 
@@ -174,8 +181,16 @@ impl MakeState {
             Variable::new("-c".into(), VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert("MAKEFLAGS".into(),
             Variable::new(self.build_makeflags(), VarFlavor::Recursive, VarOrigin::Default));
+        // MAKECMDGOALS: the list of targets specified on the command line.
+        // Set before reading makefiles so it's available during makefile processing.
+        let cmdgoals = self.args.targets.join(" ");
+        self.db.variables.insert("MAKECMDGOALS".into(),
+            Variable::new(cmdgoals, VarFlavor::Simple, VarOrigin::Default));
+        // MAKELEVEL: 0 for top-level, incremented for recursive makes.
+        // Read from the environment (set by the parent make), defaulting to "0".
+        let makelevel_str = env::var("MAKELEVEL").unwrap_or_else(|_| "0".to_string());
         self.db.variables.insert("MAKELEVEL".into(),
-            Variable::new(env::var("MAKELEVEL").unwrap_or_else(|_| "0".into()), VarFlavor::Simple, VarOrigin::Environment));
+            Variable::new(makelevel_str, VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".DEFAULT_GOAL".into(),
             Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::Default));
         self.db.variables.insert(".RECIPEPREFIX".into(),
@@ -203,18 +218,33 @@ impl MakeState {
     }
 
     fn build_makeflags(&self) -> String {
-        let mut flags = String::new();
-        if self.args.always_make { flags.push('B'); }
-        if self.args.environment_overrides { flags.push('e'); }
-        if self.args.ignore_errors { flags.push('i'); }
-        if self.args.keep_going { flags.push('k'); }
-        if self.args.dry_run { flags.push('n'); }
-        if self.args.no_builtin_rules { flags.push('r'); }
-        if self.args.no_builtin_variables { flags.push('R'); }
-        if self.args.silent { flags.push('s'); }
-        if self.args.touch { flags.push('t'); }
-        if self.args.print_directory { flags.push('w'); }
-        flags
+        // GNU Make MAKEFLAGS format:
+        //   Single-letter flags are bundled without a leading '-': e.g. "ks" for -k -s
+        //   Long options and flags with arguments follow (space-separated): "ks --jobserver-auth=..."
+        //   Command-line variable assignments are appended at the end
+        let mut single_flags = String::new();
+        if self.args.always_make { single_flags.push('B'); }
+        if self.args.environment_overrides { single_flags.push('e'); }
+        if self.args.ignore_errors { single_flags.push('i'); }
+        if self.args.keep_going { single_flags.push('k'); }
+        if self.args.dry_run { single_flags.push('n'); }
+        if self.args.no_builtin_rules { single_flags.push('r'); }
+        if self.args.no_builtin_variables { single_flags.push('R'); }
+        if self.args.silent { single_flags.push('s'); }
+        if self.args.touch { single_flags.push('t'); }
+        if self.args.print_directory { single_flags.push('w'); }
+
+        let mut parts: Vec<String> = Vec::new();
+        if !single_flags.is_empty() {
+            parts.push(single_flags);
+        }
+
+        // Append command-line variable assignments
+        for (name, value) in &self.args.variables {
+            parts.push(format!("{}={}", name, value));
+        }
+
+        parts.join(" ")
     }
 
     fn read_makefiles(&mut self) -> Result<(), String> {
@@ -319,9 +349,23 @@ impl MakeState {
                 continue;
             }
 
-            // Expand variables in line (except recipe lines)
+            // Expand variables in line (except recipe lines).
+            // For rule lines that contain an inline recipe after `;`, only expand
+            // the rule header (targets/prerequisites) portion; the recipe part must
+            // be left unexpanded so that variable references in it are evaluated at
+            // execution time (just like tab-prefixed recipe lines).
             let expanded = if line.starts_with('\t') {
                 line.clone()
+            } else if let Some(semi_pos) = parser::find_semicolon(&line) {
+                // Check whether the part before `;` contains a `:` (rule colon).
+                // If it does, this is an inline recipe: expand only the header.
+                let pre_semi = &line[..semi_pos];
+                if pre_semi.contains(':') {
+                    let expanded_header = self.expand(pre_semi);
+                    format!("{};{}", expanded_header, &line[semi_pos + 1..])
+                } else {
+                    self.expand(&line)
+                }
             } else {
                 self.expand(&line)
             };
@@ -383,6 +427,14 @@ impl MakeState {
                         })
                         .collect();
 
+                    // Stamp the source file and fix up inline recipe line numbers
+                    rule.source_file = parser.filename.to_string_lossy().to_string();
+                    for entry in rule.recipe.iter_mut() {
+                        if entry.0 == 0 {
+                            entry.0 = lineno;
+                        }
+                    }
+
                     // Store current rule and register it
                     if let Some(prev) = current_rule.take() {
                         self.register_rule(prev);
@@ -392,7 +444,7 @@ impl MakeState {
                 }
                 ParsedLine::Recipe(recipe) => {
                     if let Some(ref mut rule) = current_rule {
-                        rule.recipe.push(recipe);
+                        rule.recipe.push((lineno, recipe));
                     }
                 }
                 ParsedLine::VariableAssignment { name, value, flavor, is_override, is_export, is_private, target } => {
@@ -624,7 +676,7 @@ impl MakeState {
                     existing.order_only_prerequisites.extend(rule.order_only_prerequisites.clone());
                     if !rule.recipe.is_empty() {
                         if !existing.recipe.is_empty() {
-                            eprintln!("jmake: warning: overriding recipe for target '{}'", target);
+                            eprintln!("make: warning: overriding recipe for target '{}'", target);
                         }
                         existing.recipe = rule.recipe.clone();
                     }
@@ -666,8 +718,9 @@ impl MakeState {
                 });
             }
             VarFlavor::Shell => {
-                // != executes value as shell command
-                let result = functions::fn_shell_exec(value);
+                // != executes value as shell command; also sets .SHELLSTATUS
+                let (result, status) = functions::fn_shell_exec_with_status(value);
+                *self.last_shell_status.borrow_mut() = status;
                 let existing = self.db.variables.get(name);
                 if !is_override {
                     if let Some(existing) = existing {
@@ -781,7 +834,7 @@ impl MakeState {
                 let prereqs = rule.prerequisites.join(" ");
                 let sep = if rule.is_double_colon { "::" } else { ":" };
                 println!("{}{} {}", target, sep, prereqs);
-                for line in &rule.recipe {
+                for (_lineno, line) in &rule.recipe {
                     println!("\t{}", line);
                 }
             }
@@ -793,7 +846,7 @@ impl MakeState {
             let targets = rule.targets.join(" ");
             let prereqs = rule.prerequisites.join(" ");
             println!("{}: {}", targets, prereqs);
-            for line in &rule.recipe {
+            for (_lineno, line) in &rule.recipe {
                 println!("\t{}", line);
             }
         }
