@@ -630,6 +630,22 @@ fn expand_static_pattern_rule(
     prereq_str: &str,
     is_double_colon: bool,
 ) -> ParsedLine {
+    // Determine raw texts for second expansion BEFORE splitting.
+    // These are needed when the prerequisite pattern contains '$' (deferred refs).
+    let (raw_prereq_text, raw_order_only_text) = {
+        let prereq_part = match find_semicolon(prereq_str) {
+            Some(pos) => &prereq_str[..pos],
+            None => prereq_str,
+        };
+        if let Some(pipe_pos) = find_pipe(prereq_part) {
+            let normal = prereq_part[..pipe_pos].trim().to_string();
+            let oo = prereq_part[pipe_pos + 1..].trim().to_string();
+            (normal, oo)
+        } else {
+            (prereq_part.trim().to_string(), String::new())
+        }
+    };
+
     let (prereq_patterns, order_only_patterns, inline_recipe) =
         split_prerequisites(prereq_str);
 
@@ -656,14 +672,28 @@ fn expand_static_pattern_rule(
             .collect();
 
         let mut rule = Rule::new();
-        rule.targets = vec![target];
+        rule.targets = vec![target.clone()];
         rule.prerequisites = prereqs;
         rule.order_only_prerequisites = order_only;
         // Static pattern rules create explicit (non-pattern) rules.
         rule.is_pattern = false;
         rule.is_double_colon = is_double_colon;
         // Store the stem so the executor can provide a correct `$*`.
-        rule.static_stem = stem;
+        rule.static_stem = stem.clone();
+
+        // Store raw SE texts for second expansion.
+        // We store the raw prereq text with `%` replaced by the stem, so that
+        // at build time `$*` (not `%`) is used for stem references while
+        // `$$@`, `$$<` etc. still expand to the per-target automatic vars.
+        if raw_prereq_text.contains('$') {
+            // Replace `%` with the stem in the raw text (same as non-SE static pattern).
+            let raw_with_stem = raw_prereq_text.replace('%', &stem);
+            rule.second_expansion_prereqs = Some(raw_with_stem);
+        }
+        if raw_order_only_text.contains('$') {
+            let raw_oo_with_stem = raw_order_only_text.replace('%', &stem);
+            rule.second_expansion_order_only = Some(raw_oo_with_stem);
+        }
 
         // Inline recipe after `;` is propagated to every generated rule.
         // The caller will stamp the real line number (entry.0 == 0 is the cue).
@@ -743,26 +773,24 @@ pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, &str) {
     let mut rest = s.trim();
     loop {
         if let Some(r) = rest.strip_prefix("override") {
-            let r = r.trim_start();
-            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+            // Must be followed by whitespace or end of string (word boundary check)
+            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
                 is_override = true;
-                rest = r;
+                rest = r.trim_start();
                 continue;
             }
         }
         if let Some(r) = rest.strip_prefix("export") {
-            let r = r.trim_start();
-            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
                 is_export = true;
-                rest = r;
+                rest = r.trim_start();
                 continue;
             }
         }
         if let Some(r) = rest.strip_prefix("private") {
-            let r = r.trim_start();
-            if r.is_empty() || r.starts_with(|c: char| !c.is_alphanumeric() && c != '_') {
+            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
                 is_private = true;
-                rest = r;
+                rest = r.trim_start();
                 continue;
             }
         }

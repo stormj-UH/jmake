@@ -38,6 +38,8 @@ pub struct MakeArgs {
     pub output_sync: Option<String>,
     pub eval_strings: Vec<String>,
     pub what_if: Vec<String>,
+    pub no_silent: bool,  // explicitly set with --no-silent (for MAKEFLAGS output)
+    pub clear_include_dirs: bool,  // -I- was passed (clear default include dirs)
 }
 
 impl Default for MakeArgs {
@@ -76,6 +78,8 @@ impl Default for MakeArgs {
             output_sync: None,
             eval_strings: Vec::new(),
             what_if: Vec::new(),
+            no_silent: false,
+            clear_include_dirs: false,
         }
     }
 }
@@ -157,7 +161,8 @@ pub fn parse_args() -> MakeArgs {
                 "--print-directory" => result.print_directory = true,
                 "--print-data-base" => result.print_data_base = true,
                 "--question" => result.question = true,
-                "--silent" | "--quiet" => result.silent = true,
+                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; }
+                "--no-silent" => { result.silent = false; result.no_silent = true; }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -279,11 +284,21 @@ pub fn parse_args() -> MakeArgs {
                     'I' => {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
-                            result.include_dirs.push(PathBuf::from(rest));
+                            if rest == "-" {
+                                result.clear_include_dirs = true;
+                                result.include_dirs.clear();
+                            } else {
+                                result.include_dirs.push(PathBuf::from(rest));
+                            }
                         } else {
                             i += 1;
                             if i < args.len() {
-                                result.include_dirs.push(PathBuf::from(&args[i]));
+                                if args[i] == "-" {
+                                    result.clear_include_dirs = true;
+                                    result.include_dirs.clear();
+                                } else {
+                                    result.include_dirs.push(PathBuf::from(&args[i]));
+                                }
                             }
                         }
                         j = chars.len();
@@ -303,7 +318,11 @@ pub fn parse_args() -> MakeArgs {
                         }
                     }
                     'k' => result.keep_going = true,
-                    'l' | 'L' => {
+                    'L' => {
+                        // -L = --check-symlink-times (no argument)
+                        result.check_symlink_times = true;
+                    }
+                    'l' => {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
                             result.load_average = rest.parse().ok();
@@ -455,8 +474,8 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     result.print_directory = true;
                     result.no_print_directory = false;
                 }
-                "--silent" | "--quiet" => result.silent = true,
-                "--no-silent" => result.silent = false,
+                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; }
+                "--no-silent" => { result.silent = false; result.no_silent = true; }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -509,7 +528,11 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         continue;
                     }
                     'k' => result.keep_going = true,
-                    'l' | 'L' => {
+                    'L' => {
+                        // -L = --check-symlink-times (no argument)
+                        result.check_symlink_times = true;
+                    }
+                    'l' => {
                         let arg: String = chars[j+1..].iter().collect();
                         if !arg.is_empty() {
                             result.load_average = arg.parse().ok();
@@ -592,6 +615,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                             result.print_directory = true;
                             result.no_print_directory = false;
                         }
+                        'L' => result.check_symlink_times = true,
                         'd' => {
                             result.debug_short = true;
                             result.debug.push("b".to_string());

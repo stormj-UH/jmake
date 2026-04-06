@@ -109,6 +109,8 @@ pub enum SpecialTarget {
     NotParallel,
     OneSHell,
     Posix,
+    NotIntermediate,
+    Wait,
 }
 
 impl SpecialTarget {
@@ -129,6 +131,8 @@ impl SpecialTarget {
             ".NOTPARALLEL" => Some(SpecialTarget::NotParallel),
             ".ONESHELL" => Some(SpecialTarget::OneSHell),
             ".POSIX" => Some(SpecialTarget::Posix),
+            ".NOTINTERMEDIATE" => Some(SpecialTarget::NotIntermediate),
+            ".WAIT" => Some(SpecialTarget::Wait),
             _ => None,
         }
     }
@@ -276,9 +280,55 @@ impl MakeDatabase {
     }
 
     pub fn is_intermediate(&self, target: &str) -> bool {
-        self.special_targets
+        // Explicitly listed as .INTERMEDIATE: <name>
+        if self.special_targets
             .get(&SpecialTarget::Intermediate)
             .map_or(false, |set| set.contains(target))
+        {
+            return true;
+        }
+        false
+    }
+
+    pub fn is_secondary(&self, target: &str) -> bool {
+        let set = match self.special_targets.get(&SpecialTarget::Secondary) {
+            Some(s) => s,
+            None => return false,
+        };
+        // .SECONDARY with no prerequisites means ALL targets are secondary
+        if set.is_empty() {
+            return true;
+        }
+        set.contains(target)
+    }
+
+    pub fn is_notintermediate(&self, target: &str) -> bool {
+        // Check if explicitly marked as .NOTINTERMEDIATE
+        // .NOTINTERMEDIATE with no prereqs means ALL targets are not intermediate
+        let set = match self.special_targets.get(&SpecialTarget::NotIntermediate) {
+            Some(s) => s,
+            None => return false,
+        };
+        if set.is_empty() {
+            return true;
+        }
+        // Pattern matching: check if any pattern in the set matches target
+        for pat in set {
+            if pat.contains('%') {
+                // Simple % wildcard matching
+                if let Some(pct) = pat.find('%') {
+                    let prefix = &pat[..pct];
+                    let suffix = &pat[pct+1..];
+                    if target.starts_with(prefix) && target.ends_with(suffix)
+                        && target.len() >= prefix.len() + suffix.len() {
+                        return true;
+                    }
+                }
+            } else if pat == target {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn is_silent_target(&self, target: &str) -> bool {

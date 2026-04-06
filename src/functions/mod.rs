@@ -521,28 +521,67 @@ fn fn_let(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
     expand(&substituted)
 }
 
+/// Compare two arbitrary-precision integer strings. Returns -1, 0, or 1.
+fn bigint_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a = a.trim();
+    let b = b.trim();
+
+    let (a_neg, a_digits) = if let Some(s) = a.strip_prefix('-') {
+        (true, s.trim_start_matches('0'))
+    } else {
+        (false, a.strip_prefix('+').unwrap_or(a).trim_start_matches('0'))
+    };
+    let (b_neg, b_digits) = if let Some(s) = b.strip_prefix('-') {
+        (true, s.trim_start_matches('0'))
+    } else {
+        (false, b.strip_prefix('+').unwrap_or(b).trim_start_matches('0'))
+    };
+
+    // Treat empty digits as 0
+    let a_zero = a_digits.is_empty();
+    let b_zero = b_digits.is_empty();
+
+    // -0 == 0
+    let a_neg = if a_zero { false } else { a_neg };
+    let b_neg = if b_zero { false } else { b_neg };
+
+    if a_neg != b_neg {
+        return if a_neg { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+    }
+
+    // Both same sign - compare magnitude
+    let mag_cmp = if a_digits.len() != b_digits.len() {
+        a_digits.len().cmp(&b_digits.len())
+    } else {
+        a_digits.cmp(b_digits)
+    };
+
+    if a_neg { mag_cmp.reverse() } else { mag_cmp }
+}
+
 fn fn_intcmp(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
-    let lhs: i64 = args[0].trim().parse().unwrap_or(0);
-    let rhs: i64 = args[1].trim().parse().unwrap_or(0);
+    let ord = bigint_cmp(&args[0], &args[1]);
 
     match args.len() {
         2 => {
-            // Two args: return numeric comparison result
-            if lhs == rhs { args[1].clone() } else { String::new() }
+            if ord == std::cmp::Ordering::Equal { args[1].trim().to_string() } else { String::new() }
         }
         3 => {
-            // Three args: if lhs < rhs, expand 3rd arg
-            if lhs < rhs { expand(&args[2]) } else { String::new() }
+            if ord == std::cmp::Ordering::Less { expand(&args[2]) } else { String::new() }
         }
         4 => {
-            if lhs < rhs { expand(&args[2]) }
-            else if lhs == rhs { expand(&args[3]) }
-            else { String::new() }
+            match ord {
+                std::cmp::Ordering::Less => expand(&args[2]),
+                std::cmp::Ordering::Equal => expand(&args[3]),
+                std::cmp::Ordering::Greater => String::new(),
+            }
         }
         5 | _ => {
-            if lhs < rhs { expand(&args[2]) }
-            else if lhs == rhs { expand(&args[3]) }
-            else { expand(&args.get(4).cloned().unwrap_or_default()) }
+            match ord {
+                std::cmp::Ordering::Less => expand(&args[2]),
+                std::cmp::Ordering::Equal => expand(&args[3]),
+                std::cmp::Ordering::Greater => expand(&args.get(4).cloned().unwrap_or_default()),
+            }
         }
     }
 }

@@ -31,6 +31,13 @@ pub struct Executor<'a> {
     question_out_of_date: bool,
     errors: Vec<String>,
     progname: String,
+    /// Set to true the first time any recipe is executed.
+    /// Suppresses "is up to date" / "Nothing to be done" diagnostics.
+    any_recipe_ran: bool,
+    /// Intermediate targets that were actually built this run (candidates for deletion).
+    intermediate_built: HashSet<String>,
+    /// Top-level targets (not subject to intermediate deletion even if .INTERMEDIATE).
+    top_level_targets: HashSet<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -69,15 +76,25 @@ impl<'a> Executor<'a> {
             question_out_of_date: false,
             errors: Vec::new(),
             progname,
+            any_recipe_ran: false,
+            intermediate_built: HashSet::new(),
+            top_level_targets: HashSet::new(),
         }
     }
 
     pub fn build_targets(&mut self, targets: &[String]) -> Result<(), String> {
+        // Record top-level targets so they are not deleted even if .INTERMEDIATE
+        for t in targets {
+            self.top_level_targets.insert(t.clone());
+        }
         for target in targets {
             match self.build_target(target) {
                 Ok(rebuilt) => {
-                    // Print status for top-level targets that weren't rebuilt
-                    if !rebuilt && !self.silent && !self.question {
+                    // Print status for top-level targets that weren't rebuilt,
+                    // but ONLY when no recipe ran anywhere in this make session.
+                    // GNU Make suppresses these messages when any work was done
+                    // (even for unrelated or order-only prerequisites).
+                    if !rebuilt && !self.silent && !self.question && !self.any_recipe_ran {
                         let has_recipe = self.target_has_recipe(target);
                         if has_recipe {
                             println!("{}: '{}' is up to date.", self.progname, target);
@@ -90,11 +107,16 @@ impl<'a> Executor<'a> {
                     if self.keep_going {
                         self.errors.push(e);
                     } else {
+                        // Clean up intermediate files even on error
+                        self.delete_intermediate_files();
                         return Err(e);
                     }
                 }
             }
         }
+
+        // Delete intermediate files that were built during this run
+        self.delete_intermediate_files();
 
         if !self.errors.is_empty() {
             return Err(format!("Target(s) not remade because of errors:\n{}",
@@ -106,6 +128,31 @@ impl<'a> Executor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Delete intermediate files that were built during this run.
+    fn delete_intermediate_files(&mut self) {
+        let to_delete: Vec<String> = self.intermediate_built.iter()
+            .filter(|t| {
+                !self.top_level_targets.contains(*t)
+                    && !self.db.is_precious(t)
+                    && !self.db.is_phony(t)
+                    && !self.db.is_secondary(t)
+                    && !self.db.is_notintermediate(t)
+            })
+            .cloned()
+            .collect();
+        for t in to_delete {
+            if Path::new(&t).exists() {
+                if !self.silent {
+                    println!("rm {}", t);
+                }
+                if !self.dry_run {
+                    let _ = fs::remove_file(&t);
+                }
+            }
+            self.intermediate_built.remove(&t);
+        }
     }
 
     fn build_target(&mut self, target: &str) -> Result<bool, String> {
@@ -288,10 +335,20 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    if self.keep_going {
-                        prereq_errors.push(e);
+                    // Propagate "No rule to make target" errors with proper "needed by" chain.
+                    // If the error already has "needed by", propagate it verbatim.
+                    // Otherwise, add the current context.
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        // Strip trailing ".  Stop." and add "needed by" context
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
-                        return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.", prereq, target));
+                        e
+                    };
+                    if self.keep_going {
+                        prereq_errors.push(propagated);
+                    } else {
+                        return Err(propagated);
                     }
                 }
             }
@@ -324,10 +381,16 @@ impl<'a> Executor<'a> {
                         match self.build_target(prereq) {
                             Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
                             Err(e) => {
+                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                    let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                                    format!("{}, needed by '{}'.  Stop.", base, target)
+                                } else {
+                                    e
+                                };
                                 if self.keep_going {
                                     // continue
                                 } else {
-                                    return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.", prereq, target));
+                                    return Err(propagated);
                                 }
                             }
                         }
@@ -380,7 +443,14 @@ impl<'a> Executor<'a> {
         let collected_target_vars = self.collect_target_vars(target);
         self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
 
-        self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony)
+        let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
+        // Track if this is an intermediate target that was built
+        if let Ok(true) = &result {
+            if self.db.is_intermediate(target) {
+                self.intermediate_built.insert(target.to_string());
+            }
+        }
+        result
     }
 
     fn build_with_double_colon_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
@@ -405,10 +475,16 @@ impl<'a> Executor<'a> {
                             if rebuilt { any_prereq_rebuilt = true; }
                         }
                         Err(e) => {
-                            if self.keep_going {
-                                prereq_errors.push(e);
+                            let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                                format!("{}, needed by '{}'.  Stop.", base, target)
                             } else {
-                                return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.", p, target));
+                                e
+                            };
+                            if self.keep_going {
+                                prereq_errors.push(propagated);
+                            } else {
+                                return Err(propagated);
                             }
                         }
                     }
@@ -525,10 +601,15 @@ impl<'a> Executor<'a> {
                 Ok(rebuilt) => {
                     if rebuilt { any_rebuilt = true; }
                 }
-                Err(_e) => {
-                    // If prerequisite can't be built, this pattern rule doesn't apply
-                    // Try next pattern rule
-                    return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.", prereq, target));
+                Err(e) => {
+                    // Propagate "No rule to make target" errors correctly
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    } else {
+                        e
+                    };
+                    return Err(propagated);
                 }
             }
         }
@@ -559,24 +640,49 @@ impl<'a> Executor<'a> {
         let collected_target_vars = self.collect_target_vars(target);
         self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
 
-        self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony)
+        let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
+        // Track if this is an intermediate target that was built via pattern rule.
+        // Targets built by implicit rules are potentially intermediate.
+        if let Ok(true) = &result {
+            if self.db.is_intermediate(target) {
+                self.intermediate_built.insert(target.to_string());
+            } else if !self.db.is_precious(target) && !self.db.is_notintermediate(target) {
+                // Targets built by implicit (pattern) rules are implicitly intermediate
+                // unless they are explicitly mentioned (top-level, precious, or .NOTINTERMEDIATE).
+                // Only mark as intermediate if it's a dependency (not top-level).
+                if !self.top_level_targets.contains(target) {
+                    self.intermediate_built.insert(target.to_string());
+                }
+            }
+        }
+        result
     }
 
     fn find_pattern_rule(&self, target: &str) -> Option<(Rule, String)> {
-        for rule in &self.db.pattern_rules {
+        // Iterate in REVERSE order: user-defined rules are appended after built-in
+        // implicit rules, so reversing gives user rules the highest priority.
+        // This matches GNU Make's behaviour where user rules override built-ins.
+        for rule in self.db.pattern_rules.iter().rev() {
             if rule.recipe.is_empty() && !rule.is_terminal {
                 continue; // Skip pattern rules with no recipe (canceling rules)
             }
             for pattern_target in &rule.targets {
                 if let Some(stem) = match_pattern(pattern_target, target) {
-                    // Check if prerequisites can be satisfied
-                    let prereqs_ok = rule.prerequisites.iter().all(|p| {
-                        let resolved = p.replace('%', &stem);
-                        Path::new(&resolved).exists()
-                            || self.db.rules.contains_key(&resolved)
-                            || self.find_pattern_rule_exists(&resolved)
-                            || self.find_in_vpath(&resolved).is_some()
-                    });
+                    // Check if prerequisites can be satisfied.
+                    // For rules with no explicit prerequisites (including SE rules where
+                    // prereqs were cleared and will be expanded at build time), treat
+                    // as satisfiable — the recipe exists and will run.
+                    let prereqs_ok = if rule.prerequisites.is_empty() {
+                        true
+                    } else {
+                        rule.prerequisites.iter().all(|p| {
+                            let resolved = p.replace('%', &stem);
+                            Path::new(&resolved).exists()
+                                || self.db.rules.contains_key(&resolved)
+                                || self.find_pattern_rule_exists(&resolved)
+                                || self.find_in_vpath(&resolved).is_some()
+                        })
+                    };
                     if prereqs_ok {
                         return Some((rule.clone(), stem));
                     }
@@ -849,6 +955,7 @@ impl<'a> Executor<'a> {
             if !self.dry_run {
                 touch_file(target);
             }
+            self.any_recipe_ran = true;
             return Ok(true);
         }
 
@@ -857,29 +964,63 @@ impl<'a> Executor<'a> {
 
         if one_shell {
             // Execute all recipe lines as one shell script.
-            // Strip Make recipe prefix chars (@, -, +) before adding to the script.
+            // In .ONESHELL mode:
+            //   - ALL recipe lines are joined and passed to a single shell invocation.
+            //   - Prefix chars (@, -, +) on EVERY line are stripped from the script content.
+            //   - Echo behaviour is controlled by the FIRST recipe line's prefix only:
+            //     if the first line starts with @, the whole recipe is silent; otherwise
+            //     ALL lines are echoed (using their content stripped of prefix chars).
+            //   - Inner lines' @ etc. do NOT suppress their individual echo.
+
             let mut script = String::new();
+            let mut first_line_silent = false;
+            let mut first_line_ignore = false;
+            let mut is_first = true;
+
             for (_lineno, line) in recipe {
                 let expanded = self.state.expand_with_auto_vars(line, auto_vars);
                 let cmd_line = strip_recipe_prefixes(&expanded);
+                if is_first {
+                    let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
+                    first_line_silent = ls;
+                    first_line_ignore = li;
+                    is_first = false;
+                }
                 script.push_str(&cmd_line);
                 script.push('\n');
             }
 
-            if !self.silent && !is_silent_target {
-                // Print each recipe line (respecting @ prefix)
+            let effective_silent = first_line_silent || self.silent || is_silent_target;
+            let effective_ignore = first_line_ignore || self.ignore_errors;
+
+            if !effective_silent {
+                // Echo ALL lines (using content stripped of prefix chars)
                 for (_lineno, line) in recipe {
                     let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-                    let (display, line_silent, _, _) = parse_recipe_prefix(&expanded);
-                    if !line_silent && !display.is_empty() {
-                        println!("{}", display);
+                    let display = strip_recipe_prefixes(&expanded);
+                    if !display.trim().is_empty() {
+                        println!("{}", display.trim_end());
                     }
                 }
             }
 
+            if script.trim().is_empty() {
+                // Recipe expanded to nothing (all make-functions, no shell commands).
+                // Don't count as a recipe ran; return false so "is up to date" can print.
+                return Ok(false);
+            }
+
+            self.any_recipe_ran = true;
             if !self.dry_run {
+                // Split shell_flags by whitespace into separate arguments.
+                // .SHELLFLAGS = "-e -c" means pass -e and -c as separate args.
+                let flags: Vec<&str> = self.shell_flags.split_whitespace().collect();
                 let mut child = Command::new(self.shell);
-                child.arg(self.shell_flags).arg(&script);
+                for flag in &flags {
+                    child.arg(flag);
+                }
+                // Script is the final argument (after any flags from .SHELLFLAGS)
+                child.arg(&script);
                 child.env("MAKELEVEL", self.get_makelevel());
                 self.setup_exports(&mut child);
                 let status = child.status();
@@ -887,7 +1028,7 @@ impl<'a> Executor<'a> {
                 match status {
                     Ok(s) if !s.success() => {
                         let code = s.code().unwrap_or(1);
-                        if self.ignore_errors {
+                        if effective_ignore {
                             let loc = make_location(source_file, 0);
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
                         } else {
@@ -907,13 +1048,24 @@ impl<'a> Executor<'a> {
             return Ok(true);
         }
 
-        // Execute each recipe line separately
+        // Execute each recipe line separately.
+        // Track whether any actual shell commands were executed.
+        let mut any_cmd_ran = false;
         for (lineno, line) in recipe {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
             let (display_line, line_silent, ignore_error, force) = parse_recipe_prefix(&expanded);
 
             let effective_silent = line_silent || self.silent || is_silent_target;
             let effective_ignore = ignore_error || self.ignore_errors;
+
+            // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
+            let cmd = strip_recipe_prefixes(&expanded);
+
+            if cmd.trim().is_empty() {
+                // Empty command after expansion (e.g., $(info ...) expands to nothing).
+                // Don't count this as a real shell command, and don't echo it.
+                continue;
+            }
 
             // Echo the command BEFORE executing it (unless silenced)
             if !effective_silent {
@@ -926,19 +1078,22 @@ impl<'a> Executor<'a> {
                 // 2. Lines that contain $(MAKE) or ${MAKE} - recursive make invocations
                 let contains_make_var = line.contains("$(MAKE)") || line.contains("${MAKE}");
                 if !force && !contains_make_var {
+                    // Count as a command that would run in normal mode
+                    any_cmd_ran = true;
                     continue;
                 }
             }
 
-            // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
-            let cmd = strip_recipe_prefixes(&expanded);
+            any_cmd_ran = true;
+            self.any_recipe_ran = true;
 
-            if cmd.trim().is_empty() {
-                continue;
-            }
-
+            // Split shell_flags by whitespace into separate arguments
+            let flags: Vec<&str> = self.shell_flags.split_whitespace().collect();
             let mut child = Command::new(self.shell);
-            child.arg(self.shell_flags).arg(&cmd);
+            for flag in &flags {
+                child.arg(flag);
+            }
+            child.arg(&cmd);
             child.env("MAKELEVEL", self.get_makelevel());
 
             // Set up exported variables
@@ -978,7 +1133,10 @@ impl<'a> Executor<'a> {
             }
         }
 
-        Ok(true)
+        // Return true (rebuilt) only if actual shell commands ran.
+        // If only make-functions ($(info), etc.) ran, return false so
+        // "is up to date" message can be printed for the target.
+        Ok(any_cmd_ran)
     }
 
     fn target_has_recipe(&self, target: &str) -> bool {

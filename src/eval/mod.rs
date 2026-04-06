@@ -55,6 +55,28 @@ pub struct MakeState {
     pub pending_includes: Vec<PendingInclude>,
 }
 
+/// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
+/// The level is read from the MAKELEVEL environment variable (set by parent make).
+pub fn make_progname() -> String {
+    let base = env::args().next().unwrap_or_else(|| "make".to_string());
+    match env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(level) if level > 0 => format!("{}[{}]", base, level),
+        _ => base,
+    }
+}
+
+/// Determine whether "entering/leaving directory" messages should be printed.
+fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
+    if args.no_print_directory {
+        return false;
+    }
+    if args.print_directory {
+        return true;
+    }
+    // Recursive makes (MAKELEVEL > 0) automatically print directory messages
+    matches!(env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()), Some(level) if level > 0)
+}
+
 impl MakeState {
     pub fn new(args: MakeArgs) -> Self {
         let mut state = MakeState {
@@ -71,14 +93,14 @@ impl MakeState {
         };
 
         // Change directory if requested
-        let progname = env::args().next().unwrap_or_else(|| "make".to_string());
+        let progname = make_progname();
         if let Some(ref dir) = state.args.directory {
             if let Err(e) = env::set_current_dir(dir) {
                 eprintln!("{}: Entering directory '{}'", progname, dir.display());
                 eprintln!("{}: *** {}: {}.  Stop.", progname, dir.display(), e);
                 std::process::exit(2);
             }
-            if state.args.print_directory || !state.args.no_print_directory {
+            if should_print_directory(&state.args) {
                 let cwd = env::current_dir().unwrap_or_default();
                 eprintln!("{}: Entering directory '{}'", progname, cwd.display());
             }
@@ -151,8 +173,16 @@ impl MakeState {
             }
         }
 
+        // Print entering-directory if needed (for -w without -C)
+        let progname = make_progname();
+        let print_dir = should_print_directory(&self.args);
+        if print_dir && self.args.directory.is_none() {
+            // Already printed at startup for -C; print here for -w without -C
+            let cwd = env::current_dir().unwrap_or_default();
+            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+        }
+
         // Build targets
-        let progname = env::args().next().unwrap_or_else(|| "make".to_string());
         let mut executor = exec::Executor::new(
             &self.db,
             self,
@@ -167,18 +197,16 @@ impl MakeState {
             &shell_flags,
             self.args.always_make,
             self.args.trace,
-            progname,
+            progname.clone(),
         );
 
         let result = executor.build_targets(&targets);
 
-        // Print directory on exit if needed
-        if let Some(ref _dir) = self.args.directory {
-            if self.args.print_directory || !self.args.no_print_directory {
-                let cwd = env::current_dir().unwrap_or_default();
-                let progname = env::args().next().unwrap_or_else(|| "make".to_string());
-                eprintln!("{}: Leaving directory '{}'", progname, cwd.display());
-            }
+        // Print leaving-directory if needed
+        let print_dir = should_print_directory(&self.args);
+        if print_dir {
+            let cwd = env::current_dir().unwrap_or_default();
+            eprintln!("{}: Leaving directory '{}'", progname, cwd.display());
         }
 
         result
@@ -199,8 +227,39 @@ impl MakeState {
         self.db.variables.insert(".FEATURES".into(),
             Variable::new("target-specific order-only second-expansion else-if shortest-stem undefine oneshell check-symlink".into(),
             VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert(".INCLUDE_DIRS".into(),
-            Variable::new("/usr/include /usr/local/include".into(), VarFlavor::Simple, VarOrigin::Default));
+        // .INCLUDE_DIRS: the effective include path.
+        // When -I- is given, the default dirs are excluded (only explicit -Idir after -I- count).
+        // When -Idir is given without -I-, dirs are added to the defaults.
+        {
+            let has_reset = self.args.include_dirs.iter().any(|d| d.to_string_lossy() == "-");
+            let explicit_dirs: Vec<String> = if has_reset {
+                // Only include dirs that appear AFTER the last -I-
+                let mut after_reset = Vec::new();
+                let mut found_reset = false;
+                for d in self.args.include_dirs.iter().rev() {
+                    if d.to_string_lossy() == "-" {
+                        found_reset = true;
+                        break;
+                    }
+                    after_reset.push(d.to_string_lossy().to_string());
+                }
+                after_reset.into_iter().rev().collect()
+            } else {
+                // No -I-, include all explicit dirs plus system defaults
+                let mut dirs: Vec<String> = self.args.include_dirs.iter()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .collect();
+                // Append system defaults
+                for sys in &["/usr/local/include", "/usr/include"] {
+                    if !dirs.iter().any(|d| d == sys) {
+                        dirs.push(sys.to_string());
+                    }
+                }
+                dirs
+            };
+            self.db.variables.insert(".INCLUDE_DIRS".into(),
+                Variable::new(explicit_dirs.join(" "), VarFlavor::Simple, VarOrigin::Default));
+        }
         self.db.variables.insert("SHELL".into(),
             Variable::new("/bin/sh".into(), VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".SHELLFLAGS".into(),
@@ -272,6 +331,7 @@ impl MakeState {
         let mut long_parts: Vec<String> = Vec::new();
         if self.args.trace { long_parts.push("--trace".to_string()); }
         if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
+        if self.args.no_silent { long_parts.push("--no-silent".to_string()); }
         if self.args.warn_undefined_variables { long_parts.push("--warn-undefined-variables".to_string()); }
 
         // Options with arguments
@@ -463,7 +523,27 @@ impl MakeState {
             *self.current_line.borrow_mut() = lineno;
             // Handle define/endef blocks
             if parser.in_define {
-                if line.trim() == "endef" {
+                // Check for endef - must start with "endef" followed by whitespace, #, or end
+                // "endef$(VAR)" is NOT recognized as endef (no space between endef and $)
+                let trimmed_line = line.trim();
+                // Strip comment to get the non-comment part
+                let no_comment = parser::strip_comment(trimmed_line);
+                let no_comment_trimmed = no_comment.trim();
+                // endef is recognized if:
+                // - exactly "endef"
+                // - "endef " or "endef\t" followed by anything (extraneous text warning)
+                // - line starts with "#" (comment only line inside define = content)
+                // Note: "endef#" (no space) is also recognized per GNU make behavior
+                let is_endef = no_comment_trimmed == "endef"
+                    || trimmed_line.starts_with("endef ")
+                    || trimmed_line.starts_with("endef\t")
+                    || trimmed_line.starts_with("endef#");
+                if is_endef {
+                    // Warn about extraneous text after endef (non-comment text)
+                    if no_comment_trimmed != "endef" && !no_comment_trimmed.is_empty() {
+                        let fname = parser.filename.to_string_lossy();
+                        eprintln!("{}:{}: extraneous text after 'endef' directive", fname, lineno);
+                    }
                     parser.in_define = false;
                     let value = parser.define_lines.join("\n");
                     let var = Variable::new(
@@ -534,7 +614,7 @@ impl MakeState {
                 // If so, handle value expansion based on flavor.
                 let trimmed = line.trim();
                 if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
-                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, .. } = raw_parsed {
+                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple => {
                                 // Immediate expansion: expand the whole line
@@ -545,19 +625,26 @@ impl MakeState {
                                 // keep the value verbatim.
                                 // Reconstruct the line with only the name expanded.
                                 let expanded_name = self.expand(&raw_name);
-                                // Re-build a minimal version that the parser can handle.
-                                // We preserve the original prefixes (override, export, private)
-                                // from the trimmed line by replacing the raw name with the
-                                // expanded name.
                                 let op_str = match raw_flavor {
                                     VarFlavor::Append => " += ",
                                     VarFlavor::Conditional => " ?= ",
                                     VarFlavor::Shell => " != ",
                                     _ => " = ",
                                 };
-                                // Preserve override/export/private prefixes from the original
-                                let prefix = extract_var_prefixes(trimmed);
-                                format!("{}{}{}{}", prefix, expanded_name, op_str, raw_value)
+                                // Build modifier prefix for the variable name
+                                let mut var_prefix = String::new();
+                                if raw_is_override { var_prefix.push_str("override "); }
+                                if raw_is_export { var_prefix.push_str("export "); }
+                                if raw_is_private { var_prefix.push_str("private "); }
+                                if let Some(tgt) = raw_target {
+                                    // Target-specific variable: "target: [modifiers] name op value"
+                                    let expanded_target = self.expand(&tgt);
+                                    format!("{}: {}{}{}{}", expanded_target, var_prefix, expanded_name, op_str, raw_value)
+                                } else {
+                                    // Preserve outer override/export/private prefixes from the original
+                                    let outer_prefix = extract_var_prefixes(trimmed);
+                                    format!("{}{}{}{}", outer_prefix, expanded_name, op_str, raw_value)
+                                }
                             }
                         }
                     } else {
@@ -611,6 +698,23 @@ impl MakeState {
 
             match parsed {
                 ParsedLine::Rule(mut rule) => {
+                    // Register the previous rule FIRST.
+                    //
+                    // This must happen before the second-expansion check below, because the
+                    // previous rule may be ".SECONDEXPANSION:" whose registration activates
+                    // self.db.second_expansion.  Without this ordering, the rule immediately
+                    // after ".SECONDEXPANSION:" would be processed in non-SE mode.
+                    if let Some(prev) = current_rule.take() {
+                        for sib in &mut static_rule_siblings {
+                            sib.recipe = prev.recipe.clone();
+                        }
+                        for sib in static_rule_siblings.drain(..) {
+                            self.register_rule(sib);
+                        }
+                        self.register_rule(prev);
+                    }
+                    static_rule_siblings.clear();
+
                     if self.db.second_expansion {
                         // Second expansion is active.
                         //
@@ -658,17 +762,6 @@ impl MakeState {
                         }
                     }
 
-                    // Register the previous rule (and any static-pattern siblings).
-                    if let Some(prev) = current_rule.take() {
-                        for sib in &mut static_rule_siblings {
-                            sib.recipe = prev.recipe.clone();
-                        }
-                        for sib in static_rule_siblings.drain(..) {
-                            self.register_rule(sib);
-                        }
-                        self.register_rule(prev);
-                    }
-                    static_rule_siblings.clear();
                     parser.in_recipe = true;
                     current_rule = Some(rule);
                 }
@@ -692,25 +785,29 @@ impl MakeState {
                         continue;
                     }
 
-                    // Prepare each expanded rule: expand variable references in
-                    // the already-substituted prerequisites, stamp source file
-                    // and line number.
+                    // Prepare each expanded rule: handle SE if active, stamp source
+                    // file and line number.
                     let source_file = parser.filename.to_string_lossy().to_string();
+                    let se_active = self.db.second_expansion;
                     let mut prepared: Vec<Rule> = expanded_rules
                         .into_iter()
                         .map(|mut rule| {
-                            rule.prerequisites = rule.prerequisites.iter()
-                                .flat_map(|p| {
-                                    let e = self.expand(p);
-                                    parser::split_words(&e)
-                                })
-                                .collect();
-                            rule.order_only_prerequisites = rule.order_only_prerequisites.iter()
-                                .flat_map(|p| {
-                                    let e = self.expand(p);
-                                    parser::split_words(&e)
-                                })
-                                .collect();
+                            if se_active {
+                                // In SE mode the raw prereq text is in
+                                // second_expansion_prereqs.  For rules that have SE
+                                // references ($@ etc.) we clear the incorrectly-split
+                                // first-pass tokens; plain prereqs are left intact.
+                                if rule.second_expansion_prereqs.is_some() {
+                                    rule.prerequisites.clear();
+                                }
+                                if rule.second_expansion_order_only.is_some() {
+                                    rule.order_only_prerequisites.clear();
+                                }
+                            } else {
+                                // Not in SE mode: clear SE fields (they're not needed).
+                                rule.second_expansion_prereqs = None;
+                                rule.second_expansion_order_only = None;
+                            }
                             rule.source_file = source_file.clone();
                             for entry in rule.recipe.iter_mut() {
                                 if entry.0 == 0 {
@@ -807,11 +904,9 @@ impl MakeState {
                             let file_path = self.find_include_file(&file);
                             match file_path {
                                 Some(p) => {
-                                    if let Err(e) = self.read_makefile(&p) {
-                                        if !ignore_missing {
-                                            // Required include failed to parse - warn and defer
-                                            eprintln!("{}:{}: {}", parser.filename.display(), lineno, e);
-                                        }
+                                    if let Err(_e) = self.read_makefile(&p) {
+                                        // File exists but failed to parse (e.g. unreadable).
+                                        // Defer to pending includes to decide what to do.
                                         self.pending_includes.push(PendingInclude {
                                             file: file.clone(),
                                             parent: parser.filename.to_string_lossy().to_string(),
@@ -821,13 +916,8 @@ impl MakeState {
                                     }
                                 }
                                 None => {
-                                    // File not found
-                                    if !ignore_missing {
-                                        // Required include: print warning (no *** prefix)
-                                        eprintln!("{}:{}: {}: No such file or directory",
-                                            parser.filename.display(), lineno, file);
-                                    }
-                                    // Always add to pending (both required and optional may be buildable)
+                                    // File not found: defer to pending includes.
+                                    // Don't print a warning yet - the file may be buildable.
                                     self.pending_includes.push(PendingInclude {
                                         file: file.clone(),
                                         parent: parser.filename.to_string_lossy().to_string(),
@@ -948,9 +1038,15 @@ impl MakeState {
                 match special {
                     SpecialTarget::Phony | SpecialTarget::Precious |
                     SpecialTarget::Intermediate | SpecialTarget::Secondary |
-                    SpecialTarget::Silent | SpecialTarget::Ignore => {
+                    SpecialTarget::Silent | SpecialTarget::Ignore |
+                    SpecialTarget::NotIntermediate => {
                         let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
                         set.extend(prereqs);
+                    }
+                    SpecialTarget::Wait => {
+                        // .WAIT is a synchronization marker in dependency lists.
+                        // It has no prerequisites and no special database state.
+                        // Just register it so it's recognized and not treated as a real target.
                     }
                     SpecialTarget::ExportAllVariables => {
                         // .EXPORT_ALL_VARIABLES: causes all variables to be exported
@@ -1020,8 +1116,25 @@ impl MakeState {
             } else {
                 // Single colon - merge prerequisites, replace recipe if new one given
                 if let Some(existing) = rules.first_mut() {
+                    // GNU Make promotes a prereq from order-only to normal when the same
+                    // target lists it as a normal prereq in any rule.  Handle both directions:
+                    //  (a) new rule has normal prereqs that were order-only in existing rule
+                    //  (b) new rule has order-only prereqs that were already normal in existing rule
+                    let new_normal: std::collections::HashSet<&String> =
+                        rule.prerequisites.iter().collect();
+                    // (a) Promote: remove from existing order-only if also a new normal prereq.
+                    existing.order_only_prerequisites.retain(|p| !new_normal.contains(p));
+
+                    let existing_normal: std::collections::HashSet<&String> =
+                        existing.prerequisites.iter().collect();
+                    // (b) Filter: don't add as order-only if already a normal prereq.
+                    let filtered_order_only: Vec<String> = rule.order_only_prerequisites.iter()
+                        .filter(|p| !existing_normal.contains(p))
+                        .cloned()
+                        .collect();
+
                     existing.prerequisites.extend(rule.prerequisites.clone());
-                    existing.order_only_prerequisites.extend(rule.order_only_prerequisites.clone());
+                    existing.order_only_prerequisites.extend(filtered_order_only);
                     // Merge second-expansion raw prerequisite text.
                     if let Some(ref new_text) = rule.second_expansion_prereqs {
                         match existing.second_expansion_prereqs {
@@ -1178,19 +1291,43 @@ impl MakeState {
             None => return,
         };
 
-        // Save existing include_dirs to detect new additions
-        let old_include_dirs = self.args.include_dirs.clone();
+        // Reset all settings that come from MAKEFLAGS before re-parsing.
+        // The MAKEFLAGS string value is the source of truth; we rebuild from it
+        // to prevent duplicates when MAKEFLAGS is updated (e.g. MAKEFLAGS += -Idir).
+        self.args.include_dirs.clear();
+        self.args.debug.clear();
+        self.args.variables.clear();
+        self.args.load_average = None;
+        self.args.output_sync = None;
+        self.args.debug_short = false;
+        self.args.always_make = false;
+        self.args.environment_overrides = false;
+        self.args.ignore_errors = false;
+        self.args.keep_going = false;
+        self.args.dry_run = false;
+        self.args.just_print = false;
+        self.args.question = false;
+        self.args.no_builtin_rules = false;
+        self.args.no_builtin_variables = false;
+        self.args.silent = false;
+        self.args.touch = false;
+        self.args.print_directory = false;
+        self.args.no_print_directory = false;
+        self.args.check_symlink_times = false;
+        self.args.trace = false;
+        self.args.warn_undefined_variables = false;
 
-        // Parse the full current MAKEFLAGS value, merging into a copy of self.args
-        // to apply any new flags that were added.
+        // Parse the full current MAKEFLAGS value into self.args (fresh start).
         crate::cli::parse_makeflags(&makeflags, &mut self.args);
 
-        // Apply any newly added include dirs to self.include_dirs as well
-        for dir in &self.args.include_dirs.clone() {
-            if !old_include_dirs.contains(dir) {
-                self.include_dirs.push(dir.clone());
-            }
-        }
+        // Rebuild include_dirs from the parsed args (deduplicating).
+        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let deduped_dirs: Vec<std::path::PathBuf> = self.args.include_dirs.iter()
+            .filter(|d| seen_dirs.insert(d.to_string_lossy().to_string()))
+            .cloned()
+            .collect();
+        self.args.include_dirs = deduped_dirs;
+        self.include_dirs = self.args.include_dirs.clone();
 
         // Rebuild MAKEFLAGS from the updated args in canonical format.
         // This ensures single-char flags are sorted and properly bundled.
@@ -1319,11 +1456,15 @@ impl MakeState {
                     }
                     Some(IncludeRuleInfo { recipe, source_file, recipe_lineno, prerequisites, skippable: false }) => {
                         // First, check/build prerequisites
+                        let mut visited = HashSet::new();
+                        visited.insert(pi.file.clone());
                         let prereq_result = self.build_include_prerequisites(
                             &prerequisites,
+                            &pi.file,
                             &shell,
                             &shell_flags,
                             silent,
+                            &mut visited,
                         );
 
                         match prereq_result {
@@ -1403,35 +1544,61 @@ impl MakeState {
 
     /// Build prerequisites needed before building an include file.
     /// Returns Ok(()) if all prerequisites exist or were successfully built.
+    /// Only follows explicit (non-pattern) rules to avoid infinite recursion
+    /// through implicit rule chains.
     fn build_include_prerequisites(
         &self,
         prerequisites: &[String],
+        include_target: &str,
         shell: &str,
         shell_flags: &str,
         silent: bool,
+        visited: &mut HashSet<String>,
     ) -> Result<(), String> {
         for prereq in prerequisites {
             let prereq_path = Path::new(prereq);
             if prereq_path.exists() {
                 continue;
             }
-            // Check if prereq has a rule with a recipe
-            let rule_info = self.find_include_rule(prereq);
-            match rule_info {
+            if visited.contains(prereq) {
+                // Cycle detected: treat as can't build
+                return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
+                    prereq, include_target));
+            }
+            visited.insert(prereq.clone());
+
+            // Only look at explicit rules (not pattern rules) to avoid infinite
+            // recursion through implicit rule chains like %: %.o: %.c etc.
+            let explicit_rule = self.db.rules.get(prereq).and_then(|rules| {
+                rules.iter().find(|r| {
+                    // Skip double-colon with no prerequisites
+                    !(r.is_double_colon && r.prerequisites.is_empty())
+                    // Has something to do (recipe or dependencies)
+                    && (!r.recipe.is_empty() || !r.prerequisites.is_empty())
+                })
+            }).cloned();
+
+            match explicit_rule {
                 None => {
+                    // No explicit rule and file doesn't exist
                     return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
-                        prereq, prereq));
+                        prereq, include_target));
                 }
-                Some(info) if info.skippable => {
-                    return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
-                        prereq, prereq));
-                }
-                Some(info) => {
-                    // Build prerequisites of this prereq first
-                    self.build_include_prerequisites(&info.prerequisites, shell, shell_flags, silent)?;
+                Some(rule) => {
+                    // Build this prereq's prerequisites first
+                    if !rule.prerequisites.is_empty() {
+                        self.build_include_prerequisites(
+                            &rule.prerequisites.clone(),
+                            prereq,
+                            shell,
+                            shell_flags,
+                            silent,
+                            visited,
+                        )?;
+                    }
                     // Run the recipe
-                    if !info.recipe.is_empty() {
-                        self.run_include_recipe(prereq, &info.recipe, shell, shell_flags, silent)?;
+                    if !rule.recipe.is_empty() {
+                        self.run_include_recipe(prereq, &rule.recipe.clone(), shell, shell_flags, silent)?;
                     }
                 }
             }
@@ -1507,6 +1674,10 @@ impl MakeState {
         shell: &str, shell_flags: &str, silent: bool,
     ) -> Result<(), String> {
         let progname = env::args().next().unwrap_or_else(|| "make".to_string());
+        // Set up automatic variables for recipe expansion ($@ = target)
+        let mut auto_vars = HashMap::new();
+        auto_vars.insert("@".to_string(), target.to_string());
+
         for (lineno, cmd_template) in recipe {
             let mut cmd = cmd_template.clone();
             let mut cmd_silent = false;
@@ -1519,7 +1690,7 @@ impl MakeState {
                     _ => break,
                 }
             }
-            let expanded_cmd = self.expand(&cmd);
+            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
             if !silent && !cmd_silent {
                 println!("{}", expanded_cmd);
             }

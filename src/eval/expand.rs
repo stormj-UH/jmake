@@ -265,6 +265,33 @@ impl MakeState {
             "foreach" => {
                 return self.expand_foreach(args_str, auto_vars);
             }
+            "let" => {
+                let args = split_function_args_max(args_str, 3);
+                if args.len() < 3 { return String::new(); }
+                let var_names_str = self.expand_with_auto_vars(&args[0], auto_vars);
+                let var_names: Vec<&str> = var_names_str.split_whitespace().collect();
+                let list_str = self.expand_with_auto_vars(&args[1], auto_vars);
+                let body = &args[2];
+
+                if var_names.is_empty() {
+                    return self.expand_with_auto_vars(body, auto_vars);
+                }
+
+                // Bind words from list to variable names using auto_vars overlay
+                let words: Vec<&str> = list_str.split_whitespace().collect();
+                let mut let_vars = auto_vars.clone();
+                for (i, var) in var_names.iter().enumerate() {
+                    let val = if i == var_names.len() - 1 {
+                        if i < words.len() { words[i..].join(" ") } else { String::new() }
+                    } else if i < words.len() {
+                        words[i].to_string()
+                    } else {
+                        String::new()
+                    };
+                    let_vars.insert(var.to_string(), val);
+                }
+                return self.expand_with_auto_vars(body, &let_vars);
+            }
             "if" => {
                 let args = split_function_args_max(args_str, 3);
                 if args.is_empty() { return String::new(); }
@@ -306,12 +333,16 @@ impl MakeState {
                 *self.last_shell_status.borrow_mut() = status;
                 return output;
             }
+            "file" => {
+                return self.expand_file_function(args_str, auto_vars);
+            }
             _ => {}
         }
 
-        // Validate word/wordlist numeric arguments before dispatching
-        if name == "word" || name == "wordlist" {
-            let raw_args = split_function_args_max(args_str, if name == "word" { 2 } else { 3 });
+        // Validate word/wordlist/intcmp numeric arguments before dispatching
+        if name == "word" || name == "wordlist" || name == "intcmp" {
+            let max = match name { "word" => 2, "intcmp" => 5, _ => 3 };
+            let raw_args = split_function_args_max(args_str, max);
             let expanded_args: Vec<String> = raw_args.iter()
                 .map(|a| self.expand_with_auto_vars(a, auto_vars))
                 .collect();
@@ -346,6 +377,24 @@ impl MakeState {
             } else if name == "wordlist" && expanded_args.len() >= 3 {
                 validate_numeric_arg(&expanded_args[0], "wordlist", "first", false);
                 validate_numeric_arg(&expanded_args[1], "wordlist", "second", true);
+            } else if name == "intcmp" && expanded_args.len() >= 2 {
+                // intcmp uses "non-numeric" instead of "invalid" in error messages
+                let validate_intcmp_arg = |arg: &str, ordinal: &str| {
+                    let trimmed = arg.trim();
+                    if trimmed.is_empty() {
+                        eprintln!("{}*** non-numeric {} argument to 'intcmp' function: empty value.  Stop.", loc, ordinal);
+                        std::process::exit(2);
+                    }
+                    // intcmp accepts negative numbers and leading +/-
+                    let num_part = trimmed.strip_prefix('+').or_else(|| trimmed.strip_prefix('-')).unwrap_or(trimmed);
+                    if num_part.is_empty() || !num_part.chars().all(|c| c.is_ascii_digit()) {
+                        eprintln!("{}*** non-numeric {} argument to 'intcmp' function: '{}'.  Stop.", loc, ordinal, trimmed);
+                        std::process::exit(2);
+                    }
+                    // intcmp supports arbitrary precision - no overflow check
+                };
+                validate_intcmp_arg(&expanded_args[0], "first");
+                validate_intcmp_arg(&expanded_args[1], "second");
             }
         }
 
@@ -415,6 +464,155 @@ impl MakeState {
             self.expand_with_auto_vars(&substituted, &loop_auto_vars)
         }).collect();
         results.join(" ")
+    }
+
+    fn expand_file_function(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
+        use std::io::Write;
+
+        let file_loc = {
+            let f = self.current_file.borrow();
+            let l = *self.current_line.borrow();
+            if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+        };
+
+        let fatal = |msg: &str| -> ! {
+            eprintln!("{}*** {}.  Stop.", file_loc, msg);
+            std::process::exit(2);
+        };
+
+        // Split into at most 2 args: the op+filename part, and the optional text part.
+        // We need to know if a comma was present (args.len() > 1) even when text is empty.
+        let raw_args = split_function_args_max(args_str, 2);
+        let has_text_arg = raw_args.len() > 1;
+
+        // Expand the first arg (op + filename) and the text if present.
+        let op_raw = self.expand_with_auto_vars(&raw_args[0], auto_vars);
+        let op_str = op_raw.trim();
+
+        // Determine operation and filename by parsing the operator prefix.
+        // Must check ">>" before ">" because ">>" starts with ">".
+        let (mode, filename) = if let Some(rest) = op_str.strip_prefix(">>") {
+            (">>", rest.trim())
+        } else if let Some(rest) = op_str.strip_prefix('>') {
+            (">", rest.trim())
+        } else if let Some(rest) = op_str.strip_prefix('<') {
+            ("<", rest.trim())
+        } else {
+            // Invalid operation
+            let loc2 = {
+                let f = self.current_file.borrow();
+                let l = *self.current_line.borrow();
+                if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+            };
+            eprintln!("{}*** file: invalid file operation: {}.  Stop.", loc2, op_str);
+            std::process::exit(2);
+        };
+
+        if filename.is_empty() {
+            let loc2 = {
+                let f = self.current_file.borrow();
+                let l = *self.current_line.borrow();
+                if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+            };
+            eprintln!("{}*** file: missing filename.  Stop.", loc2);
+            std::process::exit(2);
+        }
+
+        match mode {
+            "<" => {
+                // Read mode: no text arg allowed
+                if has_text_arg {
+                    let loc2 = {
+                        let f = self.current_file.borrow();
+                        let l = *self.current_line.borrow();
+                        if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+                    };
+                    eprintln!("{}*** file: too many arguments.  Stop.", loc2);
+                    std::process::exit(2);
+                }
+                // Read file; strip exactly one trailing newline (GNU Make behavior).
+                let content = std::fs::read_to_string(filename).unwrap_or_default();
+                if content.ends_with('\n') {
+                    content[..content.len() - 1].to_string()
+                } else {
+                    content
+                }
+            }
+            ">" => {
+                // Write mode (overwrite).
+                // If a comma was present (has_text_arg), write text + newline (unless text
+                // already ends with newline).  If no comma, write an empty file.
+                let text = if has_text_arg {
+                    self.expand_with_auto_vars(&raw_args[1], auto_vars)
+                } else {
+                    // No comma: create empty file (zero bytes).
+                    match std::fs::write(filename, b"") {
+                        Err(e) => {
+                            let loc2 = {
+                                let f = self.current_file.borrow();
+                                let l = *self.current_line.borrow();
+                                if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+                            };
+                            eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                            std::process::exit(2);
+                        }
+                        Ok(_) => {}
+                    }
+                    return String::new();
+                };
+                // Determine content to write.
+                let content = if text.ends_with('\n') {
+                    text
+                } else {
+                    format!("{}\n", text)
+                };
+                match std::fs::write(filename, content.as_bytes()) {
+                    Err(e) => {
+                        let loc2 = {
+                            let f = self.current_file.borrow();
+                            let l = *self.current_line.borrow();
+                            if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+                        };
+                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                        std::process::exit(2);
+                    }
+                    Ok(_) => {}
+                }
+                String::new()
+            }
+            ">>" => {
+                // Append mode.
+                // If a comma was present with empty or non-empty text, append text + newline
+                // (unless text already ends with newline).
+                // If no comma, do nothing (not even create the file).
+                if !has_text_arg {
+                    return String::new();
+                }
+                let text = self.expand_with_auto_vars(&raw_args[1], auto_vars);
+                // With comma but empty text, still write a newline.
+                let content = if text.ends_with('\n') {
+                    text
+                } else {
+                    format!("{}\n", text)
+                };
+                match std::fs::OpenOptions::new().append(true).create(true).open(filename) {
+                    Err(e) => {
+                        let loc2 = {
+                            let f = self.current_file.borrow();
+                            let l = *self.current_line.borrow();
+                            if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
+                        };
+                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                        std::process::exit(2);
+                    }
+                    Ok(mut f) => {
+                        let _ = f.write_all(content.as_bytes());
+                    }
+                }
+                String::new()
+            }
+            _ => String::new(),
+        }
     }
 }
 
