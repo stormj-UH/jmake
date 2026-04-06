@@ -302,10 +302,10 @@ impl MakeState {
             });
         }
 
-        // Command-line variables override everything
+        // Command-line variables override everything; GNU Make stores them as recursive
         for (name, value) in &self.args.variables {
             self.db.variables.insert(name.clone(),
-                Variable::new(value.clone(), VarFlavor::Simple, VarOrigin::CommandLine));
+                Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
         }
     }
 
@@ -890,18 +890,19 @@ impl MakeState {
                                     is_override,
                                 });
                             } else {
-                                // Target-specific variable: stored in the rule
+                                // Target-specific variable: stored in the rule as a Vec
+                                // to support multiple += entries for the same variable.
                                 let var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
                                 let rules = self.db.rules.entry(t.clone()).or_insert_with(Vec::new);
                                 // Add to all rules for this target
                                 for r in rules.iter_mut() {
-                                    r.target_specific_vars.insert(name.clone(), var.clone());
+                                    r.target_specific_vars.push((name.clone(), var.clone()));
                                 }
                                 // If no rules yet, create a placeholder
                                 if rules.is_empty() {
                                     let mut r = Rule::new();
                                     r.targets = vec![t];
-                                    r.target_specific_vars.insert(name.clone(), var.clone());
+                                    r.target_specific_vars.push((name.clone(), var.clone()));
                                     rules.push(r);
                                 }
                             }
@@ -1299,9 +1300,9 @@ impl MakeState {
                         }
                         existing.recipe = rule.recipe.clone();
                     }
-                    // Merge target-specific vars
+                    // Merge target-specific vars (append to list for multiple += support)
                     for (k, v) in &rule.target_specific_vars {
-                        existing.target_specific_vars.insert(k.clone(), v.clone());
+                        existing.target_specific_vars.push((k.clone(), v.clone()));
                     }
                 } else {
                     rules.push(rule.clone());
@@ -1574,15 +1575,19 @@ impl MakeState {
 
                 match rule_info {
                     None => {
-                        // No rule at all
+                        // No rule at all - file can't be built
                         if !pi.ignore_missing {
+                            // Print "No such file" warning before the fatal error
+                            if !pi.parent.is_empty() {
+                                eprintln!("{}:{}: {}: No such file or directory",
+                                    pi.parent, pi.lineno, pi.file);
+                            }
                             return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
                         }
                         // Optional include with no rule: silently skip
                     }
                     Some(IncludeRuleInfo { skippable: true, .. }) => {
-                        // Double-colon with no prerequisites or other skippable rule:
-                        // treat as if there's no rule for include-rebuild purposes
+                        // Double-colon with no prerequisites or phony: not used for include rebuilding
                         if !pi.ignore_missing {
                             if !pi.parent.is_empty() {
                                 eprintln!("{}:{}: {}: No such file or directory",
@@ -1592,7 +1597,7 @@ impl MakeState {
                         }
                         // Optional include: silently skip
                     }
-                    Some(IncludeRuleInfo { recipe, source_file, recipe_lineno, prerequisites, skippable: false }) => {
+                    Some(IncludeRuleInfo { recipe, source_file, prerequisites, .. }) => {
                         // First, check/build prerequisites
                         let mut visited = HashSet::new();
                         visited.insert(pi.file.clone());
@@ -1610,18 +1615,23 @@ impl MakeState {
                             Err(prereq_err) => {
                                 // Prerequisite couldn't be built
                                 if !pi.ignore_missing {
+                                    // Print "No such file" warning for the include file
                                     if !pi.parent.is_empty() {
                                         eprintln!("{}:{}: {}: No such file or directory",
                                             pi.parent, pi.lineno, pi.file);
                                     }
                                     return Err(prereq_err);
                                 }
-                                // Optional include: silently skip
+                                // Optional include: silently ignore prerequisite failure
                             }
                             Ok(()) => {
                                 if recipe.is_empty() {
                                     // Has prerequisites but no recipe: just check if file exists
                                     if !file_path.exists() && !pi.ignore_missing {
+                                        if !pi.parent.is_empty() {
+                                            eprintln!("{}:{}: {}: No such file or directory",
+                                                pi.parent, pi.lineno, pi.file);
+                                        }
                                         return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
                                     }
                                 } else {
@@ -1633,7 +1643,6 @@ impl MakeState {
                                         &shell_flags,
                                         silent,
                                         &source_file,
-                                        pi.ignore_missing,
                                     );
                                     match built {
                                         Ok(()) => {
@@ -1645,25 +1654,27 @@ impl MakeState {
                                                 }
                                                 any_rebuilt = true;
                                             } else {
-                                                // Recipe ran but file not created
-                                                if !pi.parent.is_empty() {
+                                                // Recipe ran successfully but file not created
+                                                if !pi.ignore_missing && !pi.parent.is_empty() {
                                                     eprintln!("{}:{}: Failed to remake makefile '{}'.",
                                                         pi.parent, pi.lineno, pi.file);
                                                 }
                                                 if !pi.ignore_missing {
-                                                    return Err(format!("[{}:{}] Error 1",
-                                                        source_file, recipe_lineno));
+                                                    return Err(String::new()); // fatal but no additional message
                                                 }
+                                                // Optional include: silently skip if file not created
                                             }
                                         }
                                         Err(recipe_err) => {
-                                            // Recipe failed
+                                            // Recipe failed (non-zero exit)
                                             if !pi.ignore_missing {
+                                                // Print "No such file" warning
                                                 if !pi.parent.is_empty() {
                                                     eprintln!("{}:{}: {}: No such file or directory",
                                                         pi.parent, pi.lineno, pi.file);
                                                 }
-                                                return Err(format!("[{}:{}] {}", source_file, recipe_lineno, recipe_err));
+                                                // recipe_err already has "[source:lineno: target] Error N" format
+                                                return Err(recipe_err);
                                             }
                                             // Optional include with failed recipe: silently skip
                                         }
@@ -1745,7 +1756,7 @@ impl MakeState {
                         let src = rule.source_file.clone();
                         self.run_include_recipe(
                             prereq, &rule.recipe.clone(), shell, shell_flags, silent,
-                            &src, ignore_missing,
+                            &src,
                         )?;
                     }
                 }
@@ -1819,13 +1830,13 @@ impl MakeState {
 
     /// Run the recipe commands for building an include file.
     /// `source_file`: the makefile that defined the recipe (for error messages).
-    /// `ignore_missing`: if true, suppress error printing (optional include).
+    /// Returns Err with formatted "[source_file:lineno: target] Error N" string on failure.
+    /// Callers are responsible for printing warnings and propagating the error.
     fn run_include_recipe(
         &self, target: &str, recipe: &[(usize, String)],
         shell: &str, shell_flags: &str, silent: bool,
-        source_file: &str, ignore_missing: bool,
+        source_file: &str,
     ) -> Result<(), String> {
-        let progname = env::args().next().unwrap_or_else(|| "make".to_string());
         // Set up automatic variables for recipe expansion ($@ = target)
         let mut auto_vars = HashMap::new();
         auto_vars.insert("@".to_string(), target.to_string());
@@ -1855,16 +1866,9 @@ impl MakeState {
                 Ok(s) => {
                     let code = s.code().unwrap_or(1);
                     // Error format: [source_file:lineno: target] Error N
-                    let err_loc = if source_file.is_empty() {
-                        format!("{}:{}", target, lineno)
-                    } else {
-                        format!("{}:{}: {}", source_file, lineno, target)
-                    };
-                    if !ignore_missing {
-                        eprintln!("{}: *** [{}] Error {}", progname, err_loc, code);
-                    }
+                    // Caller is responsible for printing the "*** [...]" error message.
                     if !ignore_error {
-                        return Err(format!("[{}] Error {}", err_loc, code));
+                        return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
                     }
                 }
                 Err(e) => {

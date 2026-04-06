@@ -40,6 +40,10 @@ pub struct Executor<'a> {
     top_level_targets: HashSet<String>,
     /// Targets/files marked as "infinitely new" via -W/--what-if.
     what_if: Vec<String>,
+    /// Stack of inherited target-specific variables from parent targets.
+    /// When building a target's prerequisites, the parent's collected target vars
+    /// are pushed here so that prereqs can inherit them.
+    inherited_vars_stack: Vec<HashMap<String, (String, bool)>>,
 }
 
 impl<'a> Executor<'a> {
@@ -83,6 +87,7 @@ impl<'a> Executor<'a> {
             intermediate_built: HashSet::new(),
             top_level_targets: HashSet::new(),
             what_if,
+            inherited_vars_stack: Vec::new(),
         }
     }
 
@@ -354,20 +359,14 @@ impl<'a> Executor<'a> {
             self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut base_auto_vars);
 
             for text in &se_prereq_texts {
-                let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
-                for p in expanded {
-                    if !p.is_empty() {
-                        se_expanded_prereqs.push(p);
-                    }
-                }
+                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                se_expanded_prereqs.extend(normal);
+                se_expanded_order_only.extend(oo);
             }
             for text in &se_order_only_texts {
-                let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
-                for p in expanded {
-                    if !p.is_empty() {
-                        se_expanded_order_only.push(p);
-                    }
-                }
+                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                se_expanded_order_only.extend(normal);
+                se_expanded_order_only.extend(oo);
             }
         }
 
@@ -380,6 +379,11 @@ impl<'a> Executor<'a> {
         all_order_only.retain(|p| p != ".WAIT");
 
         // Build prerequisites
+        // Push this target's collected vars onto the inheritance stack so that
+        // prerequisites can inherit them (GNU Make target-specific var inheritance).
+        let my_target_vars = self.collect_target_vars(target);
+        self.inherited_vars_stack.push(my_target_vars);
+
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
 
@@ -402,6 +406,7 @@ impl<'a> Executor<'a> {
                     if self.keep_going {
                         prereq_errors.push(propagated);
                     } else {
+                        self.inherited_vars_stack.pop();
                         return Err(propagated);
                     }
                 }
@@ -412,6 +417,8 @@ impl<'a> Executor<'a> {
         for prereq in all_order_only.clone() {
             let _ = self.build_target(&prereq);
         }
+
+        self.inherited_vars_stack.pop();
 
         if !prereq_errors.is_empty() {
             return Err(prereq_errors.join("\n"));
@@ -442,21 +449,15 @@ impl<'a> Executor<'a> {
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                         let stem_subst = text.replace('%', &stem);
-                        let expanded = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
-                        for p in expanded {
-                            if !p.is_empty() {
-                                pat_prereqs.push(p);
-                            }
-                        }
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        pat_prereqs.extend(normal);
+                        pat_order_only.extend(oo);
                     }
                     if let Some(ref text) = pattern_rule.second_expansion_order_only {
                         let stem_subst = text.replace('%', &stem);
-                        let expanded = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
-                        for p in expanded {
-                            if !p.is_empty() {
-                                pat_order_only.push(p);
-                            }
-                        }
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        pat_order_only.extend(normal);
+                        pat_order_only.extend(oo);
                     }
                 }
 
@@ -585,24 +586,22 @@ impl<'a> Executor<'a> {
                 let base_auto_vars = self.make_auto_vars(target, &empty_prereqs, &empty_oo, stem);
 
                 if let Some(ref text) = rule.second_expansion_prereqs {
-                    let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
-                    for p in expanded {
-                        if !p.is_empty() {
-                            prereqs.push(p);
-                        }
-                    }
+                    let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                    prereqs.extend(normal);
+                    order_only.extend(oo);
                 }
                 if let Some(ref text) = rule.second_expansion_order_only {
-                    let expanded = self.second_expand_prereqs(text, &base_auto_vars, target);
-                    for p in expanded {
-                        if !p.is_empty() {
-                            order_only.push(p);
-                        }
-                    }
+                    let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+                    order_only.extend(normal);
+                    order_only.extend(oo);
                 }
             }
 
             // Build this rule's prerequisites
+            // Push target vars onto stack for inheritance by prerequisites.
+            let my_target_vars = self.collect_target_vars(target);
+            self.inherited_vars_stack.push(my_target_vars);
+
             let mut any_prereq_rebuilt = false;
             let mut prereq_errors = Vec::new();
 
@@ -621,6 +620,7 @@ impl<'a> Executor<'a> {
                         if self.keep_going {
                             prereq_errors.push(propagated);
                         } else {
+                            self.inherited_vars_stack.pop();
                             return Err(propagated);
                         }
                     }
@@ -630,6 +630,8 @@ impl<'a> Executor<'a> {
             for prereq in &order_only {
                 let _ = self.build_target(prereq);
             }
+
+            self.inherited_vars_stack.pop();
 
             if !prereq_errors.is_empty() {
                 return Err(prereq_errors.join("\n"));
@@ -694,7 +696,9 @@ impl<'a> Executor<'a> {
     fn build_with_pattern_rule(&mut self, target: &str, rule: &Rule, stem: &str, is_phony: bool) -> Result<bool, String> {
         // Expand pattern prerequisites using the stem.
         // For normal (non-SE) prerequisites, substitute % with the stem.
+        // .WAIT markers are filtered since they are ordering hints, not real targets.
         let mut prereqs: Vec<String> = rule.prerequisites.iter()
+            .filter(|p| p.as_str() != ".WAIT")
             .map(|p| p.replace('%', stem))
             .collect();
 
@@ -704,6 +708,7 @@ impl<'a> Executor<'a> {
 
         // Handle second-expansion prerequisites for pattern rules.
         let mut order_only: Vec<String> = rule.order_only_prerequisites.iter()
+            .filter(|p| p.as_str() != ".WAIT")
             .map(|p| p.replace('%', stem))
             .collect();
 
@@ -715,25 +720,23 @@ impl<'a> Executor<'a> {
             if let Some(ref text) = rule.second_expansion_prereqs {
                 // Substitute % in the raw text for the stem before expanding
                 let stem_subst = text.replace('%', stem);
-                let expanded_prereqs = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                for p in expanded_prereqs {
-                    if !p.is_empty() {
-                        prereqs.push(p);
-                    }
-                }
+                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                prereqs.extend(normal);
+                order_only.extend(oo);
             }
             if let Some(ref text) = rule.second_expansion_order_only {
                 let stem_subst = text.replace('%', stem);
-                let expanded_oo = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                for p in expanded_oo {
-                    if !p.is_empty() {
-                        order_only.push(p);
-                    }
-                }
+                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                order_only.extend(normal);
+                order_only.extend(oo);
             }
         }
 
         // Build prerequisites
+        // Push target vars onto stack for inheritance by prerequisites.
+        let my_target_vars = self.collect_target_vars(target);
+        self.inherited_vars_stack.push(my_target_vars);
+
         let mut any_rebuilt = false;
         for prereq in prereqs.clone() {
             match self.build_target(&prereq) {
@@ -748,6 +751,7 @@ impl<'a> Executor<'a> {
                     } else {
                         e
                     };
+                    self.inherited_vars_stack.pop();
                     return Err(propagated);
                 }
             }
@@ -756,6 +760,8 @@ impl<'a> Executor<'a> {
         for prereq in order_only.clone() {
             let _ = self.build_target(&prereq);
         }
+
+        self.inherited_vars_stack.pop();
 
         let needs_rebuild = if self.always_make || is_phony {
             true
@@ -854,6 +860,7 @@ impl<'a> Executor<'a> {
                         true
                     } else {
                         rule.prerequisites.iter().all(|p| {
+                            if p == ".WAIT" { return true; } // .WAIT is not a real prereq
                             let resolved = p.replace('%', &stem);
                             // Immediately satisfiable: exists, in VPATH, ought to exist (phony or explicit target)
                             Path::new(&resolved).exists()
@@ -890,6 +897,7 @@ impl<'a> Executor<'a> {
                         true
                     } else {
                         rule.prerequisites.iter().all(|p| {
+                            if p == ".WAIT" { return true; } // .WAIT is not a real prereq
                             let resolved = p.replace('%', &stem);
                             Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
@@ -987,24 +995,48 @@ impl<'a> Executor<'a> {
         // Map from var_name → index in staging (for quick lookup/update)
         let mut staging_idx: HashMap<String, usize> = HashMap::new();
 
-        // Helper: get current expanded value for a var_name from staging (if any)
-        let get_staging_val = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
-                                staging_idx: &HashMap<String, usize>,
-                                var_name: &str| -> Option<String> {
-            staging_idx.get(var_name).and_then(|&i| {
-                let (_, val, is_expanded, _, _) = &staging[i];
-                if *is_expanded { Some(val.clone()) } else { None }
-            })
-        };
+        // 0. Seed with inherited vars from parent target (lowest priority).
+        // Target-specific variables are inherited by prerequisites unless marked private.
+        // The inherited vars come from the parent target's collected vars pushed onto
+        // inherited_vars_stack before building this target as a prerequisite.
+        if let Some(inherited) = self.inherited_vars_stack.last() {
+            for (name, (val, is_override)) in inherited {
+                let idx = staging.len();
+                staging.push((name.clone(), val.clone(), true, *is_override, VarFlavor::Simple));
+                staging_idx.insert(name.clone(), idx);
+            }
+        }
 
-        // Helper: expand a value using global state (for Simple vars and immediate Append)
-        // For Append: get the base from staging (if already expanded) or global db.
-        let expand_imm = |state: &MakeState, val: &str| -> String {
-            state.expand(val)
+        // Helper: get raw value and is_expanded flag for var_name from staging.
+        let get_staging_entry = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
+                                  staging_idx: &HashMap<String, usize>,
+                                  var_name: &str| -> Option<(String, bool)> {
+            staging_idx.get(var_name).map(|&i| {
+                let (_, val, is_expanded, _, _) = &staging[i];
+                (val.clone(), *is_expanded)
+            })
         };
         let get_global_val = |state: &MakeState, var_name: &str| -> Option<String> {
             state.db.variables.get(var_name).map(|v| {
                 if v.flavor == VarFlavor::Simple { v.value.clone() } else { state.expand(&v.value) }
+            })
+        };
+        // Helper: expand a value immediately using the state.
+        let expand_imm = |state: &MakeState, val: &str| -> String {
+            state.expand(val)
+        };
+        // Helper: get the expanded value for var_name from staging.
+        let get_staging_val = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
+                                staging_idx: &HashMap<String, usize>,
+                                var_name: &str| -> Option<String> {
+            staging_idx.get(var_name).map(|&i| {
+                let (_, val, is_expanded, _, _) = &staging[i];
+                if *is_expanded {
+                    val.clone()
+                } else {
+                    // Unexpanded recursive value - expand it now
+                    val.clone() // Return raw for now; expansion happens in pass 2
+                }
             })
         };
 
@@ -1066,17 +1098,30 @@ impl<'a> Executor<'a> {
         // 2. Apply target-specific variables (they override pattern-specific).
         if let Some(rules) = self.db.rules.get(target) {
             for rule in rules {
-                for (var_name, var) in &rule.target_specific_vars {
+                for (raw_var_name, var) in &rule.target_specific_vars {
+                    // Expand the variable name using already-collected simple target vars.
+                    // This handles `four:VAR$(FOO)=ok` where FOO is itself a target-specific var.
+                    let expanded_var_name: String;
+                    let var_name: &str = if raw_var_name.contains('$') {
+                        let ctx: HashMap<String, String> = staging.iter()
+                            .filter(|(_, _, is_exp, _, _)| *is_exp)
+                            .map(|(n, v, _, _, _)| (n.clone(), v.clone()))
+                            .collect();
+                        expanded_var_name = self.state.expand_with_auto_vars(raw_var_name, &ctx);
+                        &expanded_var_name
+                    } else {
+                        raw_var_name.as_str()
+                    };
                     let is_override = var.origin == VarOrigin::Override;
                     match var.flavor {
                         VarFlavor::Simple => {
                             let val = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Simple);
+                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Simple);
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Simple));
-                                staging_idx.insert(var_name.clone(), idx);
+                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Simple));
+                                staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Append => {
@@ -1086,39 +1131,39 @@ impl<'a> Executor<'a> {
                                 .unwrap_or_default();
                             let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Append);
+                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Append);
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Append));
-                                staging_idx.insert(var_name.clone(), idx);
+                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Append));
+                                staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Conditional => {
                             if !staging_idx.contains_key(var_name) {
                                 let val = expand_imm(&self.state, &var.value);
                                 let idx = staging.len();
-                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Conditional));
-                                staging_idx.insert(var_name.clone(), idx);
+                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Conditional));
+                                staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Shell => {
                             let val = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.clone(), val, true, is_override, VarFlavor::Shell);
+                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Shell);
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.clone(), val, true, is_override, VarFlavor::Shell));
-                                staging_idx.insert(var_name.clone(), idx);
+                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Shell));
+                                staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Recursive => {
                             let raw = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.clone(), raw, false, is_override, VarFlavor::Recursive);
+                                staging[i] = (var_name.to_string(), raw, false, is_override, VarFlavor::Recursive);
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.clone(), raw, false, is_override, VarFlavor::Recursive));
-                                staging_idx.insert(var_name.clone(), idx);
+                                staging.push((var_name.to_string(), raw, false, is_override, VarFlavor::Recursive));
+                                staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                     }

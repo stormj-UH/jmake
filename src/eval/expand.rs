@@ -36,9 +36,16 @@ impl MakeState {
                             result.push_str(&expanded);
                             i = end + 1;
                         } else {
-                            // Unmatched paren - literal
-                            result.push('$');
-                            i += 1;
+                            // Unmatched opening paren/brace: unterminated variable reference
+                            let file = self.current_file.borrow();
+                            let line = *self.current_line.borrow();
+                            if file.is_empty() {
+                                eprintln!("*** unterminated variable reference.  Stop.");
+                            } else {
+                                eprintln!("{}: *** unterminated variable reference.  Stop.",
+                                    if line == 0 { file.clone() } else { format!("{}:{}", *file, line) });
+                            }
+                            std::process::exit(2);
                         }
                     }
                     b'@' | b'<' | b'^' | b'+' | b'*' | b'?' | b'%' | b'|' => {
@@ -473,6 +480,19 @@ impl MakeState {
     fn expand_file_function(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         use std::io::Write;
 
+        // Format an IO error message the way GNU Make does: just the OS error
+        // description without the " (os error N)" suffix that Rust appends.
+        let fmt_io_err = |e: &std::io::Error| -> String {
+            let s = e.to_string();
+            // Rust formats IO errors as "Description (os error N)".
+            // GNU Make just shows "Description".
+            if let Some(pos) = s.rfind(" (os error ") {
+                s[..pos].to_string()
+            } else {
+                s
+            }
+        };
+
         let file_loc = {
             let f = self.current_file.borrow();
             let l = *self.current_line.borrow();
@@ -557,7 +577,7 @@ impl MakeState {
                                 let l = *self.current_line.borrow();
                                 if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
                             };
-                            eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                            eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, fmt_io_err(&e));
                             std::process::exit(2);
                         }
                         Ok(_) => {}
@@ -577,7 +597,7 @@ impl MakeState {
                             let l = *self.current_line.borrow();
                             if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
                         };
-                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, fmt_io_err(&e));
                         std::process::exit(2);
                     }
                     Ok(_) => {}
@@ -606,7 +626,7 @@ impl MakeState {
                             let l = *self.current_line.borrow();
                             if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
                         };
-                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, e);
+                        eprintln!("{}*** open: {}: {}.  Stop.", loc2, filename, fmt_io_err(&e));
                         std::process::exit(2);
                     }
                     Ok(mut f) => {

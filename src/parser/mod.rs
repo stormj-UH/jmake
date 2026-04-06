@@ -26,6 +26,10 @@ pub struct Parser {
     pub define_export: bool,
     pub define_lines: Vec<String>,
     pub define_lineno: usize,  // line number where define started
+    /// Nesting depth for nested define/endef blocks within the body.
+    /// When in_define and we see another 'define', depth increments.
+    /// When we see 'endef', depth decrements; only when depth==0 does the define end.
+    pub define_depth: usize,
     pub conditional_stack: Vec<ConditionalState>,
 }
 
@@ -51,6 +55,7 @@ impl Parser {
             define_export: false,
             define_lines: Vec::new(),
             define_lineno: 0,
+            define_depth: 0,
             conditional_stack: Vec::new(),
         }
     }
@@ -91,14 +96,18 @@ impl Parser {
         // shell can handle continuation. For other lines, collapse to a single space.
         while line.ends_with('\\') && self.pos < self.lines.len() {
             if line.starts_with('\t') {
-                // Recipe line: preserve \<newline> for the shell
+                // Recipe line: preserve \<newline> for the shell.
+                // GNU Make strips at most ONE leading tab from the continuation
+                // line (it is the recipe prefix character). Any other leading
+                // whitespace (spaces) must be preserved so the shell receives
+                // the correct text (e.g., "foo\<NL>    bar" should remain as
+                // "foo\<NL>    bar" so the shell can join them correctly).
                 line.push('\n');
-                // Strip the leading tab from the continuation line
                 let next = &self.lines[self.pos];
                 let stripped = if next.starts_with('\t') {
                     &next[1..]
                 } else {
-                    next.trim_start()
+                    next   // Preserve leading spaces; only strip one tab above
                 };
                 line.push_str(stripped);
             } else {
