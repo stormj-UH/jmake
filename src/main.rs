@@ -14,6 +14,36 @@ mod signal_handler;
 use std::process;
 
 fn main() {
+    // Install a custom panic hook so that stdout write errors (e.g. writing to
+    // /dev/full or a closed pipe) cause a clean exit(1) rather than a panic
+    // message + exit(101).  GNU Make exits with code 1 on stdout write errors.
+    std::panic::set_hook(Box::new(|info| {
+        let is_write_error = info.payload()
+            .downcast_ref::<String>()
+            .map(|s| {
+                s.contains("failed printing to stdout")
+                    || s.contains("failed writing to stdout")
+            })
+            .unwrap_or(false)
+            || info.payload()
+            .downcast_ref::<&str>()
+            .map(|s| {
+                s.contains("failed printing to stdout")
+                    || s.contains("failed writing to stdout")
+            })
+            .unwrap_or(false);
+
+        if is_write_error {
+            // Exit with code 1, matching GNU Make's behaviour on stdout errors.
+            process::exit(1);
+        }
+
+        // For all other panics, print the panic info to stderr and exit 101
+        // (Rust's default exit code for panics).
+        eprintln!("{}", info);
+        process::exit(101);
+    }));
+
     // Install SIGTERM handler early so we can clean up temp files on signal.
     signal_handler::install_sigterm_handler();
 

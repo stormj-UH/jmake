@@ -644,13 +644,12 @@ impl<'a> Executor<'a> {
             .cloned()
             .collect();
         // Collect files that actually exist and need to be deleted.
-        // GNU Make deletes intermediates in reverse build order (last built = first deleted).
+        // GNU Make deletes intermediates in prerequisite/build order (first encountered first).
         let existing: Vec<String> = to_delete.iter()
-            .rev()
             .filter(|t| Path::new(t.as_str()).exists())
             .cloned()
             .collect();
-        // GNU Make prints ONE rm command with all files, in reverse build order.
+        // GNU Make prints ONE rm command with all files, in prerequisite order.
         if !existing.is_empty() && !self.silent {
             println!("rm {}", existing.join(" "));
         }
@@ -2792,7 +2791,10 @@ impl<'a> Executor<'a> {
                             return false; // secondary missing file: skip
                         }
                         // Explicitly-mentioned (non-intermediate) non-existent files MUST be built.
-                        if self.is_explicitly_mentioned(p) || self.db.is_notintermediate(p) {
+                        // Exception: if the file is also declared .INTERMEDIATE, treat it as
+                        // intermediate regardless of explicit mentions (sv 60188).
+                        if (self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p))
+                            || self.db.is_notintermediate(p) {
                             return true;
                         }
                         // Intermediate file: use effective mtime of its sources.
@@ -4157,7 +4159,9 @@ impl<'a> Executor<'a> {
                         // If the prereq is explicitly mentioned (not intermediate), a
                         // missing file is treated as infinitely new: always rebuild.
                         // Intermediate files that are absent use effective_mtime instead.
-                        if self.is_explicitly_mentioned(prereq) {
+                        // Exception: if the prereq is .INTERMEDIATE, treat as intermediate
+                        // even if it was also explicitly mentioned (sv 60188).
+                        if self.is_explicitly_mentioned(prereq) && !self.db.is_intermediate(prereq) {
                             return true;
                         }
                         // For non-existent non-phony prereqs (potentially intermediate files
