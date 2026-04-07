@@ -787,7 +787,7 @@ impl MakeState {
             // Default makefile search order
             let candidates = vec!["GNUmakefile", "makefile", "Makefile"];
             let mut found = Vec::new();
-            for name in candidates {
+            for name in &candidates {
                 if Path::new(name).exists() {
                     found.push(PathBuf::from(name));
                     break;
@@ -802,7 +802,7 @@ impl MakeState {
                 if !self.args.eval_strings.is_empty() {
                     // Add default makefile names as pending includes (ignore_missing=true
                     // so we don't error if they can't be built).
-                    for name in &["GNUmakefile", "makefile", "Makefile"] {
+                    for name in &candidates {
                         self.pending_includes.push(PendingInclude {
                             file: name.to_string(),
                             parent: String::new(),
@@ -813,6 +813,17 @@ impl MakeState {
                     return Ok(());
                 }
                 return Err("No targets.  Stop.".to_string());
+            }
+            // GNU Make always tries to remake ALL three default makefile candidates
+            // (GNUmakefile, makefile, Makefile), even if one was found and read.
+            // Add all three as pending includes so they can be updated/created by rules.
+            for name in &candidates {
+                self.pending_includes.push(PendingInclude {
+                    file: name.to_string(),
+                    parent: String::new(),
+                    lineno: 0,
+                    ignore_missing: true,
+                });
             }
             found
         } else {
@@ -3640,7 +3651,9 @@ impl MakeState {
                     }
                 }
                 PendingOutcome::RunRecipe { .. } => {
-                    let result = recipe_results[i].take().unwrap();
+                    // Use as_ref() (not take()) so SiblingOf items processed later
+                    // can still inspect recipe_results[i].
+                    let result = recipe_results[i].as_ref().unwrap();
                     match result {
                         Ok(()) => {
                             if file_path.exists() {
@@ -3661,27 +3674,19 @@ impl MakeState {
                                     eprintln!("{}:{}: {}: No such file or directory",
                                         pi_parent, pi_lineno, pi_file);
                                 }
-                                // Return the error (prints jmake: *** [...] Error N via main.rs),
-                                // then print "Failed to remake makefile" for the include.
-                                // Note: GNU Make prints "Failed to remake" AFTER "*** Error N",
-                                // which means it must come from a caller or post-error hook.
-                                // We approximate by printing before returning (the *** comes
-                                // from main.rs after we return, so effectively it follows).
-                                // Actually: print "Failed to remake" BEFORE returning so it
-                                // appears on stderr before jmake: *** from main.rs.
-                                // The test expects: exit_1, NSFOD, *** Error N, Failed to remake.
-                                // Since main.rs prints *** AFTER run() returns, we need to
-                                // print "Failed to remake" after *** — which is impossible
-                                // from inside run(). Instead, embed it in the error string.
-                                // Encode as a two-part error: first part printed by main.rs as
-                                // "*** [...] Error N", second part we add as a suffix line.
-                                // GNU Make actually prints "Failed to remake" to stderr separately
-                                // after the *** message. We'll encode this in the returned error.
-                                let failed_msg = if !pi_parent.is_empty() {
+                                // With -k (keep-going): encode "Failed to remake" as a
+                                // suffix line in the error string. GNU Make prints this
+                                // message after the "*** Error N" line. Since main.rs
+                                // prints "jmake: *** {err}" after run() returns, we embed
+                                // the "Failed to remake" in the error string so it follows
+                                // the "*** Error N" line in the output.
+                                // Without -k: just return the error, no "Failed to remake".
+                                let recipe_err_clone = recipe_err.clone();
+                                let failed_msg = if self.args.keep_going && !pi_parent.is_empty() {
                                     format!("{}\n{}:{}: Failed to remake makefile '{}'.",
-                                        recipe_err, pi_parent, pi_lineno, pi_file)
+                                        recipe_err_clone, pi_parent, pi_lineno, pi_file)
                                 } else {
-                                    recipe_err.clone()
+                                    recipe_err_clone
                                 };
                                 return Err(failed_msg);
                             }
