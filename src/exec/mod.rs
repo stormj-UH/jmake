@@ -106,6 +106,7 @@ impl<'a> Executor<'a> {
         for t in targets {
             self.top_level_targets.insert(t.clone());
         }
+        let mut failed_top_level_targets: Vec<String> = Vec::new();
         for target in targets {
             match self.build_target(target) {
                 Ok(rebuilt) => {
@@ -124,6 +125,7 @@ impl<'a> Executor<'a> {
                 }
                 Err(e) => {
                     if self.keep_going {
+                        failed_top_level_targets.push(target.clone());
                         self.errors.push(e);
                     } else {
                         // Clean up intermediate files even on error
@@ -138,8 +140,19 @@ impl<'a> Executor<'a> {
         self.delete_intermediate_files();
 
         if !self.errors.is_empty() {
-            return Err(format!("Target(s) not remade because of errors:\n{}",
-                self.errors.join("\n")));
+            // Print "Target 'X' not remade because of errors." without "***",
+            // matching GNU Make's output format.
+            let target_list: String = if failed_top_level_targets.len() == 1 {
+                format!("'{}'", failed_top_level_targets[0])
+            } else {
+                failed_top_level_targets.iter()
+                    .map(|t| format!("'{}'", t))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            eprintln!("{}: Target {} not remade because of errors.", self.progname, target_list);
+            // Return an empty error so main.rs does not print a duplicate message.
+            return Err(String::new());
         }
 
         if self.question && self.question_out_of_date {
