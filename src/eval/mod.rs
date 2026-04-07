@@ -684,9 +684,22 @@ impl MakeState {
                 }
             }
             if found.is_empty() {
-                // If there are -E eval strings, we can proceed without a makefile file.
-                // The eval strings themselves form the "makefile content".
+                // No default makefile found.
+                // If there are -E eval strings, we can proceed; but we still add the
+                // default makefile names as "pending includes" so they can be rebuilt
+                // via rules (GNU Make behavior: tries GNUmakefile, makefile, Makefile
+                // via available rules even when -E strings provide content).
                 if !self.args.eval_strings.is_empty() {
+                    // Add default makefile names as pending includes (ignore_missing=true
+                    // so we don't error if they can't be built).
+                    for name in &["GNUmakefile", "makefile", "Makefile"] {
+                        self.pending_includes.push(PendingInclude {
+                            file: name.to_string(),
+                            parent: String::new(),
+                            lineno: 0,
+                            ignore_missing: true,
+                        });
+                    }
                     return Ok(());
                 }
                 return Err("No targets.  Stop.".to_string());
@@ -3085,7 +3098,7 @@ impl MakeState {
                                     Err(recipe_err) => {
                                         if !pi.ignore_missing {
                                             if !pi.parent.is_empty() {
-                                                eprintln!("{}:{}: {}: No such file or directory",
+                                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
                                                     pi.parent, pi.lineno, pi.file);
                                             }
                                             return Err(recipe_err);

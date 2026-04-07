@@ -318,7 +318,10 @@ impl Parser {
         }
 
         // include / -include / sinclude
-        if effective.starts_with("include ") || effective.starts_with("-include ") || effective.starts_with("sinclude ") {
+        // Handle both "include file" (with space) and bare "include" (no filenames = no-op)
+        if effective.starts_with("include ") || effective == "include"
+            || effective.starts_with("-include ") || effective == "-include"
+            || effective.starts_with("sinclude ") || effective == "sinclude" {
             return parse_include(&effective);
         }
 

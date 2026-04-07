@@ -298,11 +298,6 @@ impl<'a> Executor<'a> {
 
         scheduler.find_initial_ready(targets);
 
-        // DEBUG: show initial state
-        eprintln!("[DEBUG] plans count: {}, ready_queue: {:?}",
-            self.parallel_plans.as_ref().map(|p| p.len()).unwrap_or(0),
-            scheduler.ready_queue);
-
         // ------------------------------------------------------------------
         // Phase 3: Scheduler main loop
         // ------------------------------------------------------------------
@@ -313,7 +308,6 @@ impl<'a> Executor<'a> {
                     Some(t) => t,
                     None => break,
                 };
-                eprintln!("[DEBUG] dispatching target: {}", target);
 
                 let job = self.build_job_from_plan(
                     &target,
@@ -717,17 +711,26 @@ impl<'a> Executor<'a> {
 
         // Check if file exists (no rule needed)
         if Path::new(target).exists() {
+            if self.collect_plans_mode {
+                self.record_leaf_plan(target, is_phony);
+            }
             return Ok(false);
         }
 
         // Try VPATH
-        if let Some(found) = self.find_in_vpath(target) {
+        if let Some(_found) = self.find_in_vpath(target) {
+            if self.collect_plans_mode {
+                self.record_leaf_plan(target, is_phony);
+            }
             return Ok(false);
         }
 
         // A phony target with no recipe and no file is still "successfully built" - it's
         // a no-op target. This allows .PHONY targets without recipes to be prerequisites.
         if is_phony {
+            if self.collect_plans_mode {
+                self.record_leaf_plan(target, is_phony);
+            }
             return Ok(false);
         }
 
@@ -1153,6 +1156,29 @@ impl<'a> Executor<'a> {
                 (pattern_rule.recipe.clone(), pattern_rule.source_file.clone(), stem)
             } else {
                 // No recipe and no matching pattern rule: nothing to execute.
+                // In plan collection mode, still record this target's dependency info.
+                if self.collect_plans_mode {
+                    let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+                    let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
+                    let plan = parallel::TargetPlan {
+                        target: target.to_string(),
+                        prerequisites: all_prereqs.clone(),
+                        order_only: all_order_only.clone(),
+                        recipe: Vec::new(),
+                        source_file: String::new(),
+                        auto_vars: auto_vars_for_plan,
+                        is_phony,
+                        needs_rebuild: false, // no recipe = no rebuild
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: HashMap::new(),
+                        extra_unexports: Vec::new(),
+                        is_intermediate: self.db.is_intermediate(target),
+                    };
+                    if let Some(ref mut plans) = self.pending_plans {
+                        plans.insert(target.to_string(), plan);
+                    }
+                }
                 return Ok(any_prereq_rebuilt);
             }
         } else {
@@ -3123,15 +3149,12 @@ impl<'a> Executor<'a> {
             // Execute all recipe lines as one shell script.
             // In .ONESHELL mode:
             //   - ALL recipe lines are joined and passed to a single shell invocation.
-            //   - For Bourne-compatible shells: prefix chars (@, -, +) are stripped
-            //     from ALL recipe lines when building the script.
-            //   - For non-Bourne shells (perl, python, etc.): prefixes are NOT stripped
-            //     because they may be valid syntax in those languages.
+            //   - Prefix chars (@, -, +) are stripped from ALL recipe lines when building
+            //     the script (so they don't appear as invalid shell commands).
             //   - Echo behaviour and error-ignore are controlled by the FIRST recipe
             //     line's prefix only; inner-line prefix chars don't affect behavior.
             //   - The last recipe lineno is used for error messages.
 
-            let bourne_shell = is_bourne_compatible_shell(self.shell);
             let mut script = String::new();
             let mut first_line_silent = false;
             let mut first_line_ignore = false;
@@ -3147,29 +3170,16 @@ impl<'a> Executor<'a> {
                 // Pre-process: collapse \<newline> inside $(…)/${…} references
                 let preprocessed = preprocess_recipe_bsnl(line);
                 let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                // Strip @-+ prefixes from ALL lines for the script.
+                // First line: also record behavioral flags (silent, ignore errors).
                 if is_first {
-                    // First line: record behavioral flags (silent, ignore errors).
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
                     is_first = false;
-                    // For Bourne shells, strip prefixes from script; non-Bourne: keep them.
-                    let cmd_line = if bourne_shell {
-                        strip_recipe_prefixes(&expanded)
-                    } else {
-                        expanded.clone()
-                    };
-                    script.push_str(&cmd_line);
-                } else {
-                    // Subsequent lines: for Bourne shells, strip @-+ prefixes.
-                    // For non-Bourne shells, leave them intact (they may be valid syntax).
-                    let cmd_line = if bourne_shell {
-                        strip_recipe_prefixes(&expanded)
-                    } else {
-                        expanded.clone()
-                    };
-                    script.push_str(&cmd_line);
                 }
+                let cmd_line = strip_recipe_prefixes(&expanded);
+                script.push_str(&cmd_line);
                 script.push('\n');
             }
 
@@ -3177,16 +3187,11 @@ impl<'a> Executor<'a> {
             let effective_ignore = first_line_ignore || self.ignore_errors;
 
             if !effective_silent {
-                // Echo lines. For Bourne shells, strip @-+ prefixes for display.
-                // For non-Bourne shells, leave them as-is.
+                // Echo lines with @-+ prefixes stripped from ALL lines.
                 for (_lineno, line) in recipe {
                     let preprocessed = preprocess_recipe_bsnl(line);
                     let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                    let display = if bourne_shell {
-                        strip_recipe_prefixes(&expanded)
-                    } else {
-                        expanded.clone()
-                    };
+                    let display = strip_recipe_prefixes(&expanded);
                     if !display.trim().is_empty() {
                         println!("{}", display.trim_end());
                     }
@@ -3684,6 +3689,30 @@ impl<'a> Executor<'a> {
                     list.swap(i, j);
                 }
                 list
+            }
+        }
+    }
+
+    /// Record a minimal TargetPlan for a leaf target (file exists, phony-no-recipe, VPATH).
+    /// Called during plan collection mode to ensure these targets appear in the dependency graph.
+    fn record_leaf_plan(&mut self, target: &str, is_phony: bool) {
+        if let Some(ref mut plans) = self.pending_plans {
+            if !plans.contains_key(target) {
+                plans.insert(target.to_string(), parallel::TargetPlan {
+                    target: target.to_string(),
+                    prerequisites: Vec::new(),
+                    order_only: Vec::new(),
+                    recipe: Vec::new(),
+                    source_file: String::new(),
+                    auto_vars: HashMap::new(),
+                    is_phony,
+                    needs_rebuild: false,
+                    grouped_primary: None,
+                    grouped_siblings: Vec::new(),
+                    extra_exports: HashMap::new(),
+                    extra_unexports: Vec::new(),
+                    is_intermediate: false,
+                });
             }
         }
     }

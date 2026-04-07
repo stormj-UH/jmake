@@ -96,6 +96,11 @@ pub struct Rule {
     /// in the group (excluding this rule's own target).  When this rule is built,
     /// all grouped siblings are also built.  Empty for non-grouped rules.
     pub grouped_siblings: Vec<String>,
+    /// True if the rule line had a semicolon (inline recipe marker), even if
+    /// the recipe text after the semicolon is empty.  GNU Make treats any rule
+    /// with a semicolon as "having a recipe" for the purpose of printing
+    /// "'target' is up to date" vs "Nothing to be done for 'target'".
+    pub has_inline_recipe_marker: bool,
 }
 
 impl Rule {
