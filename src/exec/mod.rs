@@ -1046,7 +1046,8 @@ impl<'a> Executor<'a> {
         // In collect_plans_mode (parallel build), extract .WAIT groups before filtering.
         // These groups encode the ordering constraint: targets in group N+1 must not start
         // until all targets in group N (and the barrier sentinel for group N) are Done.
-        let wait_groups = if self.collect_plans_mode {
+        // This is computed from non-SE prereqs here; SE prereqs are handled below.
+        let mut wait_groups = if self.collect_plans_mode {
             extract_wait_groups(&all_prereqs)
         } else {
             Vec::new()
@@ -1065,6 +1066,8 @@ impl<'a> Executor<'a> {
         // Perform second expansion if there are SE texts.
         let mut se_expanded_prereqs: Vec<String> = Vec::new();
         let mut se_expanded_order_only: Vec<String> = Vec::new();
+        // Accumulate raw SE tokens (with .WAIT) for wait_groups extraction in parallel mode.
+        let mut se_raw_tokens_for_wait: Vec<String> = Vec::new();
 
         if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
             // The global static_stem (last rule's stem) is used for $* in the auto-var
@@ -1090,6 +1093,16 @@ impl<'a> Executor<'a> {
                 let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_prereqs.extend(normal);
                 se_expanded_order_only.extend(oo);
+                // Collect raw SE tokens (including .WAIT) for wait_groups extraction.
+                if self.collect_plans_mode {
+                    *self.state.in_second_expansion.borrow_mut() = true;
+                    let raw_expanded = self.state.expand_with_auto_vars(text, &rule_auto_vars);
+                    *self.state.in_second_expansion.borrow_mut() = false;
+                    for token in raw_expanded.split_whitespace() {
+                        if token == "|" { break; } // stop at order-only separator
+                        se_raw_tokens_for_wait.push(token.to_string());
+                    }
+                }
             }
             for (text, rule_stem) in &se_order_only_texts {
                 let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
@@ -1100,6 +1113,19 @@ impl<'a> Executor<'a> {
                 se_expanded_order_only.extend(normal);
                 se_expanded_order_only.extend(oo);
             }
+        }
+
+        // Update wait_groups to include any .WAIT markers from SE-expanded normal prereqs.
+        // This handles the case where all prereqs come from second expansion (e.g.
+        // `all: $$(pre)` where `pre = .WAIT pre1 .WAIT pre2`).
+        if self.collect_plans_mode && se_raw_tokens_for_wait.iter().any(|t| t == ".WAIT") {
+            // Build combined list: non-SE prereqs (already filtered) + SE raw tokens.
+            // For wait_groups, we construct a unified token list. Non-SE prereqs have
+            // no .WAIT (already filtered above), so they form one big group before
+            // the SE groups. If both non-SE and SE prereqs have content, combine them.
+            let mut combined_for_wait = all_prereqs.clone(); // non-SE (no .WAIT)
+            combined_for_wait.extend(se_raw_tokens_for_wait); // SE tokens (with .WAIT)
+            wait_groups = extract_wait_groups(&combined_for_wait);
         }
 
         // Build prerequisites in the correct GNU Make order:
@@ -2621,6 +2647,17 @@ impl<'a> Executor<'a> {
         // dir-aware rule: when stem has a directory but the matched pattern does not,
         // only the base stem is used for words where % is not the first character,
         // and the directory is prepended to the result.
+        // Collect raw prereqs (with .WAIT) for wait_groups extraction before filtering.
+        let prereqs_with_wait: Vec<String> = if self.collect_plans_mode {
+            rule.prerequisites.iter()
+                .map(|p| {
+                    if p == ".WAIT" { ".WAIT".to_string() }
+                    else { subst_stem_in_prereq_dir(p, stem, matched_pattern_target) }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // .WAIT markers are filtered since they are ordering hints, not real targets.
         let mut prereqs: Vec<String> = rule.prerequisites.iter()
             .filter(|p| p.as_str() != ".WAIT")
@@ -3019,8 +3056,11 @@ impl<'a> Executor<'a> {
             {
                 // Each prereq in its own group to force sequential execution.
                 prereqs.iter().map(|p| vec![p.clone()]).collect()
+            } else if prereqs_with_wait.iter().any(|p| p == ".WAIT") {
+                // Pattern rule has .WAIT markers in prerequisites: extract wait groups.
+                extract_wait_groups(&prereqs_with_wait)
             } else {
-                Vec::new() // pattern rules: no .WAIT groups by default
+                Vec::new()
             };
         }
         // Capture primary target mtime BEFORE running recipe, so we can detect if it changed.
@@ -3055,15 +3095,13 @@ impl<'a> Executor<'a> {
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
             {
-                // A target built by a pattern rule is intermediate unless:
-                // - it is a top-level target (explicitly requested by the user), OR
-                // - it has its own explicit rules (user provided explicit build instructions).
-                // Note: appearing as a prerequisite of another rule does NOT prevent
-                // a file from being intermediate (GNU Make behavior).
-                let has_explicit_rules = self.db.rules.get(target)
-                    .map_or(false, |rules| !rules.is_empty());
-                let is_top_level = self.top_level_targets.contains(target);
-                if !is_top_level && !has_explicit_rules {
+                // Only mark as intermediate if the target is NOT explicitly mentioned
+                // in the makefile and NOT a top-level target.
+                // "Explicitly mentioned" includes literal prereqs of pattern rules (e.g.
+                // `test.z` in `%.tsk: %.z test.z`) — these are NOT intermediate.
+                let is_explicit = self.top_level_targets.contains(target)
+                    || self.is_explicitly_mentioned(target);
+                if !is_explicit {
                     if !self.intermediate_built.contains(&target.to_string()) {
                         self.intermediate_built.push(target.to_string());
                     }
@@ -3094,13 +3132,15 @@ impl<'a> Executor<'a> {
                     if !self.intermediate_built.contains(sib) {
                         self.intermediate_built.push(sib.clone());
                     }
-                } else if is_target_intermediate
-                    && !self.db.is_precious(sib)
+                } else if !self.db.is_precious(sib)
                     && !self.db.is_notintermediate(sib)
                     && !self.db.is_secondary(sib)
                 {
-                    // Only exclude from intermediate if the sibling is a top-level target
+                    // A sibling is intermediate independently of the primary target —
+                    // it only escapes intermediate status if it is a top-level target
                     // OR has its own explicit rules (not just pattern rules).
+                    // Note: appearing as a prerequisite of another rule does NOT
+                    // prevent a file from being intermediate (GNU Make behavior).
                     let has_explicit_rules = self.db.rules.get(sib.as_str())
                         .map_or(false, |rules| !rules.is_empty());
                     let is_top_level = self.top_level_targets.contains(sib.as_str());

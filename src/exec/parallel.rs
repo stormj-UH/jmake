@@ -533,6 +533,27 @@ impl ParallelScheduler {
                     if plans.contains_key(after_target.as_str()) {
                         extra_prereqs.push((after_target.clone(), barrier_name.clone()));
                         extra_dependents.push((barrier_name.clone(), after_target.clone()));
+                        // Transitively propagate barrier to after_target's own first-group prereqs.
+                        // This handles the case where after_target has .NOTPARALLEL or its own
+                        // .WAIT groups, and its first-group prereqs would otherwise start too early.
+                        // Example: `all: p1 .WAIT np1` with `.NOTPARALLEL: np1` — np1's first
+                        // prereq (npre1) must also wait for p1 to finish.
+                        if let Some(after_plan) = plans.get(after_target.as_str()) {
+                            let first_prereqs: Vec<String> = if !after_plan.wait_groups.is_empty() {
+                                after_plan.wait_groups[0].clone()
+                            } else {
+                                after_plan.prerequisites.clone()
+                            };
+                            for first_prereq in &first_prereqs {
+                                if globally_unguarded.contains(first_prereq.as_str()) {
+                                    continue;
+                                }
+                                if plans.contains_key(first_prereq.as_str()) {
+                                    extra_prereqs.push((first_prereq.clone(), barrier_name.clone()));
+                                    extra_dependents.push((barrier_name.clone(), first_prereq.clone()));
+                                }
+                            }
+                        }
                     }
                 }
 
