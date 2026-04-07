@@ -503,6 +503,33 @@ impl<'a> Executor<'a> {
             (*ln, line.clone(), sub_lines)
         }).collect();
 
+        // Re-compute exports here (in the main thread, sequentially) so that recursive
+        // variables like `export HI = $(shell $($@.CMD))` are evaluated with $@ set to
+        // the current target. This matches GNU Make behavior where the main thread evaluates
+        // the recipe environment just before forking the recipe subprocess.
+        let mut extra_exports = self.compute_target_exports(target);
+        let extra_unexports = self.compute_target_unexports(target).into_iter().collect::<Vec<_>>();
+
+        // Also re-evaluate globally exported recursive variables that reference $@ (or other
+        // auto-vars that vary per-target). Override the pre-computed env_ops values.
+        // Build auto_vars with $@ = target.
+        let mut at_var_ctx: HashMap<String, String> = HashMap::new();
+        at_var_ctx.insert("@".to_string(), target.to_string());
+        for (name, var) in &self.db.variables {
+            if var.flavor == VarFlavor::Recursive && var.value.contains("$@") {
+                // Check if this variable is exported.
+                let should_export = !var.is_private && match var.export {
+                    Some(true) => true,
+                    Some(false) => false,
+                    None => self.db.export_all || self.db.env_var_names.contains(name.as_str()),
+                };
+                if should_export {
+                    let val = self.state.expand_with_auto_vars(&var.value, &at_var_ctx);
+                    extra_exports.insert(name.clone(), val);
+                }
+            }
+        }
+
         Some(parallel::Job {
             target: plan.target.clone(),
             pre_expanded,
@@ -521,8 +548,8 @@ impl<'a> Executor<'a> {
             progname: self.progname.clone(),
             makelevel: makelevel.to_string(),
             env_ops: env_ops.to_vec(),
-            extra_exports: plan.extra_exports.clone(),
-            extra_unexports: plan.extra_unexports.clone(),
+            extra_exports,
+            extra_unexports,
             gnumakeflags_was_set,
         })
     }
@@ -2692,7 +2719,9 @@ impl<'a> Executor<'a> {
                     if prereqs_ok {
                         pass1_candidates.push(((**rule).clone(), stem));
                         break; // Only take first matching pattern_target per rule
-                    } else if found_compat && compat_rule.is_none() {
+                    } else if found_compat && compat_rule.is_none() && !rule.is_terminal {
+                        // Terminal rules require prereqs to already exist — do not use them
+                        // as compat candidates (compat is for implicit/non-existent deps).
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
@@ -3242,6 +3271,9 @@ impl<'a> Executor<'a> {
                 expansion_context.insert(name.clone(), val.clone());
             }
         }
+        // Include $@ = target so recursive variables using $@ (like `export HI = $(shell $($@.CMD))`)
+        // are expanded with the correct target name.
+        expansion_context.insert("@".to_string(), target.to_string());
         let mut result: HashMap<String, (String, bool, bool)> = HashMap::new();
         for (name, raw, is_expanded, is_override, _flavor) in &staging {
             let val = if *is_expanded {
