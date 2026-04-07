@@ -1832,14 +1832,13 @@ impl MakeState {
             // with '.' but contain '/' and are valid default targets.
             // Also skip pattern rules (contain '%').
             let is_special_target = target.starts_with('.') && !target.contains('/');
-            if self.db.default_target.is_none() && !is_special_target && !target.contains('%') {
+            if self.db.default_target.is_none() && !is_special_target && !target.contains('%')
+                && !self.db.default_goal_explicit
+            {
                 self.db.default_target = Some(target.clone());
-                // Also update .DEFAULT_GOAL variable so it's readable at parse time,
-                // but only if it hasn't been explicitly set to a non-empty value.
-                if !self.db.default_goal_explicit {
-                    self.db.variables.insert(".DEFAULT_GOAL".into(),
-                        Variable::new(target.clone(), VarFlavor::Simple, VarOrigin::Default));
-                }
+                // Also update .DEFAULT_GOAL variable so it's readable at parse time.
+                self.db.variables.insert(".DEFAULT_GOAL".into(),
+                    Variable::new(target.clone(), VarFlavor::Simple, VarOrigin::Default));
             }
         }
 
@@ -2052,9 +2051,11 @@ impl MakeState {
                     if !rule.grouped_siblings.is_empty() {
                         existing.grouped_siblings = rule.grouped_siblings.clone();
                     }
-                    // Preserve static_stem: if the new rule has a static stem (from a
-                    // static pattern rule) and the existing rule doesn't, copy it.
-                    if existing.static_stem.is_empty() && !rule.static_stem.is_empty() {
+                    // Update static_stem: when multiple static pattern rules match the
+                    // same target (possibly with different pattern widths), the LAST
+                    // rule's stem is used for $* — matching GNU Make behaviour where
+                    // the most-recently-seen static pattern rule determines $*.
+                    if !rule.static_stem.is_empty() {
                         existing.static_stem = rule.static_stem.clone();
                     }
                     // Merge target-specific vars (append to list for multiple += support)
@@ -2263,20 +2264,50 @@ impl MakeState {
         // Special handling for .DEFAULT_GOAL: when explicitly set in a makefile,
         // update the default_target accordingly so it is used when building.
         if name == ".DEFAULT_GOAL" {
-            let expanded_goal = self.expand(value).trim().to_string();
-            if expanded_goal.is_empty() {
-                // Reset: next non-special rule will become the default again
+            // Determine whether the raw (pre-expansion) value is blank.
+            // For := (Simple), `value` is already expanded by the caller.
+            // For = (Recursive), `value` is the raw unexpanded string.
+            // A truly-empty raw value (`.DEFAULT_GOAL :=`) means "reset".
+            // A non-empty raw value that expands to whitespace (test 5) means
+            // "explicit empty goal" → block auto-setting from rules.
+            let raw_is_empty = value.trim().is_empty();
+
+            // Expand, strip comments, then trim to get the effective goal string.
+            let raw_expanded = self.expand(value);
+            let comment_stripped = parser::strip_comment(&raw_expanded);
+            let expanded_goal = comment_stripped.trim().to_string();
+
+            if raw_is_empty {
+                // Literal/already-expanded empty value: true reset.
+                // Next non-special rule will become the default again.
                 self.db.default_target = None;
                 self.db.default_goal_explicit = false;
-                // Also update the .DEFAULT_GOAL variable value to empty
+                if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
+                    var.value = String::new();
+                }
+            } else if expanded_goal.is_empty() {
+                // Non-empty raw value that expands to whitespace-only (e.g.
+                // `.DEFAULT_GOAL = $N  $N  # comment` where N is empty).
+                // GNU Make treats this as explicit-empty: no default target,
+                // error "No targets. Stop." at build time.
+                self.db.default_target = None;
+                self.db.default_goal_explicit = true;  // block auto-setting
                 if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
                     var.value = String::new();
                 }
             } else {
+                // Check for multiple words (GNU Make fatal error).
+                let words: Vec<&str> = expanded_goal.split_whitespace().collect();
+                if words.len() > 1 {
+                    let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                    let progname = std::path::Path::new(&progname)
+                        .file_name().and_then(|n| n.to_str()).unwrap_or("make").to_string();
+                    eprintln!("{}: *** .DEFAULT_GOAL contains more than one target.  Stop.", progname);
+                    std::process::exit(2);
+                }
                 // Set to specific goal; update default_target
                 self.db.default_target = Some(expanded_goal.clone());
                 self.db.default_goal_explicit = true;
-                // Update the .DEFAULT_GOAL variable value
                 if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
                     var.value = expanded_goal;
                 }
@@ -2330,6 +2361,11 @@ impl MakeState {
             self.args.keep_going = ca.keep_going;
             self.args.keep_going_explicit = ca.keep_going_explicit;
             self.args.no_keep_going_explicit = ca.no_keep_going_explicit;
+        }
+        // Command-line -jN takes precedence over makefile MAKEFLAGS += -jM.
+        if ca.jobs_explicit {
+            self.args.jobs = ca.jobs;
+            self.args.jobs_explicit = ca.jobs_explicit;
         }
 
         // If print_directory was just enabled by the makefile (transition false→true),

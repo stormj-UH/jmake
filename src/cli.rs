@@ -55,6 +55,10 @@ pub struct MakeArgs {
     pub no_silent_explicit: bool,
     pub keep_going_explicit: bool,
     pub no_keep_going_explicit: bool,
+    /// True if -j/--jobs was explicitly set from env MAKEFLAGS or cmdline.
+    /// When true, apply_makeflags_from_makefile will not allow the makefile
+    /// to override the job count (cmdline -j takes precedence).
+    pub jobs_explicit: bool,
     /// Path to temp file holding stdin content (from --temp-stdin=PATH on re-exec).
     /// When set, read this file instead of stdin for -f- makefiles.
     pub temp_stdin: Option<PathBuf>,
@@ -124,6 +128,7 @@ impl Default for MakeArgs {
             no_silent_explicit: false,
             keep_going_explicit: false,
             no_keep_going_explicit: false,
+            jobs_explicit: false,
             temp_stdin: None,
             gnumakeflags_was_set: false,
             shuffle: None,
@@ -229,6 +234,7 @@ pub fn parse_args() -> MakeArgs {
                     i += 1;
                     if i < args.len() {
                         result.jobs = args[i].parse().unwrap_or(1);
+                        result.jobs_explicit = true;
                     }
                 }
                 "--keep-going" => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
@@ -279,7 +285,7 @@ pub fn parse_args() -> MakeArgs {
                 s if s.starts_with("--jobs=") => {
                     let val = &s[7..];
                     match val.parse::<usize>() {
-                        Ok(n) => { result.jobs = n; }
+                        Ok(n) => { result.jobs = n; result.jobs_explicit = true; }
                         Err(_) => {
                             let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
                             eprintln!("{}: invalid option -- '--jobs={}'", progname, val);
@@ -443,6 +449,7 @@ pub fn parse_args() -> MakeArgs {
                         continue;
                     }
                     'j' => {
+                        result.jobs_explicit = true;
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
                             // -j<value>: if value is not a valid number, it's an error.
@@ -679,6 +686,26 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                             i += 1;
                             result.include_dirs.push(std::path::PathBuf::from(tokens[i]));
                         }
+                        j = chars.len();
+                        continue;
+                    }
+                    'j' => {
+                        // -j[N]: job count (N attached or in next token)
+                        let arg: String = chars[j+1..].iter().collect();
+                        if !arg.is_empty() {
+                            if let Ok(n) = arg.parse::<usize>() {
+                                result.jobs = n;
+                            }
+                            // If not a number, treat as infinite (usize::MAX)
+                            // but for now just ignore malformed -jXYZ
+                        } else if i + 1 < tokens.len() {
+                            if let Ok(n) = tokens[i + 1].parse::<usize>() {
+                                i += 1;
+                                result.jobs = n;
+                            }
+                            // else: bare -j means infinite jobs
+                        }
+                        // bare -j with no number means unlimited; keep current value
                         j = chars.len();
                         continue;
                     }
