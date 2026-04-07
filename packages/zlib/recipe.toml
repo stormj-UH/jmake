@@ -1,0 +1,21 @@
+[package]
+name = "zlib"
+version = "1.3.2"
+license = "Zlib"
+description = "General-purpose compression library"
+
+[source]
+url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
+sha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+
+[build]
+system = "custom"
+configure = "CC=clang ./configure --prefix=/"
+build = "jmake -j$(nproc)"
+install = """jmake install DESTDIR=$DESTDIR
+find $DESTDIR/bin -type f -exec llvm-strip --strip-all {} \; 2>/dev/null || true
+find $DESTDIR/lib -name '*.so*' -exec llvm-strip --strip-unneeded {} \; 2>/dev/null || true"""
+
+[depends]
+runtime = ["musl"]
+build = ["clang", "jmake"]

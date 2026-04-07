@@ -1,0 +1,20 @@
+[package]
+name = "pigz"
+version = "2.8"
+license = "Zlib"
+description = "Parallel implementation of gzip"
+
+[source]
+url = "https://github.com/madler/pigz/archive/refs/tags/v2.8.tar.gz"
+sha256 = "2f7f6a6986996d21cb8658535fff95f1c7107ddce22b5324f4b41890e2904706"
+
+[build]
+system = "custom"
+build = "jmake CC=clang CFLAGS=\"-O2 -fomit-frame-pointer\" -j$(nproc)"
+install = """install -Dm755 pigz $DESTDIR/bin/pigz
+ln -sf pigz $DESTDIR/bin/unpigz
+llvm-strip --strip-all $DESTDIR/bin/pigz 2>/dev/null || true"""
+
+[depends]
+runtime = ["musl", "zlib"]
+build = ["clang", "jmake"]

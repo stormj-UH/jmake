@@ -1,0 +1,19 @@
+[package]
+name = "lua"
+version = "5.4.7"
+license = "MIT"
+description = "Lightweight, embeddable scripting language"
+
+[source]
+url = "https://www.lua.org/ftp/lua-5.4.7.tar.gz"
+sha256 = "9fbf5af0fb4e2e28baca3d3b3b1b18b1c5491e69c0ae85e930821d2cda817071"
+
+[build]
+system = "custom"
+build = "jmake linux CC=cc -j$(nproc)"
+install = """jmake install INSTALL_TOP=$DESTDIR
+find $DESTDIR/bin -type f -exec llvm-strip --strip-all {} \; 2>/dev/null || true"""
+
+[depends]
+runtime = ["musl"]
+build = ["clang", "jmake"]
