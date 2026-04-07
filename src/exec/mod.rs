@@ -1065,19 +1065,60 @@ impl<'a> Executor<'a> {
                     // IMPORTANT: We do NOT rebuild the intermediate itself (it was skipped
                     // because its normal prereqs don't cause a rebuild of the parent).
                     // We only run its order-only PHONY prereqs.
+
+                    // Collect phony order-only prereqs from skipped intermediates so we
+                    // can build them AND include them in the parallel plan for this target.
+                    let mut transitive_oo_phony: Vec<String> = Vec::new();
                     for skipped in &skipped_intermediates {
-                        let oo_phony: Vec<String> = self.db.rules.get(skipped.as_str())
+                        let oo_items: Vec<String> = self.db.rules.get(skipped.as_str())
                             .map(|rules| rules.iter()
                                 .flat_map(|r| r.order_only_prerequisites.iter().cloned())
                                 .collect())
                             .unwrap_or_default();
-                        for oo_p in oo_phony {
+                        for oo_p in oo_items {
+                            if !transitive_oo_phony.contains(&oo_p) {
+                                transitive_oo_phony.push(oo_p.clone());
+                            }
                             let _ = self.build_target(&oo_p);
                         }
                     }
                     for prereq in all_order_only.clone() {
                         let _ = self.build_target(&prereq);
                     }
+
+                    // In collect_plans_mode (parallel path), create a plan for this target
+                    // so the BFS can reach the transitive PHONY order-only prereqs and run them.
+                    if self.collect_plans_mode {
+                        // Combine direct order-only prereqs with transitive ones from skipped intermediates.
+                        let mut plan_order_only = all_order_only.clone();
+                        for p in &transitive_oo_phony {
+                            if !plan_order_only.contains(p) {
+                                plan_order_only.push(p.clone());
+                            }
+                        }
+                        if !plan_order_only.is_empty() {
+                            if let Some(ref mut plans) = self.pending_plans {
+                                if !plans.contains_key(target) {
+                                    plans.insert(target.to_string(), parallel::TargetPlan {
+                                        target: target.to_string(),
+                                        prerequisites: all_prereqs.clone(),
+                                        order_only: plan_order_only,
+                                        recipe: Vec::new(),
+                                        source_file: String::new(),
+                                        auto_vars: HashMap::new(),
+                                        is_phony: false,
+                                        needs_rebuild: false,
+                                        grouped_primary: None,
+                                        grouped_siblings: Vec::new(),
+                                        extra_exports: HashMap::new(),
+                                        extra_unexports: Vec::new(),
+                                        is_intermediate: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
                     return Ok(false);
                 }
             }
@@ -1204,36 +1245,8 @@ impl<'a> Executor<'a> {
         all_prereqs.retain(|p| p != ".WAIT");
         all_order_only.retain(|p| p != ".WAIT");
 
-        // Step 5: build TARGET-SPECIFIC .EXTRA_PREREQS (after all regular prereqs).
-        if extra_prereqs_target_specific {
-            let prev_skip = self.skip_extra_prereqs;
-            self.skip_extra_prereqs = true;
-            for prereq in &extra_prereqs {
-                match self.build_target(prereq) {
-                    Ok(rebuilt) => {
-                        if rebuilt { any_prereq_rebuilt = true; }
-                    }
-                    Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
-                        let propagated = if is_new {
-                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                            format!("{}, needed by '{}'.  Stop.", base, target)
-                        } else {
-                            e
-                        };
-                        if self.keep_going {
-                            if is_new { self.print_error_keep_going(&propagated); }
-                            prereq_errors.push(propagated);
-                        } else {
-                            self.skip_extra_prereqs = prev_skip;
-                            self.inherited_vars_stack.pop();
-                            return Err(propagated);
-                        }
-                    }
-                }
-            }
-            self.skip_extra_prereqs = prev_skip;
-        }
+        // (Step 5 for target-specific EXTRA_PREREQS is deferred until after pattern rule
+        // prereqs are built, so that pattern rule prereqs come before extra prereqs.)
 
         self.inherited_vars_stack.pop();
 
@@ -1364,6 +1377,43 @@ impl<'a> Executor<'a> {
                 .unwrap_or_default();
             (recipe, recipe_source_file, stem)
         };
+
+        // Step 5: build TARGET-SPECIFIC .EXTRA_PREREQS (after ALL prereqs including pattern rule).
+        // This is done here (after both explicit and pattern rule prereqs are known and built)
+        // so that the extra prereqs always come last in the build order, regardless of whether
+        // the recipe came from an explicit rule or a pattern rule.
+        let mut extra_prereq_errors: Vec<String> = Vec::new();
+        if extra_prereqs_target_specific {
+            let prev_skip = self.skip_extra_prereqs;
+            self.skip_extra_prereqs = true;
+            for prereq in &extra_prereqs {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_prereq_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            if is_new { self.print_error_keep_going(&propagated); }
+                            extra_prereq_errors.push(propagated);
+                        } else {
+                            self.skip_extra_prereqs = prev_skip;
+                            return Err(propagated);
+                        }
+                    }
+                }
+            }
+            self.skip_extra_prereqs = prev_skip;
+        }
+        if !extra_prereq_errors.is_empty() {
+            return Err(extra_prereq_errors.join("\n"));
+        }
 
         // Determine if we need to rebuild.
         // Include extra_prereqs in the rebuild check (they count for mtime comparison)
@@ -2233,19 +2283,29 @@ impl<'a> Executor<'a> {
                         if self.what_if.iter().any(|w| w == vp) { return true; }
                     }
                     if self.db.is_phony(p) { return true; }
+                    // Check if the file actually exists on disk.
+                    let file_exists = get_mtime(p).is_some()
+                        || self.find_in_vpath(p).and_then(|f| get_mtime(&f)).is_some();
+                    if !file_exists {
+                        // File doesn't exist. Determine if it needs to be built:
+                        if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                            return false; // secondary missing file: skip
+                        }
+                        // Explicitly-mentioned (non-intermediate) non-existent files MUST be built.
+                        if self.db.is_explicitly_mentioned(p) || self.db.is_notintermediate(p) {
+                            return true;
+                        }
+                        // Intermediate file: use effective mtime of its sources.
+                        return match self.effective_mtime(p, 0) {
+                            Some(pt) => pt > target_time,
+                            None => false, // no sources found: skip (nothing to build)
+                        };
+                    }
+                    // File exists: compare actual mtime (or effective mtime if file exists
+                    // but has newer-source deps like what-if).
                     match self.effective_mtime(p, 0) {
                         Some(pt) => pt > target_time,
-                        None => {
-                            // Non-existent prereq with no known sources:
-                            if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
-                                return false;
-                            }
-                            if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
-                                return false;
-                            }
-                            // Explicitly-mentioned missing file: must rebuild.
-                            self.db.is_explicitly_mentioned(p) || self.db.is_notintermediate(p)
-                        }
+                        None => false,
                     }
                 });
                 if !any_prereq_newer {
