@@ -270,6 +270,10 @@ pub struct MakeDatabase {
     pub unexport_all: bool,
     pub posix_mode: bool,
     pub not_parallel: bool,
+    /// Targets listed as `.NOTPARALLEL: target1 target2` — their prerequisites run
+    /// sequentially (as if jobs=1) even when the global parallel mode is active.
+    /// This is distinct from `.NOTPARALLEL:` (no prereqs) which sets `not_parallel=true`.
+    pub not_parallel_targets: HashSet<String>,
     pub default_rule: Option<Rule>,
     /// Set of names that are explicitly mentioned in the makefile as either:
     /// - Targets of explicit (non-pattern) rules
@@ -326,6 +330,7 @@ impl MakeDatabase {
             unexport_all: false,
             posix_mode: false,
             not_parallel: false,
+            not_parallel_targets: HashSet::new(),
             env_var_names: HashSet::new(),
             default_rule: None,
             pattern_specific_vars: Vec::new(),

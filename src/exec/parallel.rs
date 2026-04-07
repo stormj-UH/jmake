@@ -586,7 +586,23 @@ impl ParallelScheduler {
                 continue;
             }
             if !plan.needs_rebuild {
-                states.insert(name.clone(), TargetState::Done(false));
+                // A target that doesn't need rebuilding is Done, BUT only if it has
+                // no prerequisites that are still being built. If it has prerequisites
+                // (e.g. `2.a: 1.c` where `2.a` is up-to-date but `1.c` still needs
+                // building), we must NOT mark it Done immediately — we must wait for
+                // all its prerequisites to complete first. This ensures transitive
+                // dependencies are respected: `2.b` (which depends on `2.a`) won't
+                // start until `1.c` is actually built.
+                //
+                // Check: does this target have any prerequisites that are themselves
+                // in the plans map (i.e., need to be scheduled)?
+                let has_pending_prereqs = prereqs_of.get(name.as_str())
+                    .map_or(false, |deps| !deps.is_empty());
+                if !has_pending_prereqs {
+                    // Leaf "up-to-date" target: mark Done immediately.
+                    states.insert(name.clone(), TargetState::Done(false));
+                }
+                // Else: let find_initial_ready handle it when all prereqs are done.
             }
             // Otherwise leave absent; initial_ready_queue will compute readiness.
         }
