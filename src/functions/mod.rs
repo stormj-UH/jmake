@@ -441,33 +441,54 @@ fn fn_flavor(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 /// Execute a shell command, returning (stdout_processed, exit_code).
 /// stdout is processed per GNU Make rules: internal newlines replaced with spaces,
 /// trailing whitespace stripped.
-pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
-    // GNU Make increments MAKELEVEL for all child processes, including $(shell).
-    // Read the current level from the process environment and pass level+1 to
-    // the child so that recursive make invocations inside $(shell ...) display
-    // the correct "make[N]" label.
+/// `extra_env` provides additional environment variables to set (or override).
+/// `remove_env` lists variable names to remove from the environment.
+/// `progname` is used for error messages (e.g. "make: cmd: No such file or directory").
+pub fn fn_shell_exec_with_status_env(
+    cmd: &str,
+    extra_env: &HashMap<String, String>,
+    remove_env: &[String],
+    progname: &str,
+) -> (String, i32) {
     let child_makelevel = std::env::var("MAKELEVEL")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|l| (l + 1).to_string())
         .unwrap_or_else(|| "1".to_string());
 
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
-        .env("MAKELEVEL", &child_makelevel)
-        .output();
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(cmd);
+    c.env("MAKELEVEL", &child_makelevel);
+    for name in remove_env {
+        c.env_remove(name);
+    }
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
 
-    match output {
+    match c.output() {
         Ok(out) => {
+            // Print any stderr output (e.g. "command not found" errors) prefixed with progname.
+            if !out.stderr.is_empty() {
+                let stderr_str = String::from_utf8_lossy(&out.stderr);
+                for line in stderr_str.lines() {
+                    eprintln!("{}: {}", progname, line);
+                }
+            }
             let exit_code = out.status.code().unwrap_or(-1);
             let raw = String::from_utf8_lossy(&out.stdout).to_string();
-            // GNU Make: replace internal newlines with spaces, strip trailing whitespace
             let result = process_shell_output(&raw);
             (result, exit_code)
         }
         Err(_) => (String::new(), 127),
     }
+}
+
+/// Execute a shell command, returning (stdout_processed, exit_code).
+/// stdout is processed per GNU Make rules: internal newlines replaced with spaces,
+/// trailing whitespace stripped.
+pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
+    fn_shell_exec_with_status_env(cmd, &HashMap::new(), &[], "make")
 }
 
 /// Process shell output: replace newlines with spaces, trim trailing whitespace.

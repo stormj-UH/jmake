@@ -55,6 +55,9 @@ pub struct MakeArgs {
     pub no_silent_explicit: bool,
     pub keep_going_explicit: bool,
     pub no_keep_going_explicit: bool,
+    /// Path to temp file holding stdin content (from --temp-stdin=PATH on re-exec).
+    /// When set, read this file instead of stdin for -f- makefiles.
+    pub temp_stdin: Option<PathBuf>,
 }
 
 impl Default for MakeArgs {
@@ -102,6 +105,7 @@ impl Default for MakeArgs {
             no_silent_explicit: false,
             keep_going_explicit: false,
             no_keep_going_explicit: false,
+            temp_stdin: None,
         }
     }
 }
@@ -258,12 +262,19 @@ pub fn parse_args() -> MakeArgs {
                         result.load_average = s[eq+1..].parse().ok();
                     }
                 }
+                s if s.starts_with("--temp-stdin=") => {
+                    result.temp_stdin = Some(PathBuf::from(&s[13..]));
+                }
                 // Silently ignore options that GNU Make supports but jmake does not implement
                 s if s.starts_with("--shuffle") || s == "--no-keep-going" || s == "--sync-output" || s.starts_with("--output-sync") => {
                     // Accepted but not implemented
                 }
                 _ => {
-                    eprintln!("jmake: Unknown option '{}'", arg);
+                    let progname = env::args().next().unwrap_or_else(|| "make".to_string());
+                    eprintln!("{}: invalid option -- '{}'", progname, arg);
+                    eprintln!("Usage: {} [options] [target] ...", progname);
+                    eprintln!("This program built for aarch64-unknown-linux-gnu");
+                    std::process::exit(2);
                 }
             }
         } else if arg.starts_with('-') && arg.len() > 1 {
@@ -720,4 +731,7 @@ fn print_help() {
     println!("  -W FILE, --what-if=FILE, --new-file=FILE, --assume-new=FILE");
     println!("                              Consider FILE to be infinitely new.");
     println!("  --warn-undefined-variables  Warn when an undefined variable is referenced.");
+    println!();
+    println!("This program built for aarch64-unknown-linux-gnu");
+    println!("Report bugs to <bug-make@gnu.org>");
 }

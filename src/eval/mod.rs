@@ -37,6 +37,11 @@ struct IncludeRuleInfo {
     /// True if this rule should be skipped for include-rebuild purposes
     /// (e.g. double-colon with no prerequisites).
     skippable: bool,
+    /// True if the rule "imagines" the target was updated (sv 61226):
+    /// a rule with no recipe AND no prerequisites. In this case the target
+    /// is treated as if it was rebuilt but the file is never actually created,
+    /// so no re-exec is triggered and no error is reported.
+    imagined: bool,
     /// For pattern rules with multiple target patterns: the sibling target names
     /// (i.e., the other targets that would be built by the same recipe invocation).
     /// When this recipe runs for one target, all siblings are also considered attempted.
@@ -57,8 +62,9 @@ pub struct MakeState {
     /// Current file and line for error/warning/info context (updated during parsing)
     pub current_file: RefCell<String>,
     pub current_line: RefCell<usize>,
-    /// Exit status of the last $(shell ...) call, used to set .SHELLSTATUS
-    pub last_shell_status: RefCell<i32>,
+    /// Exit status of the last $(shell ...) call, used to set .SHELLSTATUS.
+    /// None means no $(shell ...) has been called yet (so .SHELLSTATUS is empty).
+    pub last_shell_status: RefCell<Option<i32>>,
     /// Set to true while performing second expansion of prerequisites.
     /// When eval() is called in this context, it must not create new rules
     /// (GNU Make error: "prerequisites cannot be defined in recipes").
@@ -75,6 +81,10 @@ pub struct MakeState {
     /// Causes the `-- ` separator to be shown immediately (with empty vars), but
     /// MAKEFLAGS is rebuilt cleanly (without `-- `) before executing recipes.
     pub makeoverrides_cleared: bool,
+    /// Path to temp file created for stdin (-f-) content.
+    /// Used to pass --temp-stdin=PATH when re-exec'ing, and deleted on exit.
+    /// None if -f- was not used or if re-exec read from --temp-stdin= (already have path in args).
+    pub stdin_temp_path: Option<PathBuf>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -133,12 +143,13 @@ impl MakeState {
             eval_pending: RefCell::new(Vec::new()),
             current_file: RefCell::new(String::new()),
             current_line: RefCell::new(0),
-            last_shell_status: RefCell::new(0),
+            last_shell_status: RefCell::new(None),
             in_second_expansion: RefCell::new(false),
             pending_includes: Vec::new(),
             include_recipe_ran: HashSet::new(),
             entering_directory_printed: false,
             makeoverrides_cleared: false,
+            stdin_temp_path: None,
         };
 
         // Change directory if requested
@@ -229,8 +240,9 @@ impl MakeState {
             }
         }
 
-        // Resolve pending includes (rebuild include files if rules exist)
-        self.resolve_pending_includes()?;
+        // Try to update makefiles (rebuild included/main makefiles if out of date).
+        // If any makefile is rebuilt, this re-execs the process (never returns).
+        self.try_update_makefiles()?;
 
         // Set SHELL
         if let Some(var) = self.db.variables.get("SHELL") {
@@ -406,6 +418,12 @@ impl MakeState {
         let makelevel_str = env::var("MAKELEVEL").unwrap_or_else(|_| "0".to_string());
         self.db.variables.insert("MAKELEVEL".into(),
             Variable::new(makelevel_str, VarFlavor::Simple, VarOrigin::Default));
+        // MAKE_RESTARTS: number of times make has re-exec'd itself to reread makefiles.
+        // Empty on the first run; set to "1", "2", etc. by the re-exec mechanism.
+        // Read from the MAKE_RESTARTS environment variable (set by the reinvoke logic).
+        let make_restarts = env::var("MAKE_RESTARTS").unwrap_or_default();
+        self.db.variables.insert("MAKE_RESTARTS".into(),
+            Variable::new(make_restarts, VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".DEFAULT_GOAL".into(),
             Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::Default));
         self.db.variables.insert(".RECIPEPREFIX".into(),
@@ -628,12 +646,34 @@ impl MakeState {
         });
 
         if is_stdin {
-            // Read from stdin
+            // Read stdin content. If --temp-stdin=PATH was given, read from that file
+            // (re-exec case). Otherwise read from actual stdin, saving to a temp file
+            // so that a possible re-exec can pass the content forward.
             use std::io::Read;
-            let mut content = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut content) {
-                return Err(format!("{}: {}", path_str, e));
-            }
+            let content = if let Some(ref temp_path) = self.args.temp_stdin {
+                // Re-exec path: read the temp file created by our parent invocation
+                std::fs::read_to_string(temp_path)
+                    .map_err(|e| format!("{}: {}", temp_path.display(), e))?
+            } else {
+                // First-run path: read stdin and save to a temp file so re-exec can use it
+                let mut raw = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+                    return Err(format!("{}: {}", path_str, e));
+                }
+                // Create a temp file in TMPDIR (or /tmp).
+                // We create it even if we might not re-exec, since we won't know until later.
+                let tmpdir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+                let temp_path = std::path::PathBuf::from(&tmpdir)
+                    .join(format!("jmake-stdin-{}.mk", std::process::id()));
+                if let Err(e) = std::fs::write(&temp_path, &raw) {
+                    let progname = crate::eval::make_progname();
+                    eprintln!("{}: cannot store makefile from stdin to a temporary file.  Stop.", progname);
+                    let _ = e;
+                    return Err(String::new());
+                }
+                self.stdin_temp_path = Some(temp_path);
+                raw
+            };
             parser.load_string(&content);
         } else if let Err(e) = parser.load_file() {
             // Format: "filename: No such file or directory" (no "os error N")
@@ -726,7 +766,7 @@ impl MakeState {
                         VarFlavor::Shell => {
                             let expanded_cmd = self.expand(&raw_value);
                             let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
-                            *self.last_shell_status.borrow_mut() = status;
+                            *self.last_shell_status.borrow_mut() = Some(status);
                             result
                         }
                         _ => raw_value.clone(),
@@ -1311,6 +1351,24 @@ impl MakeState {
     }
 
     fn register_rule(&mut self, rule: Rule) {
+        // Grouped target rules (&:) must have a recipe.
+        // A rule is grouped (has multiple targets in the group) when grouped_siblings is
+        // non-empty (the parser sets this only when there are 2+ targets).
+        if !rule.grouped_siblings.is_empty() && rule.recipe.is_empty() && !rule.is_pattern {
+            // Check that none of the grouped targets already has a recipe from a prior rule.
+            // If all targets already have recipes, no error; the prior recipe covers them.
+            let any_target_has_recipe = rule.targets.iter().any(|t| {
+                self.db.rules.get(t).map_or(false, |rules| {
+                    rules.iter().any(|r| !r.recipe.is_empty())
+                })
+            });
+            if !any_target_has_recipe {
+                eprintln!("{}:{}: *** grouped targets must provide a recipe.  Stop.",
+                    rule.source_file, rule.lineno);
+                std::process::exit(2);
+            }
+        }
+
         // Handle special targets
         for target in &rule.targets {
             if let Some(special) = SpecialTarget::from_str(target) {
@@ -1546,6 +1604,11 @@ impl MakeState {
                         }
                         existing.recipe = rule.recipe.clone();
                     }
+                    // Update grouped_siblings: if the new rule brings grouped siblings
+                    // (e.g. `a b&: ; recipe` following a standalone `a:`), adopt them.
+                    if !rule.grouped_siblings.is_empty() {
+                        existing.grouped_siblings = rule.grouped_siblings.clone();
+                    }
                     // Preserve static_stem: if the new rule has a static stem (from a
                     // static pattern rule) and the existing rule doesn't, copy it.
                     if existing.static_stem.is_empty() && !rule.static_stem.is_empty() {
@@ -1596,30 +1659,52 @@ impl MakeState {
 
         match flavor {
             VarFlavor::Append => {
-                if let Some(existing) = self.db.variables.get_mut(name) {
+                // Check guards and get the existing variable's flavor before taking
+                // a mutable borrow (borrow checker requires this since self.expand()
+                // also borrows self).
+                let append_info = if let Some(existing) = self.db.variables.get(name) {
                     if !is_override && is_protected(&existing.origin) {
                         return; // Protected variable: non-override append blocked
                     }
                     if makeflags_protected {
                         return; // -e protects MAKEFLAGS from makefile changes
                     }
-                    // With -e (environment overrides), makefile cannot change environment-origin vars
                     if !is_override && self.args.environment_overrides
                         && existing.origin == VarOrigin::Environment {
                         return;
                     }
-                    if existing.value.is_empty() {
-                        existing.value = value.to_string();
+                    Some((existing.flavor.clone(), existing.value.is_empty()))
+                } else {
+                    None
+                };
+
+                if let Some((existing_flavor, existing_is_empty)) = append_info {
+                    // For simply-expanded (:= / ::= / :::=) variables, the appended value
+                    // must be immediately expanded (GNU Make semantics: `foo := a; foo += $(bar)`
+                    // is equivalent to `foo := a $(bar_expanded_now)`).
+                    let append_val = if existing_flavor == VarFlavor::Simple {
+                        self.expand(value)
                     } else {
-                        existing.value.push(' ');
-                        existing.value.push_str(value);
+                        value.to_string()
+                    };
+                    if !append_val.is_empty() {
+                        let existing = self.db.variables.get_mut(name).unwrap();
+                        if existing_is_empty {
+                            existing.value = append_val;
+                        } else {
+                            existing.value.push(' ');
+                            existing.value.push_str(&append_val);
+                        }
                     }
                     if is_override {
-                        existing.origin = VarOrigin::Override;
+                        if let Some(existing) = self.db.variables.get_mut(name) {
+                            existing.origin = VarOrigin::Override;
+                        }
                     }
-                    // Update source location to the most recent assignment site.
-                    existing.source_file = src_file.clone();
-                    existing.source_line = src_line;
+                    if let Some(existing) = self.db.variables.get_mut(name) {
+                        existing.source_file = src_file.clone();
+                        existing.source_line = src_line;
+                    }
                 } else {
                     self.db.variables.insert(name.to_string(),
                         make_var(value.to_string(), VarFlavor::Recursive, origin));
@@ -1636,7 +1721,7 @@ impl MakeState {
                 // first (like := expansion) then pass the result to the shell.
                 let expanded_cmd = self.expand(value);
                 let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
-                *self.last_shell_status.borrow_mut() = status;
+                *self.last_shell_status.borrow_mut() = Some(status);
                 let existing = self.db.variables.get(name);
                 if !is_override {
                     if let Some(existing) = existing {
@@ -1853,210 +1938,7 @@ impl MakeState {
         }
     }
 
-    fn resolve_pending_includes(&mut self) -> Result<(), String> {
-        if self.pending_includes.is_empty() {
-            return Ok(());
-        }
 
-        let shell = self.db.variables.get("SHELL")
-            .map(|v| v.value.clone())
-            .unwrap_or_else(|| "/bin/sh".to_string());
-        let shell_flags = self.db.variables.get(".SHELLFLAGS")
-            .map(|v| v.value.clone())
-            .unwrap_or_else(|| "-c".to_string());
-        let silent = self.args.silent;
-
-        // Process all pending includes in order.
-        // If building any include creates more pending includes, loop again.
-        let mut rounds = 0;
-        loop {
-            rounds += 1;
-            if rounds > 20 { break; }
-
-            let pending = std::mem::take(&mut self.pending_includes);
-            if pending.is_empty() { break; }
-
-            let mut any_rebuilt = false;
-
-            for pi in pending {
-                let file_path = Path::new(&pi.file);
-
-                // If the file now exists (was built in a previous round), read it
-                if file_path.exists() {
-                    if let Err(e) = self.read_makefile(file_path) {
-                        if !pi.ignore_missing {
-                            return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
-                        }
-                    }
-                    any_rebuilt = true;
-                    continue;
-                }
-
-                // Determine if there's a buildable rule for this file.
-                // GNU Make rules for include rebuilding:
-                //   - Double-colon rules with no prerequisites are NOT used to rebuild includes
-                //   - Phony targets are NOT used to rebuild includes
-                //   - Pattern rules and explicit rules with prerequisites or recipes can be used
-
-                let is_phony = self.db.special_targets
-                    .get(&SpecialTarget::Phony)
-                    .map_or(false, |set| set.contains(&pi.file));
-
-                if is_phony {
-                    // Phony targets are not rebuilt as include files
-                    if !pi.ignore_missing {
-                        if !pi.parent.is_empty() {
-                            eprintln!("{}:{}: {}: No such file or directory",
-                                pi.parent, pi.lineno, pi.file);
-                        }
-                        return Err(String::new());
-                    }
-                    continue;
-                }
-
-                // Check for buildable rule
-                let rule_info = self.find_include_rule(&pi.file);
-
-                match rule_info {
-                    None => {
-                        // No rule at all - file can't be built
-                        if !pi.ignore_missing {
-                            // Print "No such file" warning before the fatal error
-                            if !pi.parent.is_empty() {
-                                eprintln!("{}:{}: {}: No such file or directory",
-                                    pi.parent, pi.lineno, pi.file);
-                            }
-                            return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
-                        }
-                        // Optional include with no rule: silently skip
-                    }
-                    Some(IncludeRuleInfo { skippable: true, .. }) => {
-                        // Double-colon with no prerequisites or phony: not used for include rebuilding
-                        if !pi.ignore_missing {
-                            if !pi.parent.is_empty() {
-                                eprintln!("{}:{}: {}: No such file or directory",
-                                    pi.parent, pi.lineno, pi.file);
-                            }
-                            return Err(String::new());
-                        }
-                        // Optional include: silently skip
-                    }
-                    Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, .. }) => {
-                        // Check if this file's recipe was already run by a sibling grouped
-                        // pattern target (e.g. `%_a.mk %_b.mk:` ran for inc_a.mk already).
-                        if self.include_recipe_ran.contains(&pi.file) {
-                            // Recipe already ran; treat as "file not created" path.
-                            if !pi.ignore_missing {
-                                if !pi.parent.is_empty() {
-                                    eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                        pi.parent, pi.lineno, pi.file);
-                                }
-                                return Err(String::new());
-                            }
-                            // Optional include: silently skip
-                        } else {
-                        // First, check/build prerequisites
-                        let mut visited = HashSet::new();
-                        visited.insert(pi.file.clone());
-                        let prereq_result = self.build_include_prerequisites(
-                            &prerequisites,
-                            &pi.file,
-                            &shell,
-                            &shell_flags,
-                            silent,
-                            pi.ignore_missing,
-                            &mut visited,
-                        );
-
-                        match prereq_result {
-                            Err(prereq_err) => {
-                                // Prerequisite couldn't be built
-                                if !pi.ignore_missing {
-                                    // Print "No such file" warning for the include file
-                                    if !pi.parent.is_empty() {
-                                        eprintln!("{}:{}: {}: No such file or directory",
-                                            pi.parent, pi.lineno, pi.file);
-                                    }
-                                    return Err(prereq_err);
-                                }
-                                // Optional include: silently ignore prerequisite failure
-                            }
-                            Ok(()) => {
-                                if recipe.is_empty() {
-                                    // Has prerequisites but no recipe: just check if file exists
-                                    if !file_path.exists() && !pi.ignore_missing {
-                                        if !pi.parent.is_empty() {
-                                            eprintln!("{}:{}: {}: No such file or directory",
-                                                pi.parent, pi.lineno, pi.file);
-                                        }
-                                        return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
-                                    }
-                                } else {
-                                    // Mark this target and all siblings as having had their
-                                    // recipe run, so that sibling targets don't re-run it.
-                                    self.include_recipe_ran.insert(pi.file.clone());
-                                    for sib in &sibling_targets {
-                                        self.include_recipe_ran.insert(sib.clone());
-                                    }
-                                    // Run the recipe to build the file
-                                    let built = self.run_include_recipe(
-                                        &pi.file,
-                                        &recipe,
-                                        &shell,
-                                        &shell_flags,
-                                        silent,
-                                        &source_file,
-                                    );
-                                    match built {
-                                        Ok(()) => {
-                                            if file_path.exists() {
-                                                if let Err(e) = self.read_makefile(file_path) {
-                                                    if !pi.ignore_missing {
-                                                        return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
-                                                    }
-                                                }
-                                                any_rebuilt = true;
-                                            } else {
-                                                // Recipe ran successfully but file not created
-                                                if !pi.ignore_missing && !pi.parent.is_empty() {
-                                                    eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                                        pi.parent, pi.lineno, pi.file);
-                                                }
-                                                if !pi.ignore_missing {
-                                                    return Err(String::new()); // fatal but no additional message
-                                                }
-                                                // Optional include: silently skip if file not created
-                                            }
-                                        }
-                                        Err(recipe_err) => {
-                                            // Recipe failed (non-zero exit)
-                                            if !pi.ignore_missing {
-                                                // Print "No such file" warning
-                                                if !pi.parent.is_empty() {
-                                                    eprintln!("{}:{}: {}: No such file or directory",
-                                                        pi.parent, pi.lineno, pi.file);
-                                                }
-                                                // recipe_err already has "[source:lineno: target] Error N" format
-                                                return Err(recipe_err);
-                                            }
-                                            // Optional include with failed recipe: silently skip
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        } // end else (not in include_recipe_ran)
-                    }
-                }
-            }
-
-            if !any_rebuilt {
-                break;
-            }
-        }
-
-        Ok(())
-    }
 
     /// Build prerequisites needed before building an include file.
     /// Returns Ok(()) if all prerequisites exist or were successfully built.
@@ -2142,6 +2024,21 @@ impl MakeState {
                         recipe_lineno: 0,
                         prerequisites: Vec::new(),
                         skippable: true,
+                        imagined: false,
+                        sibling_targets: Vec::new(),
+                    });
+                }
+                // Single-colon rule with no recipe AND no prerequisites: sv 61226
+                // GNU Make "imagines" the target was updated; no file is created,
+                // no re-exec triggered, no error reported.
+                if !rule.is_double_colon && rule.recipe.is_empty() && rule.prerequisites.is_empty() {
+                    return Some(IncludeRuleInfo {
+                        recipe: Vec::new(),
+                        source_file: rule.source_file.clone(),
+                        recipe_lineno: 0,
+                        prerequisites: Vec::new(),
+                        skippable: false,
+                        imagined: true,
                         sibling_targets: Vec::new(),
                     });
                 }
@@ -2155,6 +2052,7 @@ impl MakeState {
                         recipe_lineno: ln,
                         prerequisites: rule.prerequisites.clone(),
                         skippable: false,
+                        imagined: false,
                         sibling_targets: Vec::new(),
                     });
                 }
@@ -2192,6 +2090,7 @@ impl MakeState {
                             recipe_lineno: ln,
                             prerequisites: prereqs,
                             skippable: false,
+                            imagined: false,
                             sibling_targets: siblings,
                         });
                     }
@@ -2328,6 +2227,334 @@ impl MakeState {
                 println!("\t{}", line);
             }
         }
+    }
+
+    /// Re-execute the current process from scratch after makefiles were updated.
+    /// This never returns if successful (it replaces the current process via exec).
+    /// If exec fails, it logs an error and returns the appropriate error string.
+    /// `restart_count`: the new MAKE_RESTARTS value (1 for first restart, etc.)
+    fn do_reinvoke(&self, restart_count: u32) -> String {
+        use std::os::unix::process::CommandExt;
+
+        let progname = make_progname();
+        let debug_basic = self.args.debug_short
+            || self.args.debug.iter().any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
+
+        // Get the current executable path.
+        let exe = match env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}: failed to get executable path: {}", progname, e);
+                return String::new();
+            }
+        };
+
+        // Build args: skip argv[0] (the program name)
+        let orig_args: Vec<String> = env::args().skip(1)
+            .filter(|a| !a.starts_with("--temp-stdin="))  // strip any previous --temp-stdin
+            .collect();
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&orig_args);
+
+        // If -f- was given, pass the temp file path so the re-exec'd process can read stdin content
+        let temp_stdin_path = self.args.temp_stdin.clone()
+            .or_else(|| self.stdin_temp_path.clone());
+        if let Some(ref tp) = temp_stdin_path {
+            cmd.arg(format!("--temp-stdin={}", tp.display()));
+        }
+
+        // Set MAKE_RESTARTS in the environment for the re-exec'd process
+        cmd.env("MAKE_RESTARTS", restart_count.to_string());
+
+        if debug_basic {
+            // Build the full command string for debug output
+            let mut parts = vec![exe.to_string_lossy().to_string()];
+            parts.extend(orig_args.iter().cloned());
+            if let Some(ref tp) = temp_stdin_path {
+                parts.push(format!("--temp-stdin={}", tp.display()));
+            }
+            eprintln!("Re-executing: {}", parts.join(" "));
+        }
+
+        // exec() replaces the current process. It only returns on failure.
+        let err = cmd.exec();
+        // exec failed
+        eprintln!("{}: {}: {}", progname, exe.display(), err);
+        // Try to clean up the temp stdin file on exec failure
+        if let Some(ref tp) = temp_stdin_path {
+            let _ = std::fs::remove_file(tp);
+        }
+        // Exit with 127 to indicate exec failure (same as shell convention)
+        std::process::exit(127);
+    }
+
+    /// Check if any of the read makefiles (in makefile_list) are out of date
+    /// and need to be rebuilt. Also handles pending includes.
+    /// If any file is rebuilt, re-execs the process.
+    /// Returns Ok(()) normally (re-exec never returns), or Err on fatal error.
+    fn try_update_makefiles(&mut self) -> Result<(), String> {
+        // Skip if there are no makefiles to check
+        if self.makefile_list.is_empty() && self.pending_includes.is_empty() {
+            return Ok(());
+        }
+
+        let shell = self.db.variables.get("SHELL")
+            .map(|v| v.value.clone())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        let shell_flags = self.db.variables.get(".SHELLFLAGS")
+            .map(|v| v.value.clone())
+            .unwrap_or_else(|| "-c".to_string());
+        let silent = self.args.silent;
+
+        let mut any_really_rebuilt = false;
+
+        // First, handle pending includes (files that were missing when first read)
+        let pending = std::mem::take(&mut self.pending_includes);
+        for pi in pending {
+            let file_path = Path::new(&pi.file);
+
+            // If the file now exists, just read it
+            if file_path.exists() {
+                if let Err(e) = self.read_makefile(file_path) {
+                    if !pi.ignore_missing {
+                        return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
+                    }
+                }
+                any_really_rebuilt = true;
+                continue;
+            }
+
+            // Check for phony - phony targets can't be used for include rebuilding
+            let is_phony = self.db.special_targets
+                .get(&SpecialTarget::Phony)
+                .map_or(false, |set| set.contains(&pi.file));
+            if is_phony {
+                if !pi.ignore_missing {
+                    if !pi.parent.is_empty() {
+                        eprintln!("{}:{}: {}: No such file or directory",
+                            pi.parent, pi.lineno, pi.file);
+                    }
+                    return Err(String::new());
+                }
+                continue;
+            }
+
+            // Find rule to build this file
+            let rule_info = self.find_include_rule(&pi.file);
+            match rule_info {
+                None => {
+                    if !pi.ignore_missing {
+                        if !pi.parent.is_empty() {
+                            eprintln!("{}:{}: {}: No such file or directory",
+                                pi.parent, pi.lineno, pi.file);
+                        }
+                        return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
+                    }
+                }
+                Some(IncludeRuleInfo { skippable: true, .. }) => {
+                    if !pi.ignore_missing {
+                        if !pi.parent.is_empty() {
+                            eprintln!("{}:{}: {}: No such file or directory",
+                                pi.parent, pi.lineno, pi.file);
+                        }
+                        return Err(String::new());
+                    }
+                }
+                Some(IncludeRuleInfo { imagined: true, .. }) => {
+                    // sv 61226: rule with no recipe and no prereqs → "imagined update"
+                    // Treat as if file was updated but don't actually create it,
+                    // don't re-exec, and don't error. Just silently continue.
+                    // (The file remains "missing" but include treats it as empty)
+                }
+                Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, .. }) => {
+                    if self.include_recipe_ran.contains(&pi.file) {
+                        // Recipe already ran (sibling pattern target)
+                        if !pi.ignore_missing {
+                            if !pi.parent.is_empty() {
+                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                    pi.parent, pi.lineno, pi.file);
+                            }
+                            return Err(String::new());
+                        }
+                        continue;
+                    }
+
+                    // Build prerequisites first
+                    let mut visited = HashSet::new();
+                    visited.insert(pi.file.clone());
+                    let prereq_result = self.build_include_prerequisites(
+                        &prerequisites, &pi.file, &shell, &shell_flags, silent,
+                        pi.ignore_missing, &mut visited,
+                    );
+
+                    match prereq_result {
+                        Err(prereq_err) => {
+                            if !pi.ignore_missing {
+                                if !pi.parent.is_empty() {
+                                    eprintln!("{}:{}: {}: No such file or directory",
+                                        pi.parent, pi.lineno, pi.file);
+                                }
+                                return Err(prereq_err);
+                            }
+                        }
+                        Ok(()) => {
+                            if recipe.is_empty() {
+                                // Has prerequisites but no recipe: just check if file exists
+                                // (sv 61226: "imagined" if prereqs exist but file doesn't)
+                                // Don't error, don't re-exec - treat as imagined update
+                                // Continue silently
+                            } else {
+                                // Mark siblings as ran
+                                self.include_recipe_ran.insert(pi.file.clone());
+                                for sib in &sibling_targets {
+                                    self.include_recipe_ran.insert(sib.clone());
+                                }
+                                // Run the recipe
+                                let built = self.run_include_recipe(
+                                    &pi.file, &recipe, &shell, &shell_flags, silent, &source_file,
+                                );
+                                match built {
+                                    Ok(()) => {
+                                        if file_path.exists() {
+                                            if let Err(e) = self.read_makefile(file_path) {
+                                                if !pi.ignore_missing {
+                                                    return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
+                                                }
+                                            }
+                                            any_really_rebuilt = true;
+                                        } else {
+                                            // sv 61226: recipe ran but file not created
+                                            // → "imagined update", no error, no re-exec
+                                            // (whether include or -include doesn't matter here)
+                                        }
+                                    }
+                                    Err(recipe_err) => {
+                                        if !pi.ignore_missing {
+                                            if !pi.parent.is_empty() {
+                                                eprintln!("{}:{}: {}: No such file or directory",
+                                                    pi.parent, pi.lineno, pi.file);
+                                            }
+                                            return Err(recipe_err);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second, check existing makefiles that may be out of date.
+        // Any makefile in makefile_list that has a rule and whose prerequisites
+        // are newer than it should be rebuilt.
+        // Skip stdin (-) since it can't be checked for staleness.
+        let makefile_list_snap = self.makefile_list.clone();
+        for mf_path in &makefile_list_snap {
+            let mf_str = mf_path.to_string_lossy();
+            if mf_str == "-" {
+                // Skip stdin makefiles
+                continue;
+            }
+            let mf_name = mf_str.to_string();
+
+            // Check if this makefile has a rule to rebuild it
+            let rule_info = self.find_include_rule(&mf_name);
+            let rule_info = match rule_info {
+                Some(ri) if !ri.skippable && !ri.imagined => ri,
+                _ => continue, // no applicable rule
+            };
+
+            // Determine if the makefile is out of date
+            let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+            let needs_rebuild = if target_mtime.is_none() {
+                // File doesn't exist → needs rebuild
+                true
+            } else {
+                let target_time = target_mtime.unwrap();
+                // Check if any prerequisite is newer
+                let any_prereq_newer = rule_info.prerequisites.iter().any(|prereq| {
+                    if let Ok(m) = std::fs::metadata(prereq) {
+                        if let Ok(pt) = m.modified() {
+                            return pt > target_time;
+                        }
+                    }
+                    false
+                });
+                any_prereq_newer
+            };
+
+            if !needs_rebuild {
+                continue;
+            }
+
+            if self.include_recipe_ran.contains(&mf_name) {
+                continue;
+            }
+
+            // Build prerequisites first
+            let prereqs = rule_info.prerequisites.clone();
+            let mut visited = HashSet::new();
+            visited.insert(mf_name.clone());
+            let prereq_result = self.build_include_prerequisites(
+                &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
+            );
+
+            if let Err(e) = prereq_result {
+                return Err(e);
+            }
+
+            if rule_info.recipe.is_empty() {
+                // Has prerequisites but no recipe - prereqs were built but no file update
+                // sv 61226: imagined update, no re-exec
+                continue;
+            }
+
+            // Mark as ran
+            self.include_recipe_ran.insert(mf_name.clone());
+            for sib in &rule_info.sibling_targets {
+                self.include_recipe_ran.insert(sib.clone());
+            }
+
+            // Run the recipe
+            let built = self.run_include_recipe(
+                &mf_name, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
+                &rule_info.source_file.clone(),
+            );
+
+            match built {
+                Ok(()) => {
+                    // Check if the file was actually updated (mtime changed or created)
+                    let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+                    let actually_updated = match (target_mtime, new_mtime) {
+                        (_, None) => false, // file still doesn't exist
+                        (None, Some(_)) => true, // file was created
+                        (Some(old_t), Some(new_t)) => new_t > old_t, // file was updated
+                    };
+                    if actually_updated {
+                        any_really_rebuilt = true;
+                    }
+                    // If file not updated (sv 61226): no re-exec, no error
+                }
+                Err(recipe_err) => {
+                    return Err(recipe_err);
+                }
+            }
+        }
+
+        // If any makefile was really rebuilt, re-exec from scratch
+        if any_really_rebuilt {
+            let restart_val = env::var("MAKE_RESTARTS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            self.do_reinvoke(restart_val + 1);
+            // do_reinvoke never returns normally - if it does, something went wrong
+            // (but it calls process::exit internally)
+        }
+
+        Ok(())
     }
 }
 

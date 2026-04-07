@@ -31,6 +31,8 @@ pub struct Parser {
     /// When we see 'endef', depth decrements; only when depth==0 does the define end.
     pub define_depth: usize,
     pub conditional_stack: Vec<ConditionalState>,
+    /// True when `.POSIX:` has been seen; affects backslash-newline collapsing.
+    pub posix_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,7 @@ impl Parser {
             define_lineno: 0,
             define_depth: 0,
             conditional_stack: Vec::new(),
+            posix_mode: false,
         }
     }
 
@@ -131,8 +134,21 @@ impl Parser {
                 line.push_str(stripped);
             } else {
                 line.pop(); // remove backslash
-                line.push(' ');
-                line.push_str(self.lines[self.pos].trim_start());
+                // $\ (dollar immediately before backslash-newline): GNU Make treats
+                // this as a concatenating continuation: the $ and \ are both removed
+                // and the next line is trimmed and directly appended (no space).
+                if line.ends_with('$') {
+                    line.pop(); // remove the preceding $
+                    line.push_str(self.lines[self.pos].trim_start());
+                } else {
+                    if !self.posix_mode {
+                        // GNU Make non-POSIX: strip trailing whitespace before the space.
+                        let trimmed_len = line.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                        line.truncate(trimmed_len);
+                    }
+                    line.push(' ');
+                    line.push_str(self.lines[self.pos].trim_start());
+                }
             }
             self.pos += 1;
         }

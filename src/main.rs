@@ -25,7 +25,19 @@ fn main() {
 
     let mut state = eval::MakeState::new(args);
 
-    match state.run() {
+    let result = state.run();
+
+    // Clean up temp stdin file if we created one (and re-exec didn't happen).
+    // On re-exec, the temp file is preserved for the re-exec'd process to read.
+    // On normal exit (success or error after run), we can clean it up.
+    // Note: if --temp-stdin was given, the file was created by our parent; don't delete it here.
+    if state.args.temp_stdin.is_none() {
+        if let Some(ref tp) = state.stdin_temp_path {
+            let _ = std::fs::remove_file(tp);
+        }
+    }
+
+    match result {
         Ok(()) => process::exit(0),
         Err(e) => {
             if !e.is_empty() {

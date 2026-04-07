@@ -181,9 +181,13 @@ impl MakeState {
         if let Some(val) = auto_vars.get(&expanded_name) {
             return val.clone();
         }
-        // .SHELLSTATUS is dynamically maintained from the last $(shell) call
+        // .SHELLSTATUS is dynamically maintained from the last $(shell) call.
+        // Before any $(shell ...) call, .SHELLSTATUS expands to empty string.
         if expanded_name == ".SHELLSTATUS" {
-            return self.last_shell_status.borrow().to_string();
+            return match *self.last_shell_status.borrow() {
+                Some(status) => status.to_string(),
+                None => String::new(),
+            };
         }
         if let Some(var) = self.db.variables.get(&expanded_name) {
             return self.expand_var_value(var, auto_vars);
@@ -440,7 +444,7 @@ impl MakeState {
                 let cmd = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
                 let (output, status) = functions::fn_shell_exec_with_status(&cmd);
                 // Store exit code; variable lookup for .SHELLSTATUS checks this field.
-                *self.last_shell_status.borrow_mut() = status;
+                *self.last_shell_status.borrow_mut() = Some(status);
                 return output;
             }
             "file" => {
@@ -468,8 +472,13 @@ impl MakeState {
                 }
                 match trimmed.parse::<i64>() {
                     Ok(n) if !allow_zero && n == 0 => {
-                        // Special message for zero (only when zero is disallowed)
-                        eprintln!("{}*** first argument to '{}' function must be greater than 0.  Stop.", loc, func_name);
+                        // $(word) uses a special "must be greater than 0" message for zero;
+                        // other functions (e.g. $(wordlist)) use the generic "invalid" message.
+                        if func_name == "word" {
+                            eprintln!("{}*** first argument to '{}' function must be greater than 0.  Stop.", loc, func_name);
+                        } else {
+                            eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg);
+                        }
                         std::process::exit(2);
                     }
                     Ok(n) if n < 0 => {
@@ -848,8 +857,9 @@ fn dir_part(path: &str) -> String {
     let words: Vec<&str> = path.split_whitespace().collect();
     let results: Vec<String> = words.iter().map(|w| {
         match w.rfind('/') {
-            Some(pos) => w[..=pos].to_string(),
-            None => "./".to_string(),
+            Some(0) => "/".to_string(),
+            Some(pos) => w[..pos].to_string(),
+            None => ".".to_string(),
         }
     }).collect();
     results.join(" ")

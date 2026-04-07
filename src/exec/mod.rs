@@ -34,6 +34,9 @@ pub struct Executor<'a> {
     /// Set to true the first time any recipe is executed.
     /// Suppresses "is up to date" / "Nothing to be done" diagnostics.
     any_recipe_ran: bool,
+    /// Targets that were covered as grouped siblings (not the primary target that ran the
+    /// recipe). When explicitly requested, these always get "Nothing to be done" printed.
+    grouped_covered: HashSet<String>,
     /// Intermediate targets that were actually built this run (candidates for deletion).
     /// Stored as Vec to maintain insertion order (for consistent rm output).
     intermediate_built: Vec<String>,
@@ -92,6 +95,7 @@ impl<'a> Executor<'a> {
             errors: Vec::new(),
             progname,
             any_recipe_ran: false,
+            grouped_covered: HashSet::new(),
             intermediate_built: Vec::new(),
             top_level_targets: HashSet::new(),
             what_if,
@@ -114,7 +118,13 @@ impl<'a> Executor<'a> {
                     // but ONLY when no recipe ran anywhere in this make session.
                     // GNU Make suppresses these messages when any work was done
                     // (even for unrelated or order-only prerequisites).
-                    if !rebuilt && !self.silent && !self.question && !self.any_recipe_ran {
+                    // Print "Nothing to be done" / "is up to date" when not rebuilt.
+                    // Normally suppressed when any recipe ran, but grouped-covered siblings
+                    // always get the message (GNU Make prints it for them even after recipes ran).
+                    let is_grouped_covered = self.grouped_covered.contains(target);
+                    if !rebuilt && !self.silent && !self.question
+                        && (!self.any_recipe_ran || is_grouped_covered)
+                    {
                         let has_recipe = self.target_has_recipe(target);
                         if has_recipe {
                             println!("{}: '{}' is up to date.", self.progname, target);
@@ -242,8 +252,35 @@ impl<'a> Executor<'a> {
         };
 
         // If we have explicit rules
-        if let Some(rules) = &rules {
+        if let Some(ref rules) = rules {
             if !rules.is_empty() {
+                let is_double_colon = rules.first().map_or(false, |r| r.is_double_colon);
+                if is_double_colon {
+                    // For double-colon rules, each rule is independent.
+                    // If a rule has grouped_siblings, treat it as its own grouped invocation.
+                    // This handles `a b c&::; X` + `c d e&::; Y` where c has two groups.
+                    let rules_clone = rules.clone();
+                    let any_rule_is_grouped = rules_clone.iter().any(|r| !r.grouped_siblings.is_empty());
+                    if any_rule_is_grouped {
+                        let mut any_rebuilt = false;
+                        for rule in &rules_clone {
+                            // Compute this rule's siblings (not yet built, not already building)
+                            let rule_siblings: Vec<String> = rule.grouped_siblings.iter()
+                                .filter(|s| !self.built.contains_key(s.as_str())
+                                         && !self.building.contains(s.as_str()))
+                                .cloned()
+                                .collect();
+                            let result = self.build_with_rules_grouped(
+                                target, std::slice::from_ref(rule), is_phony, &rule_siblings
+                            );
+                            match result {
+                                Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        return Ok(any_rebuilt);
+                    }
+                }
                 // For grouped targets (&:): pass the siblings to build_with_rules so it
                 // can build their prerequisites BEFORE running the recipe, and mark them
                 // as built afterward. The recipe runs ONCE for the primary target only.
@@ -926,10 +963,20 @@ impl<'a> Executor<'a> {
         }
 
         // Phase 3: determine if we need to rebuild and run the recipe.
+        // For grouped targets, also rebuild if any sibling is missing or out of date.
         let needs_rebuild = if self.always_make || is_phony {
             true
+        } else if self.needs_rebuild(target, &all_prereqs, any_prereq_rebuilt) {
+            true
         } else {
-            self.needs_rebuild(target, &all_prereqs, any_prereq_rebuilt)
+            // Check if any sibling needs rebuilding (missing or older than a prereq).
+            grouped_siblings.iter().any(|sib| {
+                let sib_rules = self.db.rules.get(sib.as_str()).cloned().unwrap_or_default();
+                let sib_prereqs: Vec<String> = sib_rules.iter()
+                    .flat_map(|r| r.prerequisites.iter().cloned())
+                    .collect();
+                self.needs_rebuild(sib, &sib_prereqs, any_prereq_rebuilt)
+            })
         };
 
         if !needs_rebuild {
@@ -965,8 +1012,12 @@ impl<'a> Executor<'a> {
 
         let rebuilt = result.as_ref().copied().unwrap_or(false);
         for (sibling, _) in &sibling_rules {
-            self.built.insert(sibling.clone(), rebuilt);
+            // Mark siblings as "covered" (not independently rebuilt) so that
+            // when they are requested as top-level targets, "Nothing to be done" is printed.
+            self.grouped_covered.insert(sibling.clone());
+            self.built.insert(sibling.clone(), false);
         }
+        let _ = rebuilt; // primary target's rebuilt status is propagated by build_target()
 
         result
     }
@@ -1168,6 +1219,15 @@ impl<'a> Executor<'a> {
     }
 
     fn build_with_pattern_rule(&mut self, target: &str, rule: &Rule, stem: &str, is_phony: bool) -> Result<bool, String> {
+        // For grouped pattern rules (`a.% b.%&: ; recipe`): compute concrete sibling targets
+        // by substituting % with the stem, then filter out the current target and already-built ones.
+        let concrete_grouped_siblings: Vec<String> = rule.grouped_siblings.iter()
+            .map(|pat| pat.replace('%', stem))
+            .filter(|s| s != target
+                    && !self.built.contains_key(s.as_str())
+                    && !self.building.contains(s.as_str()))
+            .collect();
+
         // Expand pattern prerequisites using the stem.
         // For normal (non-SE) prerequisites, substitute % with the stem.
         // .WAIT markers are filtered since they are ordering hints, not real targets.
@@ -1249,11 +1309,21 @@ impl<'a> Executor<'a> {
 
         let needs_rebuild = if self.always_make || is_phony {
             true
+        } else if self.needs_rebuild(target, &prereqs, any_rebuilt) {
+            true
         } else {
-            self.needs_rebuild(target, &prereqs, any_rebuilt)
+            // For grouped pattern rules, also rebuild if any concrete sibling is missing.
+            concrete_grouped_siblings.iter().any(|sib| {
+                self.needs_rebuild(sib, &[], false)
+            })
         };
 
         if !needs_rebuild {
+            // Mark grouped pattern siblings as covered (up to date).
+            for sib in &concrete_grouped_siblings {
+                self.grouped_covered.insert(sib.clone());
+                self.built.insert(sib.clone(), false);
+            }
             return Ok(false);
         }
 
@@ -1308,6 +1378,11 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+        }
+        // Mark grouped pattern siblings as covered by this recipe run.
+        for sib in &concrete_grouped_siblings {
+            self.grouped_covered.insert(sib.clone());
+            self.built.insert(sib.clone(), false);
         }
         result
     }
@@ -1906,6 +1981,12 @@ impl<'a> Executor<'a> {
                         if self.db.is_secondary(prereq) {
                             continue;
                         }
+                        // A prereq that was visited (has a rule, even an empty one) but
+                        // still doesn't exist as a file always triggers a rebuild.
+                        // GNU Make treats such prerequisites as "newer than everything".
+                        if self.built.contains_key(prereq.as_str()) {
+                            return true;
+                        }
                         // For non-existent non-phony prereqs (potentially intermediate files
                         // that were deleted), compute effective mtime from their sources.
                         // If sources are all older than the target, no rebuild needed.
@@ -1988,8 +2069,9 @@ impl<'a> Executor<'a> {
                     (None, Some(_)) => true,       // target doesn't exist, prereq does: newer
                     (Some(tt), Some(pt)) => pt > tt, // both exist: compare times
                     (_, None) => {
-                        // prereq doesn't exist as file: include if target doesn't exist AND prereq was visited
-                        target_time.is_none() && self.built.contains_key(p.as_str())
+                        // prereq doesn't exist as file: include if prereq was visited
+                        // (had a rule but didn't create a file — counts as always newer)
+                        self.built.contains_key(p.as_str())
                     }
                     _ => false,
                 }
@@ -2091,31 +2173,38 @@ impl<'a> Executor<'a> {
             // Execute all recipe lines as one shell script.
             // In .ONESHELL mode:
             //   - ALL recipe lines are joined and passed to a single shell invocation.
-            //   - Prefix chars (@, -, +) on EVERY line are stripped from the script content.
-            //   - Echo behaviour is controlled by the FIRST recipe line's prefix only:
-            //     if the first line starts with @, the whole recipe is silent; otherwise
-            //     ALL lines are echoed (using their content stripped of prefix chars).
-            //   - Inner lines' @ etc. do NOT suppress their individual echo.
+            //   - Prefix chars (@, -, +) are stripped ONLY from the FIRST recipe line.
+            //     Inner lines keep their content as-is (they are interpreter script body).
+            //   - Echo behaviour is controlled by the FIRST recipe line's prefix only.
+            //   - The last recipe lineno is used for error messages.
 
             let mut script = String::new();
             let mut first_line_silent = false;
             let mut first_line_ignore = false;
             let mut is_first = true;
+            let mut last_lineno: usize = 0;
 
             for (lineno, line) in recipe {
+                last_lineno = *lineno;
                 // Update current_file/current_line so that errors during expansion
                 // (e.g. from $(word ...) or $(wordlist ...)) report the correct location.
                 *self.state.current_file.borrow_mut() = source_file.to_string();
                 *self.state.current_line.borrow_mut() = *lineno;
-                let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-                let cmd_line = strip_recipe_prefixes(&expanded);
+                // Pre-process: collapse \<newline> inside $(…)/${…} references
+                let preprocessed = preprocess_recipe_bsnl(line);
+                let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
                 if is_first {
+                    // First line: strip @-+ prefixes and record their effect.
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
+                    let cmd_line = strip_recipe_prefixes(&expanded);
+                    script.push_str(&cmd_line);
                     is_first = false;
+                } else {
+                    // Inner lines: keep content as-is (they are interpreter script body).
+                    script.push_str(&expanded);
                 }
-                script.push_str(&cmd_line);
                 script.push('\n');
             }
 
@@ -2123,10 +2212,17 @@ impl<'a> Executor<'a> {
             let effective_ignore = first_line_ignore || self.ignore_errors;
 
             if !effective_silent {
-                // Echo ALL lines (using content stripped of prefix chars)
+                // Echo lines; first line with @-+ stripped, inner lines as-is.
+                let mut echo_first = true;
                 for (_lineno, line) in recipe {
-                    let expanded = self.state.expand_with_auto_vars(line, auto_vars);
-                    let display = strip_recipe_prefixes(&expanded);
+                    let preprocessed = preprocess_recipe_bsnl(line);
+                    let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                    let display = if echo_first {
+                        echo_first = false;
+                        strip_recipe_prefixes(&expanded)
+                    } else {
+                        expanded.clone()
+                    };
                     if !display.trim().is_empty() {
                         println!("{}", display.trim_end());
                     }
@@ -2141,15 +2237,17 @@ impl<'a> Executor<'a> {
 
             self.any_recipe_ran = true;
             if !self.dry_run {
-                // Split shell_flags by whitespace into separate arguments.
-                // .SHELLFLAGS = "-e -c" means pass -e and -c as separate args.
-                let flags: Vec<&str> = self.shell_flags.split_whitespace().collect();
+                // Parse shell_flags respecting shell-like single-quote quoting.
+                // E.g. `.SHELLFLAGS = -w -E 'use warnings;' -E` produces 4 separate args.
+                let flags: Vec<String> = parse_shell_flags(self.shell_flags);
                 let mut child = Command::new(self.shell);
                 for flag in &flags {
                     child.arg(flag);
                 }
-                // Script is the final argument (after any flags from .SHELLFLAGS)
-                child.arg(&script);
+                // Script is the final argument (after any flags from .SHELLFLAGS).
+                // Trim trailing newlines to avoid embedded newlines when interpreter
+                // treats the arg as a filename (e.g. perl without -e/-E flags).
+                child.arg(script.trim_end_matches('\n'));
                 child.env("MAKELEVEL", self.get_makelevel());
                 self.setup_exports(&mut child);
                 let status = child.status();
@@ -2158,10 +2256,10 @@ impl<'a> Executor<'a> {
                     Ok(s) if !s.success() => {
                         let code = s.code().unwrap_or(1);
                         if effective_ignore {
-                            let loc = make_location(source_file, 0);
+                            let loc = make_location(source_file, last_lineno);
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
                         } else {
-                            let loc = make_location(source_file, 0);
+                            let loc = make_location(source_file, last_lineno);
                             eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
                             return Err(String::new());
                         }
@@ -2185,7 +2283,10 @@ impl<'a> Executor<'a> {
             // (e.g. from $(word ...) or $(wordlist ...)) report the correct location.
             *self.state.current_file.borrow_mut() = source_file.to_string();
             *self.state.current_line.borrow_mut() = *lineno;
-            let expanded = self.state.expand_with_auto_vars(line, auto_vars);
+            // Pre-process: collapse \<newline> inside $(…)/${…} references
+            // (GNU Make job.c behavior: \<nl> inside variable refs is eaten before expansion).
+            let preprocessed = preprocess_recipe_bsnl(line);
+            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
 
             // Extract prefix flags (@, -, +) from the ORIGINAL recipe line (before expansion).
             // These flags propagate to ALL sub-lines from the expansion.
@@ -2530,6 +2631,42 @@ fn make_location(source_file: &str, lineno: usize) -> String {
     }
 }
 
+/// Parse a .SHELLFLAGS value into individual arguments, respecting single-quote quoting.
+/// E.g. `-w -E 'use warnings FATAL => "all";' -E` → ["-w", "-E", "use warnings...", "-E"]
+/// Unquoted tokens are split on whitespace; single-quoted strings are a single token.
+fn parse_shell_flags(flags: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let bytes = flags.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if in_single_quote {
+            if ch == '\'' {
+                in_single_quote = false;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '\'' {
+            in_single_quote = true;
+        } else if ch == ' ' || ch == '\t' {
+            if !current.is_empty() {
+                result.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
 fn match_pattern(pattern: &str, target: &str) -> Option<String> {
     if let Some(percent_pos) = pattern.find('%') {
         let prefix = &pattern[..percent_pos];
@@ -2633,6 +2770,77 @@ fn strip_recipe_prefixes(line: &str) -> String {
     line[i..].to_string()
 }
 
+/// Pre-process a recipe line before variable expansion.
+///
+/// GNU Make (job.c) collapses backslash-newline sequences that appear INSIDE
+/// variable or function references (`$(...)` / `${...}`) before expanding them.
+/// The rule: inside a `$(…)` block, `\<newline>` (and any following whitespace
+/// and preceding whitespace) is replaced by a single space.  Outside such blocks
+/// the `\<newline>` is left intact so the shell can handle the continuation.
+///
+/// This function implements that pre-processing pass.
+fn preprocess_recipe_bsnl(line: &str) -> String {
+    if !line.contains('\n') {
+        // No embedded newlines – nothing to do.
+        return line.to_string();
+    }
+    let bytes = line.as_bytes();
+    let mut result = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut depth: i32 = 0;  // nesting depth inside $(…) / ${…}
+
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'$' && i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') {
+            depth += 1;
+            result.push(ch as char);
+            result.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        if depth > 0 && (ch == b')' || ch == b'}') {
+            depth -= 1;
+            result.push(ch as char);
+            i += 1;
+            continue;
+        }
+        if depth > 0 && ch == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            // Inside a variable/function reference: count consecutive backslashes.
+            let mut nb = 0usize;
+            let mut j = i;
+            while j < bytes.len() && bytes[j] == b'\\' {
+                nb += 1;
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'\n' && nb % 2 == 1 {
+                // Odd number of backslashes followed by newline → collapse.
+                // Emit (nb-1)/2 literal backslashes (each pair → one backslash).
+                for _ in 0..(nb / 2) {
+                    result.push('\\');
+                }
+                // Strip trailing whitespace already in result (before the backslash run)
+                while result.ends_with(|c: char| c == ' ' || c == '\t') {
+                    result.pop();
+                }
+                // Skip backslash(es) + newline + leading whitespace on next line
+                i = j + 1; // skip newline
+                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                result.push(' ');
+            } else {
+                // Even number of backslashes or no newline: just push the backslash
+                result.push(ch as char);
+                i += 1;
+            }
+            continue;
+        }
+        result.push(ch as char);
+        i += 1;
+    }
+    result
+}
+
 /// Split a recipe line on bare newlines (i.e., `\n` NOT preceded by `\`).
 ///
 /// When the parser joins backslash-newline continuations in recipe lines it
@@ -2665,8 +2873,15 @@ fn split_recipe_sub_lines(s: &str) -> Vec<String> {
 
 fn dir_of(path: &str) -> String {
     match path.rfind('/') {
-        Some(pos) => path[..=pos].to_string(),
-        None => "./".to_string(),
+        Some(pos) => {
+            if pos == 0 {
+                // Root dir: the dir of "/foo" is "/"
+                "/".to_string()
+            } else {
+                path[..pos].to_string()
+            }
+        }
+        None => ".".to_string(),
     }
 }
 
