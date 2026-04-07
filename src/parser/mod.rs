@@ -272,24 +272,36 @@ impl Parser {
 
 pub fn strip_comment(line: &str) -> String {
     let mut result = String::new();
-    let mut chars = line.chars().peekable();
-    let mut escaped = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut depth = 0; // track $(...) and ${...} nesting
 
-    while let Some(ch) = chars.next() {
-        if escaped {
-            result.push(ch);
-            escaped = false;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() {
+            // Escaped character - push both and skip
+            result.push(ch as char);
+            result.push(bytes[i + 1] as char);
+            i += 2;
             continue;
         }
-        if ch == '\\' {
-            escaped = true;
-            result.push(ch);
+        if ch == b'$' && i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') {
+            depth += 1;
+            result.push(ch as char);
+            i += 1;
             continue;
         }
-        if ch == '#' {
+        if depth > 0 && (ch == b')' || ch == b'}') {
+            depth -= 1;
+            result.push(ch as char);
+            i += 1;
+            continue;
+        }
+        if ch == b'#' && depth == 0 {
             break;
         }
-        result.push(ch);
+        result.push(ch as char);
+        i += 1;
     }
 
     result
@@ -303,20 +315,52 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
     let mut work = line.to_string();
 
     // Check for override/export/private prefixes
+    // Note: these are only keywords when followed by another keyword or a valid
+    // variable name+operator (not when the word IS the variable name, e.g. "private = g").
+    let is_keyword_prefix = |keyword: &str, rest: &str| -> bool {
+        // After the keyword (with leading whitespace stripped), the remaining text
+        // must NOT start with an assignment operator. If it does, the keyword is
+        // the variable name itself (e.g., `private = g` sets var "private").
+        let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
+        let rest_trimmed = rest.trim_start();
+        if rest_trimmed.is_empty() {
+            return false; // Bare keyword with nothing after = not a keyword prefix
+        }
+        // If next token starts with an assignment op, this is the variable name
+        for op in &ops {
+            if rest_trimmed.starts_with(op) {
+                return false; // "keyword =" → keyword is the variable name
+            }
+        }
+        true
+    };
     loop {
         let trimmed = work.trim_start();
         if trimmed.starts_with("override ") {
-            is_override = true;
-            work = trimmed["override ".len()..].to_string();
-        } else if trimmed.starts_with("export ") {
-            is_export = true;
-            work = trimmed["export ".len()..].to_string();
-        } else if trimmed.starts_with("private ") {
-            is_private = true;
-            work = trimmed["private ".len()..].to_string();
-        } else {
-            break;
+            let after = &trimmed["override ".len()..];
+            if is_keyword_prefix("override", after) {
+                is_override = true;
+                work = after.to_string();
+                continue;
+            }
         }
+        if trimmed.starts_with("export ") {
+            let after = &trimmed["export ".len()..];
+            if is_keyword_prefix("export", after) {
+                is_export = true;
+                work = after.to_string();
+                continue;
+            }
+        }
+        if trimmed.starts_with("private ") {
+            let after = &trimmed["private ".len()..];
+            if is_keyword_prefix("private", after) {
+                is_private = true;
+                work = after.to_string();
+                continue;
+            }
+        }
+        break;
     }
 
     let work = work.trim_start();
@@ -377,9 +421,9 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                 return None;
             }
 
-            // Valid variable name check (no colons in plain variable names;
-            // colons indicate it could be a rule)
-            if name.contains(':') {
+            // Valid variable name check (no colons or spaces in plain variable names;
+            // colons indicate it could be a rule, spaces indicate multiple targets)
+            if name.contains(':') || name.contains(' ') || name.contains('\t') {
                 return None;
             }
 
@@ -470,8 +514,15 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     // Example:  "foo.o bar.o: %.o: %.c"
     //           rest = " %.o: %.c"  →  second colon found at "%.o"
     let rest_trimmed = rest.trim();
-    if let Some(second_colon) = find_bare_colon(rest_trimmed) {
-        let target_pattern_str = rest_trimmed[..second_colon].trim();
+    // Only search for the static-pattern-rule colon in the part before any
+    // inline recipe (`;`).  Otherwise "%.elf: %.c ; :" would incorrectly
+    // treat the `:` from the inline recipe as a static-pattern-rule separator.
+    let rest_before_semi = match find_semicolon(rest_trimmed) {
+        Some(semi) => &rest_trimmed[..semi],
+        None => rest_trimmed,
+    };
+    if let Some(second_colon) = find_bare_colon(rest_before_semi) {
+        let target_pattern_str = rest_before_semi[..second_colon].trim();
         if target_pattern_str.contains('%') {
             let after_second = rest_trimmed[second_colon + 1..].trim();
             let targets: Vec<String> = split_words(targets_str);
@@ -841,33 +892,47 @@ pub fn strip_var_prefixes(s: &str) -> (bool, bool, bool, bool, &str) {
     let mut rest = s.trim();
     loop {
         if let Some(r) = rest.strip_prefix("override") {
-            // Must be followed by whitespace or end of string (word boundary check)
-            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
-                is_override = true;
-                rest = r.trim_start();
-                continue;
+            // Must be followed by whitespace (not end of string: "override" alone = var name)
+            if r.starts_with(|c: char| c.is_ascii_whitespace()) {
+                let trimmed = r.trim_start();
+                // Also check: remaining text must not be empty and must not start with
+                // an assignment operator (which would make "override" the var name).
+                if !trimmed.is_empty() && !trimmed.starts_with(['=', '!', '?', '+', ':']) {
+                    is_override = true;
+                    rest = trimmed;
+                    continue;
+                }
             }
         }
         // Check 'unexport' before 'export' to avoid prefix match issues
         if let Some(r) = rest.strip_prefix("unexport") {
-            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
-                is_unexport = true;
-                rest = r.trim_start();
-                continue;
+            if r.starts_with(|c: char| c.is_ascii_whitespace()) {
+                let trimmed = r.trim_start();
+                if !trimmed.is_empty() && !trimmed.starts_with(['=', '!', '?', '+', ':']) {
+                    is_unexport = true;
+                    rest = trimmed;
+                    continue;
+                }
             }
         }
         if let Some(r) = rest.strip_prefix("export") {
-            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
-                is_export = true;
-                rest = r.trim_start();
-                continue;
+            if r.starts_with(|c: char| c.is_ascii_whitespace()) {
+                let trimmed = r.trim_start();
+                if !trimmed.is_empty() && !trimmed.starts_with(['=', '!', '?', '+', ':']) {
+                    is_export = true;
+                    rest = trimmed;
+                    continue;
+                }
             }
         }
         if let Some(r) = rest.strip_prefix("private") {
-            if r.is_empty() || r.starts_with(|c: char| c.is_ascii_whitespace()) {
-                is_private = true;
-                rest = r.trim_start();
-                continue;
+            if r.starts_with(|c: char| c.is_ascii_whitespace()) {
+                let trimmed = r.trim_start();
+                if !trimmed.is_empty() && !trimmed.starts_with(['=', '!', '?', '+', ':']) {
+                    is_private = true;
+                    rest = trimmed;
+                    continue;
+                }
             }
         }
         break;

@@ -35,7 +35,8 @@ pub struct Executor<'a> {
     /// Suppresses "is up to date" / "Nothing to be done" diagnostics.
     any_recipe_ran: bool,
     /// Intermediate targets that were actually built this run (candidates for deletion).
-    intermediate_built: HashSet<String>,
+    /// Stored as Vec to maintain insertion order (for consistent rm output).
+    intermediate_built: Vec<String>,
     /// Top-level targets (not subject to intermediate deletion even if .INTERMEDIATE).
     top_level_targets: HashSet<String>,
     /// Targets/files marked as "infinitely new" via -W/--what-if.
@@ -91,7 +92,7 @@ impl<'a> Executor<'a> {
             errors: Vec::new(),
             progname,
             any_recipe_ran: false,
-            intermediate_built: HashSet::new(),
+            intermediate_built: Vec::new(),
             top_level_targets: HashSet::new(),
             what_if,
             inherited_vars_stack: Vec::new(),
@@ -160,16 +161,23 @@ impl<'a> Executor<'a> {
             })
             .cloned()
             .collect();
-        for t in to_delete {
-            if Path::new(&t).exists() {
-                if !self.silent {
-                    println!("rm {}", t);
-                }
-                if !self.dry_run {
-                    let _ = fs::remove_file(&t);
-                }
+        // Collect files that actually exist and need to be deleted.
+        let existing: Vec<String> = to_delete.iter()
+            .filter(|t| Path::new(t.as_str()).exists())
+            .cloned()
+            .collect();
+        // GNU Make prints ONE rm command with all files, in the order they were built.
+        if !existing.is_empty() && !self.silent {
+            println!("rm {}", existing.join(" "));
+        }
+        if !self.dry_run {
+            for t in &existing {
+                let _ = fs::remove_file(t);
             }
-            self.intermediate_built.remove(&t);
+        }
+        // Remove deleted (or non-existent) entries from intermediate_built
+        for t in &to_delete {
+            self.intermediate_built.retain(|x| x != t);
         }
     }
 
@@ -287,7 +295,11 @@ impl<'a> Executor<'a> {
         target: &str,
     ) -> (Vec<String>, Vec<String>) {
         // Expand the raw text using auto vars (second expansion).
+        // Set the in_second_expansion flag so that eval() in this context
+        // can detect and reject attempts to create new rules.
+        *self.state.in_second_expansion.borrow_mut() = true;
         let expanded = self.state.expand_with_auto_vars(raw_text, base_auto_vars);
+        *self.state.in_second_expansion.borrow_mut() = false;
         // Split on whitespace, handle '|' as separator for order-only prereqs.
         let mut normal = Vec::new();
         let mut order_only = Vec::new();
@@ -396,6 +408,31 @@ impl<'a> Executor<'a> {
         // Filter .WAIT markers from SE results
         se_expanded_prereqs.retain(|p| p != ".WAIT");
         se_expanded_order_only.retain(|p| p != ".WAIT");
+
+        // Pre-check: if the target exists and none of the prereqs (by effective mtime, which
+        // accounts for deleted intermediates) are newer than the target, skip rebuilding.
+        // This handles the case where intermediate files were deleted after a previous build:
+        // they should not cause an unnecessary rebuild if their sources are still old.
+        // Only applicable for non-phony targets with no SE prereqs and no always-make.
+        if !is_phony && !self.always_make && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
+            if let Some(target_time) = get_mtime(target).or_else(|| {
+                self.find_in_vpath(target).and_then(|f| get_mtime(&f))
+            }) {
+                let any_prereq_newer = all_prereqs.iter().any(|p| {
+                    if p == ".WAIT" { return false; }
+                    if self.what_if.iter().any(|w| w == p) { return true; }
+                    if self.db.is_phony(p) { return true; }
+                    // Use effective_mtime to handle deleted intermediates
+                    match self.effective_mtime(p, 0) {
+                        Some(pt) => pt > target_time,
+                        None => false, // Can't determine mtime → assume not newer
+                    }
+                });
+                if !any_prereq_newer {
+                    return Ok(false);
+                }
+            }
+        }
 
         // Push this target's collected vars onto the inheritance stack.
         let my_target_vars = self.collect_target_vars(target);
@@ -606,7 +643,9 @@ impl<'a> Executor<'a> {
         // Track if this is an intermediate target that was built.
         if let Ok(true) = &result {
             if self.db.is_intermediate(target) {
-                self.intermediate_built.insert(target.to_string());
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
+                }
             }
         }
         result
@@ -1139,6 +1178,13 @@ impl<'a> Executor<'a> {
             let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
             let base_auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
 
+            // For pattern rule SE expansion, GNU Make does not include a file:line prefix
+            // in error messages (unlike explicit rule SE).  Temporarily clear the file context.
+            let saved_file = self.state.current_file.borrow().clone();
+            let saved_line = *self.state.current_line.borrow();
+            *self.state.current_file.borrow_mut() = String::new();
+            *self.state.current_line.borrow_mut() = 0;
+
             if let Some(ref text) = rule.second_expansion_prereqs {
                 // Substitute % in the raw text for the stem before expanding
                 let stem_subst = text.replace('%', stem);
@@ -1152,6 +1198,9 @@ impl<'a> Executor<'a> {
                 order_only.extend(normal);
                 order_only.extend(oo);
             }
+            // Restore file context after pattern rule SE expansion.
+            *self.state.current_file.borrow_mut() = saved_file;
+            *self.state.current_line.borrow_mut() = saved_line;
         }
 
         // Build prerequisites
@@ -1229,7 +1278,9 @@ impl<'a> Executor<'a> {
         if let Ok(true) = &result {
             if self.db.is_intermediate(target) {
                 // Explicitly marked .INTERMEDIATE
-                self.intermediate_built.insert(target.to_string());
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
+                }
             } else if !self.db.is_precious(target)
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
@@ -1239,7 +1290,9 @@ impl<'a> Executor<'a> {
                 let is_explicit = self.top_level_targets.contains(target)
                     || self.db.is_explicitly_mentioned(target);
                 if !is_explicit {
-                    self.intermediate_built.insert(target.to_string());
+                    if !self.intermediate_built.contains(&target.to_string()) {
+                        self.intermediate_built.push(target.to_string());
+                    }
                 }
             }
         }
@@ -1279,7 +1332,13 @@ impl<'a> Executor<'a> {
 
         // Pass 1: all prereqs immediately satisfiable.
         for rule in &all_rules {
-            if rule.recipe.is_empty() && !rule.is_terminal { continue; }
+            // Skip rules with no recipe unless they have SE prereqs (which may produce
+            // errors or provide prerequisites at build time) or are terminal rules.
+            if rule.recipe.is_empty()
+                && !rule.is_terminal
+                && rule.second_expansion_prereqs.is_none()
+                && rule.second_expansion_order_only.is_none()
+            { continue; }
             for pattern_target in &rule.targets {
                 if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
                 if let Some(stem) = match_pattern(pattern_target, target) {
@@ -1319,7 +1378,11 @@ impl<'a> Executor<'a> {
 
         // Pass 2: prereqs can be built via chaining. Terminal rules skipped.
         for rule in &all_rules {
-            if rule.recipe.is_empty() && !rule.is_terminal { continue; }
+            if rule.recipe.is_empty()
+                && !rule.is_terminal
+                && rule.second_expansion_prereqs.is_none()
+                && rule.second_expansion_order_only.is_none()
+            { continue; }
             if rule.is_terminal { continue; }
             for pattern_target in &rule.targets {
                 if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
@@ -1574,13 +1637,21 @@ impl<'a> Executor<'a> {
         if let Some(rules) = self.db.rules.get(target) {
             for rule in rules {
                 for (raw_var_name, var) in &rule.target_specific_vars {
-                    // Expand the variable name using already-collected simple target vars.
+                    // Expand the variable name using already-collected target vars.
                     // This handles `four:VAR$(FOO)=ok` where FOO is itself a target-specific var.
+                    // Include both simple (is_exp=true) and recursive (is_exp=false) staging entries,
+                    // expanding recursive ones immediately so that `VAR$(FOO)` with FOO=x gives VARx.
                     let expanded_var_name: String;
                     let var_name: &str = if raw_var_name.contains('$') {
                         let ctx: HashMap<String, String> = staging.iter()
-                            .filter(|(_, _, is_exp, _, _)| *is_exp)
-                            .map(|(n, v, _, _, _)| (n.clone(), v.clone()))
+                            .map(|(n, v, is_exp, _, _)| {
+                                let val = if *is_exp {
+                                    v.clone()
+                                } else {
+                                    self.state.expand(v)
+                                };
+                                (n.clone(), val)
+                            })
                             .collect();
                         expanded_var_name = self.state.expand_with_auto_vars(raw_var_name, &ctx);
                         &expanded_var_name
@@ -1719,11 +1790,25 @@ impl<'a> Executor<'a> {
     }
 
     /// Apply collected target vars to auto_vars, respecting command-line variable priority.
+    /// Also shadows globally-private variables with empty strings so that recipe expansion
+    /// does not see the global value for `private VAR = val` assignments.
     fn apply_target_vars_to_auto_vars(
         &self,
         target_vars: &HashMap<String, (String, bool, bool)>,
         auto_vars: &mut HashMap<String, String>,
     ) {
+        // First, shadow any globally-private variables that aren't already set
+        // by target-specific vars. This ensures that `private F = g` at global
+        // scope is not visible in recipe expansion (only visible at parse time).
+        for (var_name, var) in &self.db.variables {
+            if var.is_private && !target_vars.contains_key(var_name.as_str()) {
+                // Private global var: make it appear as empty in recipe context.
+                // (Only insert if not already shadowed by auto var like @, <, etc.)
+                if !auto_vars.contains_key(var_name.as_str()) {
+                    auto_vars.insert(var_name.clone(), String::new());
+                }
+            }
+        }
         for (var_name, (value, is_override, _is_private)) in target_vars {
             // Non-override target-specific vars don't override command-line vars
             let is_cmdline = self.db.variables.get(var_name.as_str())
@@ -1733,6 +1818,42 @@ impl<'a> Executor<'a> {
             }
             auto_vars.insert(var_name.clone(), value.clone());
         }
+    }
+
+    /// Compute the "effective mtime" of a target for the purpose of checking if a parent needs rebuild.
+    /// For a target that doesn't exist but is intermediate/deletable, this computes the maximum
+    /// mtime of the target's sources, representing "when would this have been built".
+    /// Returns None if the target doesn't exist and has no known sources.
+    fn effective_mtime(&self, target: &str, depth: usize) -> Option<SystemTime> {
+        // Prevent infinite recursion
+        if depth > 10 { return None; }
+        // If target exists, use its actual mtime
+        if let Some(t) = get_mtime(target).or_else(|| self.find_in_vpath(target).and_then(|f| get_mtime(&f))) {
+            return Some(t);
+        }
+        // Target doesn't exist. If phony, treat as always new (infinite mtime).
+        if self.db.is_phony(target) {
+            return Some(SystemTime::now());
+        }
+        // Look for a rule that would build this target and find its sources' max mtime.
+        // Check explicit rules first.
+        if let Some(rules) = self.db.rules.get(target) {
+            let max_prereq_time = rules.iter()
+                .flat_map(|r| r.prerequisites.iter())
+                .filter_map(|p| self.effective_mtime(p, depth + 1))
+                .max();
+            return max_prereq_time;
+        }
+        // Check pattern rules
+        if let Some((rule, stem)) = self.find_pattern_rule(target) {
+            let max_prereq_time = rule.prerequisites.iter()
+                .filter(|p| p.as_str() != ".WAIT")
+                .map(|p| p.replace('%', &stem))
+                .filter_map(|p| self.effective_mtime(&p, depth + 1))
+                .max();
+            return max_prereq_time;
+        }
+        None
     }
 
     fn needs_rebuild(&self, target: &str, prereqs: &[String], any_prereq_rebuilt: bool) -> bool {
@@ -1772,7 +1893,13 @@ impl<'a> Executor<'a> {
                         if self.db.is_secondary(prereq) {
                             continue;
                         }
-                        continue;
+                        // For non-existent non-phony prereqs (potentially intermediate files
+                        // that were deleted), compute effective mtime from their sources.
+                        // If sources are all older than the target, no rebuild needed.
+                        match self.effective_mtime(prereq, 0) {
+                            Some(eff_t) if eff_t > target_time => return true,
+                            _ => continue,
+                        }
                     }
                 }
             };
@@ -1833,8 +1960,11 @@ impl<'a> Executor<'a> {
             .collect();
         vars.insert("+".to_string(), all_prereqs.join(" "));
 
-        // $? - prerequisites that are newer than target (or target doesn't exist and prereq exists).
-        // GNU Make only includes prereqs that actually exist on disk.
+        // $? - prerequisites that are newer than the target.
+        // Includes prereqs that:
+        //   - exist on disk AND are newer than the target
+        //   - target doesn't exist but prereq exists on disk
+        //   - prereq doesn't exist on disk but was visited/built this make run and target doesn't exist
         let target_time = get_mtime(target);
         let newer: Vec<String> = prereqs.iter()
             .filter(|p| {
@@ -1842,9 +1972,12 @@ impl<'a> Executor<'a> {
                     self.find_in_vpath(p).and_then(|found| get_mtime(&found))
                 });
                 match (target_time, prereq_mtime) {
-                    (_, None) => false,           // prereq doesn't exist: not newer
-                    (None, Some(_)) => true,      // target doesn't exist, prereq exists: newer
+                    (None, Some(_)) => true,       // target doesn't exist, prereq does: newer
                     (Some(tt), Some(pt)) => pt > tt, // both exist: compare times
+                    (_, None) => {
+                        // prereq doesn't exist as file: include if target doesn't exist AND prereq was visited
+                        target_time.is_none() && self.built.contains_key(p.as_str())
+                    }
                     _ => false,
                 }
             })
@@ -1852,8 +1985,27 @@ impl<'a> Executor<'a> {
             .collect();
         vars.insert("?".to_string(), newer.join(" "));
 
-        // $* - stem (for pattern rules)
-        vars.insert("*".to_string(), stem.to_string());
+        // $* - stem
+        // For pattern rules, stem is provided. For explicit rules, compute the stem
+        // by removing the longest suffix of target that appears in .SUFFIXES.
+        let effective_stem = if !stem.is_empty() {
+            stem.to_string()
+        } else {
+            // Find the longest suffix of target that is in .SUFFIXES
+            let mut best_stem = String::new();
+            let mut best_suffix_len = 0;
+            for suffix in &self.db.suffixes {
+                if target.ends_with(suffix.as_str()) && suffix.len() > best_suffix_len {
+                    best_suffix_len = suffix.len();
+                    best_stem = target[..target.len() - suffix.len()].to_string();
+                }
+            }
+            best_stem
+        };
+        vars.insert("*".to_string(), effective_stem.clone());
+        // Update $(*D) and $(*F) with effective stem
+        vars.insert("*D".to_string(), dir_of(&effective_stem));
+        vars.insert("*F".to_string(), file_of(&effective_stem));
 
         // $| - order-only prerequisites (deduplicated, preserving first occurrence order)
         let mut oo_seen = HashSet::new();
@@ -1868,8 +2020,7 @@ impl<'a> Executor<'a> {
         vars.insert("@F".to_string(), file_of(target));
         vars.insert("<D".to_string(), dir_of(&first_prereq));
         vars.insert("<F".to_string(), file_of(&first_prereq));
-        vars.insert("*D".to_string(), dir_of(stem));
-        vars.insert("*F".to_string(), file_of(stem));
+        // $(*D) and $(*F) are already inserted above with effective_stem
 
         vars
     }
@@ -1996,6 +2147,12 @@ impl<'a> Executor<'a> {
         for (lineno, line) in recipe {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
 
+            // Extract prefix flags (@, -, +) from the ORIGINAL recipe line (before expansion).
+            // These flags propagate to ALL sub-lines from the expansion.
+            // For example, `@$(MULTI_LINE_VAR)` silences every line in the expansion,
+            // not just the first one.
+            let (_outer_display, outer_silent, outer_ignore, outer_force) = parse_recipe_prefix(line);
+
             // A recipe line may expand to multiple sub-lines when it contains a
             // multi-line `define` variable.  Split on bare newlines (not preceded
             // by a backslash) and treat each sub-line as an independent recipe
@@ -2005,10 +2162,13 @@ impl<'a> Executor<'a> {
             let sub_lines: Vec<String> = split_recipe_sub_lines(&expanded);
 
             'sub_line_loop: for sub_line in &sub_lines {
-                let (display_line, line_silent, ignore_error, force) = parse_recipe_prefix(sub_line);
+                let (display_line, line_silent, ignore_error, force_sub) = parse_recipe_prefix(sub_line);
+                // Outer flags (from the original recipe line before expansion) propagate to
+                // all sub-lines.  This handles `@$(MULTI)` where MULTI has multiple lines.
+                let force = force_sub || outer_force;
 
-                let effective_silent = line_silent || self.silent || is_silent_target;
-                let effective_ignore = ignore_error || self.ignore_errors;
+                let effective_silent = line_silent || outer_silent || self.silent || is_silent_target;
+                let effective_ignore = ignore_error || outer_ignore || self.ignore_errors;
 
                 // Get the actual command (strip @, -, + prefixes - none of them go to the shell)
                 let cmd = strip_recipe_prefixes(sub_line);

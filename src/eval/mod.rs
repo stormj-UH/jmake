@@ -37,6 +37,10 @@ struct IncludeRuleInfo {
     /// True if this rule should be skipped for include-rebuild purposes
     /// (e.g. double-colon with no prerequisites).
     skippable: bool,
+    /// For pattern rules with multiple target patterns: the sibling target names
+    /// (i.e., the other targets that would be built by the same recipe invocation).
+    /// When this recipe runs for one target, all siblings are also considered attempted.
+    sibling_targets: Vec<String>,
 }
 
 pub struct MakeState {
@@ -55,8 +59,16 @@ pub struct MakeState {
     pub current_line: RefCell<usize>,
     /// Exit status of the last $(shell ...) call, used to set .SHELLSTATUS
     pub last_shell_status: RefCell<i32>,
+    /// Set to true while performing second expansion of prerequisites.
+    /// When eval() is called in this context, it must not create new rules
+    /// (GNU Make error: "prerequisites cannot be defined in recipes").
+    pub in_second_expansion: RefCell<bool>,
     /// Pending includes that couldn't be found during initial read
     pub pending_includes: Vec<PendingInclude>,
+    /// Set of include file names for which a rebuild recipe has already been
+    /// attempted (ran or was considered ran via grouped pattern rules).
+    /// Used to avoid running the same recipe twice for grouped pattern rules.
+    pub include_recipe_ran: HashSet<String>,
 }
 
 /// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
@@ -95,7 +107,9 @@ impl MakeState {
             current_file: RefCell::new(String::new()),
             current_line: RefCell::new(0),
             last_shell_status: RefCell::new(0),
+            in_second_expansion: RefCell::new(false),
             pending_includes: Vec::new(),
+            include_recipe_ran: HashSet::new(),
         };
 
         // Change directory if requested
@@ -128,13 +142,26 @@ impl MakeState {
             implicit_rules::register_implicit_rules(&mut self.db);
         }
 
-        // Read makefiles
-        self.read_makefiles()?;
+        // Print entering-directory if needed (for -w without -C)
+        // Must be BEFORE read_makefiles so $(info ...) at parse time appears after the header.
+        let progname = make_progname();
+        let print_dir = should_print_directory(&self.args);
+        if print_dir && self.args.directory.is_none() {
+            // Already printed at startup for -C; print here for -w without -C
+            let cwd = env::current_dir().unwrap_or_default();
+            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+        }
 
-        // Process any --eval strings
+        // Process any --eval (-E) strings BEFORE reading makefiles.
+        // This matches GNU Make behavior where -E content is prepended to the makefile.
+        // Doing this first ensures rules from -E are available when processing MAKEFILES
+        // env var includes and the default makefile search.
         for eval_str in self.args.eval_strings.clone() {
             self.eval_string(&eval_str)?;
         }
+
+        // Read makefiles (MAKEFILES env var + default/specified makefiles)
+        self.read_makefiles()?;
 
         // Process pending $(eval) calls
         loop {
@@ -145,16 +172,6 @@ impl MakeState {
             for s in pending {
                 self.eval_string(&s)?;
             }
-        }
-
-        // Print entering-directory if needed (for -w without -C)
-        // Must be before resolve_pending_includes so include-rebuild output is wrapped.
-        let progname = make_progname();
-        let print_dir = should_print_directory(&self.args);
-        if print_dir && self.args.directory.is_none() {
-            // Already printed at startup for -C; print here for -w without -C
-            let cwd = env::current_dir().unwrap_or_default();
-            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
         }
 
         // Resolve pending includes (rebuild include files if rules exist)
@@ -272,8 +289,14 @@ impl MakeState {
             Variable::new("/bin/sh".into(), VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".SHELLFLAGS".into(),
             Variable::new("-c".into(), VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert("MAKEFLAGS".into(),
-            Variable::new(self.build_makeflags(), VarFlavor::Recursive, VarOrigin::Default));
+        {
+            let mf = self.build_makeflags();
+            // Also update the process environment so $(shell echo "$MAKEFLAGS") reflects
+            // the canonical merged value from the start.
+            env::set_var("MAKEFLAGS", &mf);
+            self.db.variables.insert("MAKEFLAGS".into(),
+                Variable::new(mf, VarFlavor::Recursive, VarOrigin::Default));
+        }
         // MAKECMDGOALS: the list of targets specified on the command line.
         // Set before reading makefiles so it's available during makefile processing.
         let cmdgoals = self.args.targets.join(" ");
@@ -382,14 +405,13 @@ impl MakeState {
         }
 
         // Append command-line variable assignments after "-- " separator.
-        // GNU Make outputs variables in reverse-insertion order (last cmdline var first),
-        // with deduplication keeping the LAST occurrence (cmdline beats env since cmdline
-        // is added after env MAKEFLAGS is parsed).
+        // GNU Make outputs variables in insertion order (cmdline vars appear before env vars).
+        // args.variables has cmdline entries first (baseline), then env-parsed entries appended.
+        // Iterate forward and keep the first occurrence (cmdline value wins on duplicates).
         if has_vars {
-            // Deduplicate: iterate in reverse, keep first-seen (= last-specified)
             let mut seen_names: HashSet<String> = HashSet::new();
             let mut var_parts: Vec<String> = Vec::new();
-            for (name, value) in variables.iter().rev() {
+            for (name, value) in variables.iter() {
                 // Strip trailing ':' (and '?' '+') from name for dedup key
                 // (handles 'hello:' from 'hello:=world')
                 let key = name.trim_end_matches(|c| c == ':' || c == '?' || c == '+');
@@ -670,11 +692,30 @@ impl MakeState {
                 // Check if this is a variable assignment by parsing the raw line.
                 // If so, handle value expansion based on flavor.
                 let trimmed = line.trim();
-                if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
+
+                // Special case: `define` directives (and `override define`, `export define`).
+                // These look like "define VAR_NAME [OP]" where VAR_NAME may contain variable
+                // references.  We must expand VAR_NAME at this point (first expansion), but NOT
+                // treat the line as a regular variable assignment.  `try_parse_variable_assignment`
+                // would misparse e.g. `define $(NAME) =` as `variable("define $(NAME)") = ""`.
+                //
+                // Identifying a define directive here: the line (after stripping optional
+                // `override`/`export` prefixes) starts with the word `define` followed by a
+                // space/tab OR is exactly `define`, AND what follows after `define` is NOT a
+                // bare assignment operator (which would make it a regular variable named "define").
+                if let Some(define_expanded) = try_expand_define_name(&trimmed, self) {
+                    define_expanded
+                } else if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
                     if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: _, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple => {
-                                // Immediate expansion: expand the whole line
+                                // Set directly without re-parsing to preserve '#' in values
+                                let expanded_name = self.expand(&raw_name);
+                                let expanded_value = self.expand(&raw_value);
+                                if raw_target.is_none() {
+                                    self.set_variable(&expanded_name, &expanded_value, &VarFlavor::Simple, raw_is_override, raw_is_export);
+                                    continue;
+                                }
                                 self.expand(&line)
                             }
                             _ => {
@@ -953,6 +994,22 @@ impl MakeState {
                         }
                     } else {
                         self.set_variable(&name, &value, &flavor, is_override, is_export);
+                        // Handle unexport on global variable assignments.
+                        // `unexport FOO=bar` sets FOO=bar but marks it as NOT exported.
+                        if is_unexport {
+                            if let Some(var) = self.db.variables.get_mut(&name) {
+                                var.export = Some(false);
+                            }
+                        }
+                        // Handle private on global variable assignments.
+                        // `private FOO = bar` sets FOO but marks it as private (not inherited
+                        // by prerequisites; in the global context this means targets should
+                        // not see it from the global scope—treated as an implicit unexport).
+                        if is_private {
+                            if let Some(var) = self.db.variables.get_mut(&name) {
+                                var.is_private = true;
+                            }
+                        }
                     }
                 }
                 ParsedLine::Include { paths, ignore_missing } => {
@@ -972,6 +1029,9 @@ impl MakeState {
                         let expanded = self.expand(path_pattern);
                         let files: Vec<String> = parser::split_words(&expanded);
                         for file in files {
+                            // Mark included files as explicitly mentioned so they are
+                            // not treated as intermediate targets (sv63484).
+                            self.db.explicitly_mentioned.insert(file.clone());
                             let file_path = self.find_include_file(&file);
                             match file_path {
                                 Some(p) => {
@@ -1074,14 +1134,17 @@ impl MakeState {
                         let fname = parser.filename.to_string_lossy();
                         eprintln!("{}:{}: extraneous text after 'define' directive", fname, lineno);
                     }
+                    // Expand the variable name (it may contain variable references like $(NAME))
+                    let expanded_name = self.expand(&name);
+                    let expanded_name = expanded_name.trim().to_string();
                     // Empty variable name is a fatal error
-                    if name.is_empty() {
+                    if expanded_name.is_empty() {
                         let fname = parser.filename.to_string_lossy();
                         eprintln!("{}:{}: *** empty variable name.  Stop.", fname, lineno);
                         return Err(String::new());
                     }
                     parser.in_define = true;
-                    parser.define_name = name;
+                    parser.define_name = expanded_name;
                     parser.define_flavor = flavor;
                     parser.define_override = is_override;
                     parser.define_export = is_export;
@@ -1356,6 +1419,11 @@ impl MakeState {
                         }
                         existing.recipe = rule.recipe.clone();
                     }
+                    // Preserve static_stem: if the new rule has a static stem (from a
+                    // static pattern rule) and the existing rule doesn't, copy it.
+                    if existing.static_stem.is_empty() && !rule.static_stem.is_empty() {
+                        existing.static_stem = rule.static_stem.clone();
+                    }
                     // Merge target-specific vars (append to list for multiple += support)
                     for (k, v) in &rule.target_specific_vars {
                         existing.target_specific_vars.push((k.clone(), v.clone()));
@@ -1508,24 +1576,31 @@ impl MakeState {
         let mut seen_debug: std::collections::HashSet<String> = std::collections::HashSet::new();
         self.args.debug.retain(|d| seen_debug.insert(d.clone()));
 
-        // Deduplicate variables (keep last occurrence: cmdline beat env since cmdline is added last).
+        // Deduplicate variables: keep LAST occurrence of each variable name, preserving order.
+        // This means cmdline vars (which come early in the list from cmdline_args baseline)
+        // may be replaced by later MAKEFLAGS-parsed entries, but their POSITION is kept.
+        // Actually: we want the output order to match what build_makeflags_from_args expects
+        // (which uses iter().rev() to put cmdline first). So we keep the list in its natural
+        // order: env vars first (from cmdline_args baseline), cmdline-specified vars next.
+        // For dedup: keep first occurrence only.
         let mut seen_var_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut deduped_vars: Vec<(String, String)> = Vec::new();
-        for (name, value) in self.args.variables.iter().rev() {
+        for (name, value) in self.args.variables.iter() {
             let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
             if seen_var_names.insert(key.to_string()) {
                 deduped_vars.push((name.clone(), value.clone()));
             }
         }
-        deduped_vars.reverse();
         self.args.variables = deduped_vars;
 
         // Rebuild MAKEFLAGS from the updated args in canonical format.
         // This ensures single-char flags are sorted and properly bundled.
         let new_makeflags = self.build_makeflags_from_args(&self.args.variables.clone());
         if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
-            var.value = new_makeflags;
+            var.value = new_makeflags.clone();
         }
+        // Update the process environment so $(shell echo "$MAKEFLAGS") returns the current value.
+        env::set_var("MAKEFLAGS", &new_makeflags);
 
         // Update .INCLUDE_DIRS to reflect current include_dirs
         // GNU Make's .INCLUDE_DIRS shows the effective include path (excluding special "-" entry)
@@ -1627,7 +1702,7 @@ impl MakeState {
                             eprintln!("{}:{}: {}: No such file or directory",
                                 pi.parent, pi.lineno, pi.file);
                         }
-                        return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
+                        return Err(String::new());
                     }
                     continue;
                 }
@@ -1655,11 +1730,24 @@ impl MakeState {
                                 eprintln!("{}:{}: {}: No such file or directory",
                                     pi.parent, pi.lineno, pi.file);
                             }
-                            return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
+                            return Err(String::new());
                         }
                         // Optional include: silently skip
                     }
-                    Some(IncludeRuleInfo { recipe, source_file, prerequisites, .. }) => {
+                    Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, .. }) => {
+                        // Check if this file's recipe was already run by a sibling grouped
+                        // pattern target (e.g. `%_a.mk %_b.mk:` ran for inc_a.mk already).
+                        if self.include_recipe_ran.contains(&pi.file) {
+                            // Recipe already ran; treat as "file not created" path.
+                            if !pi.ignore_missing {
+                                if !pi.parent.is_empty() {
+                                    eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                        pi.parent, pi.lineno, pi.file);
+                                }
+                                return Err(String::new());
+                            }
+                            // Optional include: silently skip
+                        } else {
                         // First, check/build prerequisites
                         let mut visited = HashSet::new();
                         visited.insert(pi.file.clone());
@@ -1697,6 +1785,12 @@ impl MakeState {
                                         return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
                                     }
                                 } else {
+                                    // Mark this target and all siblings as having had their
+                                    // recipe run, so that sibling targets don't re-run it.
+                                    self.include_recipe_ran.insert(pi.file.clone());
+                                    for sib in &sibling_targets {
+                                        self.include_recipe_ran.insert(sib.clone());
+                                    }
                                     // Run the recipe to build the file
                                     let built = self.run_include_recipe(
                                         &pi.file,
@@ -1744,6 +1838,7 @@ impl MakeState {
                                 }
                             }
                         }
+                        } // end else (not in include_recipe_ran)
                     }
                 }
             }
@@ -1840,6 +1935,7 @@ impl MakeState {
                         recipe_lineno: 0,
                         prerequisites: Vec::new(),
                         skippable: true,
+                        sibling_targets: Vec::new(),
                     });
                 }
                 // A rule that has a recipe or has prerequisites counts
@@ -1852,6 +1948,7 @@ impl MakeState {
                         recipe_lineno: ln,
                         prerequisites: rule.prerequisites.clone(),
                         skippable: false,
+                        sibling_targets: Vec::new(),
                     });
                 }
             }
@@ -1876,12 +1973,19 @@ impl MakeState {
                         let prereqs: Vec<String> = rule.prerequisites.iter()
                             .map(|p| p.replace('%', &stem))
                             .collect();
+                        // Compute sibling targets: other patterns in the same rule
+                        // that also match via the same stem (for grouped pattern rules).
+                        let siblings: Vec<String> = rule.targets.iter()
+                            .filter(|p2| p2.as_str() != pat)
+                            .map(|p2| p2.replace('%', &stem))
+                            .collect();
                         return Some(IncludeRuleInfo {
                             recipe,
                             source_file: src,
                             recipe_lineno: ln,
                             prerequisites: prereqs,
                             skippable: false,
+                            sibling_targets: siblings,
                         });
                     }
                 }
@@ -2069,6 +2173,119 @@ fn suffix_to_pattern_rule(target: &str, rule: &Rule, suffixes: &[String]) -> Opt
     }
 
     None
+}
+
+/// Try to detect and expand the variable name in a `define` directive line.
+///
+/// Returns `Some(expanded_line)` if the line is a `define` directive (possibly
+/// prefixed with `override` and/or `export`), where the variable name (the token
+/// immediately after the `define` keyword) has been expanded.
+///
+/// Returns `None` if the line is not a define directive (e.g. it's a regular
+/// assignment like `define = value`, or starts with some other keyword).
+///
+/// This is called before `try_parse_variable_assignment` so that lines like
+/// `define $(NAME) =` are handled as define directives (with $(NAME) expanded)
+/// rather than misinterpreted as assignments with name `define $(NAME)`.
+fn try_expand_define_name(trimmed: &str, state: &MakeState) -> Option<String> {
+    // Strip optional `override`/`export` prefixes
+    let mut prefix = String::new();
+    let mut work = trimmed;
+    loop {
+        if work.starts_with("override ") || work.starts_with("override\t") {
+            let n = "override".len();
+            prefix.push_str("override ");
+            work = work[n..].trim_start();
+        } else if work.starts_with("export ") || work.starts_with("export\t") {
+            let n = "export".len();
+            prefix.push_str("export ");
+            work = work[n..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    // Must start with exactly "define" (followed by space/tab) or be exactly "define"
+    let rest_after_define = if work.starts_with("define ") || work.starts_with("define\t") {
+        work["define".len()..].trim_start()
+    } else if work == "define" {
+        ""
+    } else {
+        return None;
+    };
+
+    // Assignment operators that make this NOT a define directive but a regular assignment
+    // (e.g. `define = value` defines a variable named "define").
+    let assignment_ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
+    let starts_with_op = assignment_ops.iter().any(|op| {
+        rest_after_define.starts_with(op) && (
+            rest_after_define.len() == op.len()
+            || rest_after_define[op.len()..].starts_with(' ')
+            || rest_after_define[op.len()..].starts_with('\t')
+        )
+    });
+    // `define : recipe` → rule with target named "define", not a define directive
+    let starts_with_rule_colon = rest_after_define.starts_with(':')
+        && !rest_after_define.starts_with(":=")
+        && !rest_after_define.starts_with("::=")
+        && !rest_after_define.starts_with(":::=");
+
+    if starts_with_op || starts_with_rule_colon {
+        return None;
+    }
+
+    // This is a define directive.  Expand ONLY the variable name token.
+    // rest_after_define is `VAR_NAME [OP [EXTRANEOUS]]`.
+    // We must expand variable references in VAR_NAME but keep OP and anything
+    // after it verbatim (so that `has_extraneous` detection still works in
+    // parse_define_start).
+    //
+    // Find the variable name: it is everything up to the first whitespace or
+    // the first occurrence of an assignment operator that is immediately adjacent
+    // to the name (e.g. `NAME=` or `NAME:=`).
+    let var_name_end = {
+        // Scan for the end of the name token: stop at unparenthesized whitespace
+        // or when an assignment op starts at depth 0.
+        // Track parenthesis depth to correctly handle names like `$(subst e,e,$(NAME))`.
+        let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
+        let bytes = rest_after_define.as_bytes();
+        let mut end = 0;
+        let mut paren_depth: i32 = 0;
+        while end < bytes.len() {
+            // Track $( and ${ as opening delimiters
+            if bytes[end] == b'$' && end + 1 < bytes.len()
+                && (bytes[end+1] == b'(' || bytes[end+1] == b'{')
+            {
+                paren_depth += 1;
+                end += 2;
+                continue;
+            }
+            match bytes[end] {
+                b'(' | b'{' if paren_depth > 0 => { paren_depth += 1; }
+                b')' | b'}' if paren_depth > 0 => { paren_depth -= 1; }
+                _ => {}
+            }
+            if paren_depth == 0 {
+                if bytes[end].is_ascii_whitespace() {
+                    break;
+                }
+                // Check if any op starts here (name adjacent to op, e.g. `NAME=`)
+                let suffix = &rest_after_define[end..];
+                if ops.iter().any(|op| suffix.starts_with(op)) {
+                    break;
+                }
+            }
+            end += 1;
+        }
+        end
+    };
+    let var_name_raw = &rest_after_define[..var_name_end];
+    let after_name = &rest_after_define[var_name_end..]; // " = VALUE" or "= VALUE" etc.
+
+    let expanded_name = state.expand(var_name_raw);
+
+    // Reconstruct: "define EXPANDED_NAME<rest>" (plus prefix if any)
+    Some(format!("{}define {}{}", prefix, expanded_name, after_name))
 }
 
 /// Extract the `override`/`export`/`private` prefix(es) from a raw variable

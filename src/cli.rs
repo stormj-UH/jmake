@@ -596,48 +596,47 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
             continue;
         }
 
-        // First token without '-' prefix: either bundled single-char flags (e.g. "erR")
+        // Token without '-' prefix: either bundled single-char flags (e.g. "erR", "B")
         // OR a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
         // Check if it contains '=' to distinguish variable from flags.
-        if first_token {
-            first_token = false;
-            if token.contains('=') {
-                // This is a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
-                // Add to variables so it's included in MAKEFLAGS output.
-                if let Some(eq_pos) = token.find('=') {
-                    let name = token[..eq_pos].to_string();
-                    let value = token[eq_pos+1..].to_string();
-                    result.variables.push((name, value));
-                }
-            } else {
-                // Bundled single-char flags
-                for ch in token.chars() {
-                    match ch {
-                        'B' => result.always_make = true,
-                        'e' => result.environment_overrides = true,
-                        'i' => result.ignore_errors = true,
-                        'k' => result.keep_going = true,
-                        'n' => {
-                            result.dry_run = true;
-                            result.just_print = true;
-                        }
-                        'q' => result.question = true,
-                        'r' => result.no_builtin_rules = true,
-                        'R' => result.no_builtin_variables = true,
-                        's' => { result.silent = true; result.no_silent = false; }
-                        'S' => result.keep_going = false,
-                        't' => result.touch = true,
-                        'w' => {
-                            result.print_directory = true;
-                            result.no_print_directory = false;
-                        }
-                        'L' => result.check_symlink_times = true,
-                        'd' => {
-                            result.debug_short = true;
-                            result.debug.push("b".to_string());
-                        }
-                        _ => {}
+        // NOTE: GNU Make allows multiple bundled-flag tokens, e.g. "i B" means flags i AND B.
+        first_token = false;
+        if token.contains('=') {
+            // This is a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
+            // Add to variables so it's included in MAKEFLAGS output.
+            if let Some(eq_pos) = token.find('=') {
+                let name = token[..eq_pos].to_string();
+                let value = token[eq_pos+1..].to_string();
+                result.variables.push((name, value));
+            }
+        } else {
+            // Bundled single-char flags
+            for ch in token.chars() {
+                match ch {
+                    'B' => result.always_make = true,
+                    'e' => result.environment_overrides = true,
+                    'i' => result.ignore_errors = true,
+                    'k' => result.keep_going = true,
+                    'n' => {
+                        result.dry_run = true;
+                        result.just_print = true;
                     }
+                    'q' => result.question = true,
+                    'r' => result.no_builtin_rules = true,
+                    'R' => result.no_builtin_variables = true,
+                    's' => { result.silent = true; result.no_silent = false; }
+                    'S' => result.keep_going = false,
+                    't' => result.touch = true,
+                    'w' => {
+                        result.print_directory = true;
+                        result.no_print_directory = false;
+                    }
+                    'L' => result.check_symlink_times = true,
+                    'd' => {
+                        result.debug_short = true;
+                        result.debug.push("b".to_string());
+                    }
+                    _ => {}
                 }
             }
         }

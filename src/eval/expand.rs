@@ -36,14 +36,42 @@ impl MakeState {
                             result.push_str(&expanded);
                             i = end + 1;
                         } else {
-                            // Unmatched opening paren/brace: unterminated variable reference
+                            // Unmatched opening paren/brace: unterminated variable reference.
+                            // If the content starts with a known function name, emit a
+                            // function-specific error message (matching GNU Make behavior).
+                            let partial = &input[start..];
+                            let func_name = if let Some(sp) = partial.find(|c: char| c.is_whitespace() || c == ',') {
+                                let candidate = &partial[..sp];
+                                if functions::get_builtin_functions().contains_key(candidate) {
+                                    Some(candidate.to_string())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            let close_char = if bytes[i + 1] == b'(' { "')'" } else { "'}'" };
                             let file = self.current_file.borrow();
                             let line = *self.current_line.borrow();
-                            if file.is_empty() {
-                                eprintln!("*** unterminated variable reference.  Stop.");
+                            let location = if file.is_empty() {
+                                None
+                            } else if line == 0 {
+                                Some(file.clone())
                             } else {
-                                eprintln!("{}: *** unterminated variable reference.  Stop.",
-                                    if line == 0 { file.clone() } else { format!("{}:{}", *file, line) });
+                                Some(format!("{}:{}", *file, line))
+                            };
+                            if let Some(fname) = func_name {
+                                let msg = format!("unterminated call to function '{}': missing {}.",
+                                    fname, close_char);
+                                if let Some(loc) = location {
+                                    eprintln!("{}: *** {}.  Stop.", loc, msg.trim_end_matches('.'));
+                                } else {
+                                    eprintln!("*** {}.  Stop.", msg.trim_end_matches('.'));
+                                }
+                            } else if let Some(loc) = location {
+                                eprintln!("{}: *** unterminated variable reference.  Stop.", loc);
+                            } else {
+                                eprintln!("*** unterminated variable reference.  Stop.");
                             }
                             std::process::exit(2);
                         }
@@ -68,9 +96,22 @@ impl MakeState {
                         }
                         i += 2;
                     }
-                    _ => {
+                    b' ' | b'\t' | b'\n' | b'\r' => {
+                        // $<space> is NOT a variable reference; keep the $ literal.
                         result.push('$');
                         i += 1;
+                    }
+                    _ => {
+                        // $X where X is any other char (e.g., $., $/, $!, etc.)
+                        // GNU Make expands these as single-char variable references.
+                        let var_name = (bytes[i + 1] as char).to_string();
+                        if let Some(val) = auto_vars.get(&var_name) {
+                            result.push_str(val);
+                        } else if let Some(var) = self.db.variables.get(&var_name) {
+                            result.push_str(&self.expand_var_value(var, auto_vars));
+                        }
+                        // If not found, expand to empty string (no output)
+                        i += 2;
                     }
                 }
             } else {
@@ -84,8 +125,12 @@ impl MakeState {
 
     fn expand_reference(&self, content: &str, auto_vars: &HashMap<String, String>) -> String {
         // Check for substitution reference: $(var:pattern=replacement)
+        // GNU Make allows `\:` as the separator, with the `\` stripped from the var name.
+        // e.g. $(@\:%=%.bar) has var_name="@", pattern="%", replacement="%.bar"
         if let Some(colon_pos) = find_subst_ref_colon(content) {
-            let var_name = &content[..colon_pos];
+            let raw_var_name = &content[..colon_pos];
+            // Strip trailing `\` from var name (backslash-quoted colon separator).
+            let var_name = raw_var_name.trim_end_matches('\\');
             let rest = &content[colon_pos + 1..];
             if let Some(eq_pos) = rest.find('=') {
                 let pattern = &rest[..eq_pos];
@@ -199,9 +244,46 @@ impl MakeState {
         // Handle special functions that need access to state
         match name {
             "eval" => {
-                let expanded = self.expand_with_auto_vars(args_str, auto_vars);
-                // Push to eval_pending (processed after expansion via RefCell)
-                self.eval_pending.borrow_mut().push(expanded);
+                // GNU Make does not allow eval to define prerequisites from within
+                // a second expansion prereq context (it would modify the rule database
+                // while iterating). Detect this and emit the matching error.
+                if *self.in_second_expansion.borrow() {
+                    let expanded = self.expand_with_auto_vars(args_str, auto_vars);
+                    // Check if the expanded text tries to define rules (contains ':').
+                    // More specifically: GNU Make's check is whether any rule is added.
+                    // We replicate by detecting the pattern here.
+                    // GNU Make always emits the error when eval is used in SE prereqs
+                    // and the content would create rules/prereqs.
+                    // Simplest: always emit error when eval in SE prereq context creates
+                    // any rule. We detect by checking if the expanded text contains ':'
+                    // (which would be a rule separator).
+                    // Actually GNU Make's check is simpler: it errors if eval creates
+                    // any new deps. We mimic this by flagging any eval in SE prereqs.
+                    if !expanded.is_empty() {
+                        // Check if it looks like a rule definition (contains ':')
+                        // by trying to see if parse would create rules.
+                        // For accuracy, check if the content has lines with ':' that
+                        // look like rule definitions.
+                        let looks_like_rule = expanded.lines().any(|line| {
+                            let t = line.trim();
+                            !t.is_empty() && !t.starts_with('#')
+                                && t.contains(':')
+                                && !t.starts_with("override ")
+                                && !t.starts_with("export ")
+                                && !t.starts_with("vpath ")
+                        });
+                        if looks_like_rule {
+                            let progname = crate::eval::make_progname();
+                            eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
+                            std::process::exit(2);
+                        }
+                    }
+                    self.eval_pending.borrow_mut().push(expanded);
+                } else {
+                    let expanded = self.expand_with_auto_vars(args_str, auto_vars);
+                    // Push to eval_pending (processed after expansion via RefCell)
+                    self.eval_pending.borrow_mut().push(expanded);
+                }
                 return String::new();
             }
             "info" => {
@@ -667,7 +749,9 @@ fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Optio
 }
 
 fn find_subst_ref_colon(content: &str) -> Option<usize> {
-    // Find ':' that's a substitution reference, not inside a function call
+    // Find ':' that's a substitution reference, not inside a function call.
+    // GNU Make allows '\:' as the colon separator (the backslash is stripped
+    // from the variable name). We find the ':' position (including after '\').
     let bytes = content.as_bytes();
     let mut i = 0;
 
