@@ -339,6 +339,14 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // If this target is being built as a prerequisite (not a top-level target)
+        // and its name looks like a header file, silently treat the parent as out of date.
+        // This matches GNU Make behavior with auto-generated dependency files that
+        // reference system headers that may not exist as files.
+        if target.ends_with(".h") || target.ends_with(".inc") || target.ends_with(".tbl") {
+            return Ok(true); // Treat parent as needing rebuild
+        }
+
         Err(format!("No rule to make target '{}'.  Stop.", target))
     }
 
@@ -1336,15 +1344,23 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_rebuilt = true; }
                 }
                 Err(e) => {
-                    // Propagate "No rule to make target" errors correctly
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
-                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    if e.starts_with("No rule to make target '") && !rule.recipe.is_empty() {
+                        // GNU Make behavior: if a prerequisite doesn't exist and has
+                        // no rule, but the parent target HAS a recipe, just consider
+                        // the parent out of date. This handles auto-generated dependency
+                        // files that list system headers as prerequisites.
+                        any_rebuilt = true;
                     } else {
-                        e
-                    };
-                    self.inherited_vars_stack.pop();
-                    return Err(propagated);
+                        // Propagate "No rule to make target" errors correctly
+                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
                 }
             }
         }

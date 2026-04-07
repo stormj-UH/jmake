@@ -1699,8 +1699,13 @@ impl MakeState {
                 continue;
             }
 
-            // Set default target
-            if self.db.default_target.is_none() && !target.starts_with('.') && !target.contains('%') {
+            // Set default target.
+            // Skip special targets (those starting with '.' but NOT containing '/',
+            // like .PHONY, .DEFAULT, etc.).  File targets like ./foo or ../bar start
+            // with '.' but contain '/' and are valid default targets.
+            // Also skip pattern rules (contain '%').
+            let is_special_target = target.starts_with('.') && !target.contains('/');
+            if self.db.default_target.is_none() && !is_special_target && !target.contains('%') {
                 self.db.default_target = Some(target.clone());
             }
         }
