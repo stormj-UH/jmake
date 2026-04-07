@@ -15,6 +15,7 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 indexmap = "2"
 filetime = "0.2"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

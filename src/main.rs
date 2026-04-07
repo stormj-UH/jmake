@@ -9,10 +9,14 @@ mod cli;
 mod types;
 mod database;
 mod implicit_rules;
+mod signal_handler;
 
 use std::process;
 
 fn main() {
+    // Install SIGTERM handler early so we can clean up temp files on signal.
+    signal_handler::install_sigterm_handler();
+
     let args = cli::parse_args();
 
     if args.version {
@@ -27,14 +31,18 @@ fn main() {
 
     let result = state.run();
 
-    // Clean up temp stdin file if we created one (and re-exec didn't happen).
-    // On re-exec, the temp file is preserved for the re-exec'd process to read.
-    // On normal exit (success or error after run), we can clean it up.
-    // Note: if --temp-stdin was given, the file was created by our parent; don't delete it here.
-    if state.args.temp_stdin.is_none() {
-        if let Some(ref tp) = state.stdin_temp_path {
-            let _ = std::fs::remove_file(tp);
-        }
+    // Clean up temp stdin file when run() returns normally (re-exec didn't happen).
+    // If we're the re-exec'd process (args.temp_stdin is set), we are the final
+    // invocation and must clean up the file passed via --temp-stdin.
+    // If we're the original process (stdin_temp_path is set), run() would have
+    // called exec() and replaced us if a re-exec was needed, so if we reach here,
+    // no re-exec happened and we should clean up.
+    let temp_file = state.args.temp_stdin
+        .clone()
+        .or_else(|| state.stdin_temp_path.clone());
+    if let Some(ref tp) = temp_file {
+        let _ = std::fs::remove_file(tp);
+        signal_handler::clear_temp_stdin_path();
     }
 
     match result {

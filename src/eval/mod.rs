@@ -747,6 +747,10 @@ impl MakeState {
                     let _ = e;
                     return Err(String::new());
                 }
+                // Register temp file path with signal handler so SIGTERM can clean it up.
+                crate::signal_handler::set_temp_stdin_path(
+                    &temp_path.to_string_lossy()
+                );
                 self.stdin_temp_path = Some(temp_path);
                 raw
             };
@@ -943,9 +947,18 @@ impl MakeState {
                     if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: _, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple => {
-                                // Set directly without re-parsing to preserve '#' in values
-                                let expanded_name = self.expand(&raw_name);
-                                let expanded_value = self.expand(&raw_value);
+                                // For :=, expand and set directly. Strip comments from the value
+                                // first (handles `#` after closing `)` as a comment, `\#` → `#`
+                                // at top level, while preserving `#` inside `$(...)` args).
+                                let comment_stripped = parser::strip_comment(trimmed);
+                                let stripped_parsed = parser::try_parse_variable_assignment(&comment_stripped);
+                                let (stripped_name, stripped_value) = if let Some(ParsedLine::VariableAssignment { name: sn, value: sv, .. }) = stripped_parsed {
+                                    (sn, sv)
+                                } else {
+                                    (raw_name.clone(), raw_value.clone())
+                                };
+                                let expanded_name = self.expand(&stripped_name);
+                                let expanded_value = self.expand(&stripped_value);
                                 if raw_target.is_none() {
                                     self.set_variable(&expanded_name, &expanded_value, &VarFlavor::Simple, raw_is_override, raw_is_export);
                                     continue;
@@ -2317,9 +2330,13 @@ impl MakeState {
         shell: &str, shell_flags: &str, silent: bool,
         source_file: &str,
     ) -> Result<(), String> {
+        use std::os::unix::process::ExitStatusExt;
+
         // Set up automatic variables for recipe expansion ($@ = target)
         let mut auto_vars = HashMap::new();
         auto_vars.insert("@".to_string(), target.to_string());
+
+        let progname = make_progname();
 
         for (lineno, cmd_template) in recipe {
             let mut cmd = cmd_template.clone();
@@ -2340,18 +2357,47 @@ impl MakeState {
             if !silent && !cmd_silent && !expanded_cmd.is_empty() {
                 println!("{}", expanded_cmd);
             }
+
+            // Set up the SIGTERM message for this recipe line.
+            // If jmake receives SIGTERM while waiting for the child, the signal
+            // handler will print this message and clean up the temp stdin file.
+            let term_msg = format!(
+                "{}: *** [{}:{}: {}] Terminated\n",
+                progname, source_file, lineno, target
+            );
+            crate::signal_handler::set_term_message(&term_msg);
+
             let status = std::process::Command::new(shell)
                 .arg(shell_flags)
                 .arg(&expanded_cmd)
                 .status();
+
+            // Clear the term message after the command completes.
+            crate::signal_handler::clear_term_message();
+
             match status {
                 Ok(s) if s.success() => {}
                 Ok(s) => {
-                    let code = s.code().unwrap_or(1);
-                    // Error format: [source_file:lineno: target] Error N
-                    // Caller is responsible for printing the "*** [...]" error message.
-                    if !ignore_error {
-                        return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
+                    // Check if killed by signal
+                    if let Some(sig) = s.signal() {
+                        if !ignore_error {
+                            // Signal names for common signals
+                            let sig_name = match sig {
+                                libc::SIGTERM => "Terminated",
+                                libc::SIGINT => "Interrupt",
+                                libc::SIGHUP => "Hangup",
+                                libc::SIGKILL => "Killed",
+                                _ => "Signal",
+                            };
+                            return Err(format!("[{}:{}: {}] {}", source_file, lineno, target, sig_name));
+                        }
+                    } else {
+                        let code = s.code().unwrap_or(1);
+                        // Error format: [source_file:lineno: target] Error N
+                        // Caller is responsible for printing the "*** [...]" error message.
+                        if !ignore_error {
+                            return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
+                        }
                     }
                 }
                 Err(e) => {
