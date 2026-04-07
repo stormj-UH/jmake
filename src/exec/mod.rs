@@ -261,6 +261,12 @@ impl<'a> Executor<'a> {
         // ------------------------------------------------------------------
         let plans = self.collect_plans(targets)?;
 
+        // DEBUG: show collected plans
+        eprintln!("[DBG] collect_plans returned {} plans:", plans.len());
+        for (k, v) in &plans {
+            eprintln!("[DBG]   plan {:?}: needs_rebuild={}, recipe_lines={}", k, v.needs_rebuild, v.recipe.len());
+        }
+
         // Store plans so build_job_from_plan can look them up.
         self.parallel_plans = Some(plans);
 
@@ -298,6 +304,10 @@ impl<'a> Executor<'a> {
 
         scheduler.find_initial_ready(targets);
 
+        // DEBUG: show initial ready queue
+        eprintln!("[DBG] initial ready_queue: {:?}", scheduler.ready_queue);
+        eprintln!("[DBG] initial states: {:?}", scheduler.states.keys().collect::<Vec<_>>());
+
         // ------------------------------------------------------------------
         // Phase 3: Scheduler main loop
         // ------------------------------------------------------------------
@@ -322,11 +332,13 @@ impl<'a> Executor<'a> {
 
                 match job {
                     Some(j) => {
+                        eprintln!("[DBG] launching job: {:?}", target);
                         scheduler.states.insert(target.clone(), TargetState::Running);
                         scheduler.running_count += 1;
                         scheduler.send_job(j);
                     }
                     None => {
+                        eprintln!("[DBG] no-recipe target: {:?}", target);
                         // No recipe or not needed — complete immediately without
                         // going through a worker thread.
                         // We mark it done and propagate to dependents directly.
@@ -3408,26 +3420,31 @@ impl<'a> Executor<'a> {
     }
 
     fn target_has_recipe(&self, target: &str) -> bool {
-        // A "real" recipe has at least one non-empty line after stripping
-        // whitespace. An empty inline recipe (`target: prereqs ;` with nothing
-        // after the semicolon) does NOT count as having a recipe for the purposes
-        // of "is up to date" vs "Nothing to be done" messages.
-        let recipe_is_real = |recipe: &[(usize, String)]| -> bool {
-            recipe.iter().any(|(_, line)| {
+        // A "real" recipe either:
+        //   (a) has at least one non-empty line after stripping whitespace, OR
+        //   (b) has an inline recipe marker (semicolon in the rule line), even
+        //       if the text after the semicolon is empty (`target: ;`).
+        // GNU Make treats `target: ;` as having a recipe, so it prints
+        // "'target' is up to date" rather than "Nothing to be done".
+        let rule_has_recipe = |rule: &crate::types::Rule| -> bool {
+            if rule.has_inline_recipe_marker {
+                return true;
+            }
+            rule.recipe.iter().any(|(_, line)| {
                 let stripped = strip_recipe_prefixes(line);
                 !stripped.trim().is_empty()
             })
         };
         if let Some(rules) = self.db.rules.get(target) {
             for rule in rules {
-                if recipe_is_real(&rule.recipe) {
+                if rule_has_recipe(rule) {
                     return true;
                 }
             }
         }
         // Check pattern rules
         if let Some((rule, _)) = self.find_pattern_rule(target) {
-            if recipe_is_real(&rule.recipe) {
+            if rule_has_recipe(&rule) {
                 return true;
             }
         }

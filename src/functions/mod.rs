@@ -264,9 +264,43 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let mut results = Vec::new();
     for pattern in patterns {
         let mut matches = Vec::new();
+        // Extract the directory prefix from the pattern to preserve it in results.
+        // e.g., pattern "./foo*" → prefix "./", pattern "dir/foo*" → prefix "dir/"
+        // GNU Make preserves the directory prefix from the pattern in its output.
+        let prefix = {
+            let p = std::path::Path::new(pattern);
+            if let Some(parent) = p.parent() {
+                let ps = parent.to_string_lossy();
+                if ps.is_empty() || ps == "." {
+                    // Pattern has no explicit dir prefix, or just "./" vs no prefix.
+                    // Check if the pattern literally starts with "./"
+                    if pattern.starts_with("./") {
+                        "./"
+                    } else {
+                        ""
+                    }
+                } else {
+                    // Pattern has a real directory component like "dir/" or "../"
+                    // We need the prefix up to and including the last slash
+                    if let Some(slash) = pattern.rfind('/') {
+                        &pattern[..slash + 1]
+                    } else {
+                        ""
+                    }
+                }
+            } else {
+                ""
+            }
+        };
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
-                matches.push(entry.to_string_lossy().to_string());
+                let s = entry.to_string_lossy().to_string();
+                // If the glob crate stripped the directory prefix, re-add it.
+                if !prefix.is_empty() && !s.starts_with(prefix) && !s.starts_with('/') {
+                    matches.push(format!("{}{}", prefix, s));
+                } else {
+                    matches.push(s);
+                }
             }
         }
         // GNU Make sorts wildcard results lexicographically

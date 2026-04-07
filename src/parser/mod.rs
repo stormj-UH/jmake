@@ -1033,6 +1033,7 @@ fn expand_static_pattern_rule(
         // Inline recipe after `;` is propagated to every generated rule.
         // The caller will stamp the real line number (entry.0 == 0 is the cue).
         if let Some(ref recipe_line) = inline_recipe {
+            rule.has_inline_recipe_marker = true;
             rule.recipe.push((0, recipe_line.clone()));
         }
 

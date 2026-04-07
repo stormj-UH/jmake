@@ -1075,6 +1075,24 @@ impl MakeState {
                                 let expanded_name = self.expand(&stripped_name);
                                 let expanded_value = self.expand(&stripped_value);
                                 if raw_target.is_none() {
+                                    // Flush any pending current_rule before applying the
+                                    // variable assignment. This ensures the rule's effect on
+                                    // state (e.g. .DEFAULT_GOAL tracking) happens before the
+                                    // assignment modifies that state. Without this, a sequence
+                                    // like `foo: ; @:` followed by `.DEFAULT_GOAL :=` would
+                                    // register `foo` AFTER the reset, incorrectly making `foo`
+                                    // the default again.
+                                    if let Some(prev) = current_rule.take() {
+                                        for sib in &mut static_rule_siblings {
+                                            sib.recipe = prev.recipe.clone();
+                                        }
+                                        for sib in static_rule_siblings.drain(..) {
+                                            self.register_rule(sib);
+                                        }
+                                        self.register_rule(prev);
+                                        parser.in_recipe = false;
+                                    }
+                                    static_rule_siblings.clear();
                                     self.set_variable(&expanded_name, &expanded_value, &raw_flavor, raw_is_override, raw_is_export);
                                     // Handle unexport and private flags (not passed through set_variable).
                                     if raw_is_unexport {
@@ -1259,6 +1277,22 @@ impl MakeState {
                     if rule.targets.iter().any(|t| t == ".POSIX") {
                         self.db.posix_mode = true;
                         parser.posix_mode = true;
+                    }
+
+                    // Eagerly update .DEFAULT_GOAL when the first valid target is seen.
+                    // This must happen NOW (before the next line is expanded) so that
+                    // conditionals like `ifneq ($(.DEFAULT_GOAL),foo)` appearing on the
+                    // very next line after `foo: ; @:` see the correct value.
+                    if self.db.default_target.is_none() && !self.db.default_goal_explicit {
+                        for t in &rule.targets {
+                            let is_special = t.starts_with('.') && !t.contains('/');
+                            if !is_special && !t.contains('%') {
+                                self.db.default_target = Some(t.clone());
+                                self.db.variables.insert(".DEFAULT_GOAL".into(),
+                                    Variable::new(t.clone(), VarFlavor::Simple, VarOrigin::Default));
+                                break;
+                            }
+                        }
                     }
 
                     parser.in_recipe = true;
