@@ -496,7 +496,7 @@ fn strip_shell_prefix(line: &str) -> &str {
         let prefix = &line[..colon_pos];
         // Check if prefix looks like a shell binary path.
         let basename = prefix.rsplit('/').next().unwrap_or(prefix);
-        let is_shell = matches!(basename, "sh" | "bash" | "ksh" | "dash" | "zsh" | "ash");
+        let is_shell = matches!(basename, "sh" | "bash" | "ksh" | "mksh" | "dash" | "zsh" | "ash");
         if is_shell {
             let rest = &line[colon_pos + 2..];
             // Also strip "line N: " prefix if present (e.g., "/bin/sh: line 1: cmd: msg")

@@ -650,6 +650,12 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
                     is_double_colon,
                 ));
             }
+        } else if !target_pattern_str.is_empty() {
+            // A second bare colon was found but the target pattern contains no '%'.
+            // This is a fatal error: "target pattern contains no '%'".
+            return Some(ParsedLine::FatalError(
+                "target pattern contains no '%'.  Stop.".to_string()
+            ));
         }
     }
 

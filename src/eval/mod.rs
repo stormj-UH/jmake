@@ -19,6 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
+// Thread-local re-entry guard for shell_exec_with_env.
+// Prevents infinite recursion when exported variables contain $(shell ...).
+thread_local! {
+    static IN_SHELL_EXEC_WITH_ENV: RefCell<bool> = RefCell::new(false);
+}
+
 /// A pending include that couldn't be resolved during initial makefile reading.
 #[derive(Clone)]
 pub struct PendingInclude {
@@ -469,6 +475,26 @@ impl MakeState {
     /// This ensures $(shell ...) sees the correct values of exported make variables,
     /// overriding environment variables that have been redefined in the makefile.
     pub fn shell_exec_with_env(&self, cmd: &str) -> (String, i32) {
+        // Re-entry guard: if we are already inside shell_exec_with_env (because
+        // expanding an exported variable itself triggered $(shell ...)), fall back
+        // to a plain shell execution without computing extra exports. This prevents
+        // infinite recursion (and a SIGSEGV from stack overflow).
+        let already_in = IN_SHELL_EXEC_WITH_ENV.with(|flag| *flag.borrow());
+        if already_in {
+            let progname = self.progname();
+            return functions::fn_shell_exec_with_status_env(cmd, &HashMap::new(), &[], &progname);
+        }
+
+        // Set re-entry guard (RAII: use a struct that resets on drop)
+        struct ShellGuard;
+        impl Drop for ShellGuard {
+            fn drop(&mut self) {
+                IN_SHELL_EXEC_WITH_ENV.with(|flag| *flag.borrow_mut() = false);
+            }
+        }
+        IN_SHELL_EXEC_WITH_ENV.with(|flag| *flag.borrow_mut() = true);
+        let _guard = ShellGuard;
+
         let mut extra_env: HashMap<String, String> = HashMap::new();
         let mut remove_env: Vec<String> = Vec::new();
         for (name, var) in &self.db.variables {
@@ -477,11 +503,11 @@ impl MakeState {
             }
             let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
             let was_from_env = self.db.env_var_names.contains(name.as_str());
-            let should_export = always_export || match var.export {
+            let should_export = !var.is_private && (always_export || match var.export {
                 Some(true) => true,
                 Some(false) => false,
                 None => self.db.export_all || was_from_env,
-            };
+            });
             if should_export {
                 let value = self.expand(&var.value);
                 extra_env.insert(name.clone(), value);
@@ -493,6 +519,7 @@ impl MakeState {
                 }
             }
         }
+
         let progname = self.progname();
         functions::fn_shell_exec_with_status_env(cmd, &extra_env, &remove_env, &progname)
     }
@@ -1401,6 +1428,11 @@ impl MakeState {
                     }
                     std::process::exit(2);
                 }
+                ParsedLine::FatalError(msg) => {
+                    let fname = parser.filename.to_string_lossy();
+                    eprintln!("{}:{}: *** {}", fname, lineno, msg);
+                    std::process::exit(2);
+                }
                 _ => {}
             }
         }
@@ -2103,8 +2135,14 @@ impl MakeState {
                 continue;
             }
 
+            // Check if this prereq has ANY explicit rule (even an empty one like `force:`).
+            // Empty rules (no recipe, no prereqs) act as "satisfied" prerequisites.
+            let has_any_rule = self.db.rules.get(prereq).map_or(false, |r| !r.is_empty());
+
             // Only look at explicit rules (not pattern rules) to avoid infinite
             // recursion through implicit rule chains like %: %.o: %.c etc.
+            // Filter out double-colon rules with no prereqs (skippable), but keep
+            // rules with a recipe or prerequisites.
             let explicit_rule = self.db.rules.get(prereq).and_then(|rules| {
                 rules.iter().find(|r| {
                     !(r.is_double_colon && r.prerequisites.is_empty())
@@ -2113,6 +2151,12 @@ impl MakeState {
             }).cloned();
 
             if !prereq_path.exists() {
+                if has_any_rule && explicit_rule.is_none() {
+                    // Has a rule but it has no recipe and no prereqs (e.g. `force:`).
+                    // This is an "imagined" target: treat as satisfied, continue.
+                    visited.insert(prereq.clone());
+                    continue;
+                }
                 match explicit_rule {
                     None => {
                         if !ignore_missing {
@@ -2630,7 +2674,25 @@ impl MakeState {
                 _ => continue, // no applicable rule
             };
 
-            // Determine if the makefile is out of date
+            if self.include_recipe_ran.contains(&mf_name) {
+                continue;
+            }
+
+            // Build prerequisites first (they may themselves be out of date,
+            // which would make the makefile out of date after they're rebuilt).
+            let prereqs = rule_info.prerequisites.clone();
+            let mut visited = HashSet::new();
+            visited.insert(mf_name.clone());
+            let prereq_result = self.build_include_prerequisites(
+                &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
+            );
+
+            if let Err(e) = prereq_result {
+                return Err(e);
+            }
+
+            // Determine if the makefile is out of date (check AFTER building prereqs,
+            // since prereq building may have updated them making this target stale).
             let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
             let needs_rebuild = if target_mtime.is_none() {
                 // File doesn't exist → needs rebuild
@@ -2651,22 +2713,6 @@ impl MakeState {
 
             if !needs_rebuild {
                 continue;
-            }
-
-            if self.include_recipe_ran.contains(&mf_name) {
-                continue;
-            }
-
-            // Build prerequisites first
-            let prereqs = rule_info.prerequisites.clone();
-            let mut visited = HashSet::new();
-            visited.insert(mf_name.clone());
-            let prereq_result = self.build_include_prerequisites(
-                &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
-            );
-
-            if let Err(e) = prereq_result {
-                return Err(e);
             }
 
             if rule_info.recipe.is_empty() {

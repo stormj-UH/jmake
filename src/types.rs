@@ -220,6 +220,8 @@ pub enum ParsedLine {
     /// Invalid syntax in a conditional directive (e.g. `ifeq` with no args or bad args)
     InvalidConditional,
     LoadDirective(String),
+    /// Fatal parse error that must terminate make immediately (e.g. "target pattern has no %").
+    FatalError(String),
 }
 
 /// A pattern-specific variable assignment entry.
