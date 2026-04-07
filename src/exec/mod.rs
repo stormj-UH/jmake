@@ -728,7 +728,21 @@ impl<'a> Executor<'a> {
         }
 
         // Try VPATH
-        if let Some(_found) = self.find_in_vpath(target) {
+        if let Some(found) = self.find_in_vpath(target) {
+            if found == target {
+                // Shouldn't happen, but guard against infinite recursion.
+                if self.collect_plans_mode {
+                    self.record_leaf_plan(target, is_phony);
+                }
+                return Ok(false);
+            }
+            // If the vpath-resolved path has an explicit rule, build it.
+            // This handles cases like `vpath %.te vpath-d/` where `vpath-d/fail.te:`
+            // has a rule but `fail.te` doesn't exist yet.
+            if self.db.rules.contains_key(&found) {
+                return self.build_target(&found);
+            }
+            // File exists in a vpath directory (no rule needed), treat as up-to-date.
             if self.collect_plans_mode {
                 self.record_leaf_plan(target, is_phony);
             }
@@ -1760,6 +1774,15 @@ impl<'a> Executor<'a> {
         // are empty (as in single-colon 1st-rule SE).  But in contrast to single-
         // colon rules, even the 2nd double-colon rule has empty $</$^/etc because
         // there is no "accumulated" context from sibling rules.
+        //
+        // GNU Make semantics: all double-colon rules in the family are checked for
+        // need-to-rebuild using the TARGET's STATE AT BUILD START, not after each
+        // individual rule runs.  This ensures that if the target doesn't exist
+        // initially, ALL rules run — even if an earlier rule in the family creates
+        // the target and later rules would otherwise see it as "up to date".
+        let initial_target_mtime: Option<SystemTime> = get_mtime(target);
+        let target_initially_missing = initial_target_mtime.is_none();
+
         let mut any_rebuilt = false;
 
         for rule in rules {
@@ -1845,6 +1868,10 @@ impl<'a> Executor<'a> {
                 true
             } else if prereqs.is_empty() {
                 // No prerequisites: always run (GNU Make behaviour for :: rules)
+                true
+            } else if target_initially_missing {
+                // Target didn't exist when we started building this double-colon family;
+                // all rules in the family run regardless of post-rule target creation.
                 true
             } else {
                 self.needs_rebuild(target, &prereqs, any_prereq_rebuilt)
@@ -2431,21 +2458,30 @@ impl<'a> Executor<'a> {
     }
 
     fn find_in_vpath(&self, target: &str) -> Option<String> {
-        // Search VPATH and vpath for the target
+        // Search VPATH and vpath for the target.
+        // A vpath-resolved path is valid if either:
+        //   (a) the file exists on disk, OR
+        //   (b) there is an explicit rule for the resolved path in the database.
+        // This allows patterns like `vpath %.te vpath-d/` to resolve `fail.te`
+        // to `vpath-d/fail.te` even when `vpath-d/fail.te` doesn't exist but has a rule.
+        let has_rule = |path: &str| self.db.rules.contains_key(path);
+
         for (pattern, dirs) in &self.db.vpath {
             if vpath_pattern_matches(pattern, target) {
                 for dir in dirs {
                     let candidate = dir.join(target);
-                    if candidate.exists() {
-                        return Some(candidate.to_string_lossy().to_string());
+                    let s = candidate.to_string_lossy().to_string();
+                    if candidate.exists() || has_rule(&s) {
+                        return Some(s);
                     }
                 }
             }
         }
         for dir in &self.db.vpath_general {
             let candidate = dir.join(target);
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
+            let s = candidate.to_string_lossy().to_string();
+            if candidate.exists() || has_rule(&s) {
+                return Some(s);
             }
         }
 
@@ -2455,8 +2491,9 @@ impl<'a> Executor<'a> {
                 let dir = dir.trim();
                 if !dir.is_empty() {
                     let candidate = Path::new(dir).join(target);
-                    if candidate.exists() {
-                        return Some(candidate.to_string_lossy().to_string());
+                    let s = candidate.to_string_lossy().to_string();
+                    if candidate.exists() || has_rule(&s) {
+                        return Some(s);
                     }
                 }
             }
