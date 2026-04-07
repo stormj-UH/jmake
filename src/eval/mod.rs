@@ -509,11 +509,11 @@ impl MakeState {
             }
             let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
             let was_from_env = self.db.env_var_names.contains(name.as_str());
-            let should_export = !var.is_private && (always_export || match var.export {
+            let should_export = always_export || match var.export {
                 Some(true) => true,
                 Some(false) => false,
                 None => self.db.export_all || was_from_env,
-            });
+            };
             if should_export {
                 let value = self.expand(&var.value);
                 extra_env.insert(name.clone(), value);
@@ -905,6 +905,55 @@ impl MakeState {
             // Determine if this line is a recipe line for a custom .RECIPEPREFIX.
             // Tab-prefixed lines and custom-prefix lines must NOT be pre-expanded
             // (they are handed verbatim to parse_line and then to the executor).
+            // When inside an inactive conditional branch, only process
+            // conditional directives (ifdef/ifndef/ifeq/ifneq/else/endif).
+            // Skip expansion and everything else to avoid side effects like $(info).
+            if !parser.is_conditionally_active() {
+                let trimmed_check = line.trim();
+                let is_conditional = trimmed_check.starts_with("ifdef ")
+                    || trimmed_check.starts_with("ifndef ")
+                    || trimmed_check.starts_with("ifeq ")
+                    || trimmed_check.starts_with("ifeq(")
+                    || trimmed_check.starts_with("ifneq ")
+                    || trimmed_check.starts_with("ifneq(")
+                    || trimmed_check.starts_with("else")
+                    || trimmed_check == "endif"
+                    || trimmed_check.starts_with("endif ");
+                if is_conditional {
+                    let parsed = parser.parse_line(&line, self);
+                    match &parsed {
+                        ParsedLine::Conditional(kind) => {
+                            // Don't evaluate - just push inactive state
+                            parser.conditional_stack.push(parser::ConditionalState {
+                                active: false,
+                                seen_true: false,
+                                in_else: false,
+                            });
+                        }
+                        ParsedLine::Else(maybe_cond) => {
+                            if let Some(state) = parser.conditional_stack.last_mut() {
+                                if state.seen_true {
+                                    state.active = false;
+                                } else if let Some(kind) = maybe_cond {
+                                    let active = self.evaluate_condition(kind);
+                                    state.active = active;
+                                    if active { state.seen_true = true; }
+                                } else {
+                                    state.active = true;
+                                    state.seen_true = true;
+                                }
+                                state.in_else = true;
+                            }
+                        }
+                        ParsedLine::Endif => {
+                            parser.conditional_stack.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             let custom_recipe_prefix: Option<char> = {
                 let pfx = self.db.variables.get(".RECIPEPREFIX")
                     .and_then(|v| v.value.chars().next());
@@ -987,11 +1036,16 @@ impl MakeState {
                                     VarFlavor::Shell => " != ",
                                     _ => " = ",
                                 };
-                                // Build modifier prefix for the variable name
+                                // Build modifier prefix for the variable name.
+                                // Order matters: put `private` first so that `parse_line`
+                                // does not mistake the reconstructed line for a bare `export`
+                                // directive (which would call `parse_export`, dropping the
+                                // `private` flag).  Reconstructed as "private [override] export ..."
+                                // ensures `try_parse_variable_assignment` handles it.
                                 let mut var_prefix = String::new();
+                                if raw_is_private { var_prefix.push_str("private "); }
                                 if raw_is_override { var_prefix.push_str("override "); }
                                 if raw_is_export { var_prefix.push_str("export "); }
-                                if raw_is_private { var_prefix.push_str("private "); }
                                 if let Some(tgt) = raw_target {
                                     // Target-specific variable: "target: [modifiers] name op value"
                                     let expanded_target = self.expand(&tgt);
