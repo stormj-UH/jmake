@@ -5370,14 +5370,40 @@ fn get_mtime(path: &str) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Get mtime for symlink checking: if check_symlink_times is true, use the
-/// symlink's own modification time (lstat) rather than following the symlink.
-/// When the symlink points to a non-existent target (dangling symlink), returns
-/// the symlink's own mtime so the target can still be built.
+/// Get mtime for symlink checking: with -L, use the latest mtime between the
+/// symlink itself and its target (recursively), as GNU Make does.
+/// For dangling symlinks (target doesn't exist), returns the symlink's own mtime
+/// so the dependent target can still be built.
 fn get_mtime_symlink(path: &str) -> Option<SystemTime> {
-    // Use symlink_metadata (lstat equivalent) to get the symlink's own mtime.
-    // This returns Some() even for dangling symlinks (symlink exists but target doesn't).
-    fs::symlink_metadata(path).ok()?.modified().ok()
+    // Get the symlink's own mtime via lstat.
+    let sym_meta = fs::symlink_metadata(path).ok()?;
+    let sym_mtime = sym_meta.modified().ok()?;
+
+    // If it's not a symlink, just return the file's mtime.
+    if !sym_meta.file_type().is_symlink() {
+        return Some(sym_mtime);
+    }
+
+    // It's a symlink: read where it points.
+    if let Ok(target) = fs::read_link(path) {
+        // Resolve the target path relative to the parent directory of 'path'.
+        let resolved = if target.is_absolute() {
+            target
+        } else if let Some(parent) = Path::new(path).parent() {
+            parent.join(&target)
+        } else {
+            target
+        };
+        // Recursively get the target's mtime (handles symlink chains).
+        // If the target doesn't exist (dangling), fall through and use sym_mtime.
+        if let Some(target_mtime) = get_mtime_symlink(resolved.to_str().unwrap_or("")) {
+            // Use the MAX of symlink mtime and target mtime.
+            return Some(sym_mtime.max(target_mtime));
+        }
+    }
+
+    // Dangling symlink or can't read link: return symlink's own mtime.
+    Some(sym_mtime)
 }
 
 fn touch_file(path: &str) {
