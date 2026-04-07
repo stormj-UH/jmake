@@ -644,11 +644,13 @@ impl<'a> Executor<'a> {
             .cloned()
             .collect();
         // Collect files that actually exist and need to be deleted.
+        // GNU Make deletes intermediates in reverse build order (last built = first deleted).
         let existing: Vec<String> = to_delete.iter()
+            .rev()
             .filter(|t| Path::new(t.as_str()).exists())
             .cloned()
             .collect();
-        // GNU Make prints ONE rm command with all files, in the order they were built.
+        // GNU Make prints ONE rm command with all files, in reverse build order.
         if !existing.is_empty() && !self.silent {
             println!("rm {}", existing.join(" "));
         }
@@ -732,7 +734,36 @@ impl<'a> Executor<'a> {
                 self.lib_search_results.insert(target.to_string(), resolved);
                 return Ok(false);
             }
-            // Library not found on disk — fall through to check explicit/pattern rules.
+            // Library not found on disk — check if libname.a has its own recipe.
+            // If libname.a has explicit rules with a recipe, AND -lname would have a
+            // recipe via a pattern rule (like -l%: lib%.a ;), then -lname "resolves"
+            // to libname.a. Warn that -lname's recipe is ignored and redirect.
+            // This matches GNU Make's sv 54549 behavior.
+            let lib_a = format!("lib{}.a", lib_name);
+            if let Some(lib_a_rules) = self.db.rules.get(&lib_a) {
+                let lib_a_has_recipe = lib_a_rules.iter().any(|r| !r.recipe.is_empty());
+                if lib_a_has_recipe {
+                    // Check if -lname would have a recipe via a pattern rule.
+                    if let Some((pattern_rule, _stem)) = self.find_pattern_rule(target) {
+                        if !pattern_rule.recipe.is_empty() {
+                            // Find source info from the pattern rule.
+                            let src = &pattern_rule.source_file;
+                            let recipe_lineno = pattern_rule.recipe.first()
+                                .map(|(l, _)| *l)
+                                .unwrap_or(pattern_rule.lineno);
+                            eprintln!("{}:{}: Recipe was specified for file '{}' at {}:{},",
+                                src, recipe_lineno, target, src, recipe_lineno);
+                            eprintln!("{}:{}: but '{}' is now considered the same file as '{}'.",
+                                src, recipe_lineno, target, lib_a);
+                            eprintln!("{}:{}: Recipe for '{}' will be ignored in favor of the one for '{}'.",
+                                src, recipe_lineno, target, lib_a);
+                            // Redirect to libname.a
+                            return self.build_target(&lib_a);
+                        }
+                    }
+                }
+            }
+            // Fall through to check explicit/pattern rules.
         }
 
         // Find rule for this target
@@ -5616,15 +5647,24 @@ fn run_cmd_with_error_handling(
             Ok(l) => l,
             Err(_) => break,
         };
-        // Suppress lines that are just the shell's own "not found" error.
-        // These take the form: "/bin/sh: cmd: inaccessible or not found"
-        //                       "mksh: cmd: not found"
-        //                       "sh: cmd: command not found"
-        // We detect them by their well-known suffix patterns.
-        let is_shell_notfound = line.ends_with(": inaccessible or not found")
+        // Suppress lines that are the shell's own exec error messages.
+        // The shell emits these when exit code is 127 (not found) or 126 (permission/exec).
+        // GNU Make prints its own formatted version of these errors, so we suppress the
+        // shell's version to avoid duplication.
+        // Forms include:
+        //   "/bin/sh: cmd: inaccessible or not found"   (mksh, 127)
+        //   "mksh: cmd: not found"                      (mksh, 127)
+        //   "sh: cmd: command not found"                (dash, 127)
+        //   "/bin/sh: cmd: can't execute: Permission denied"  (mksh, 126)
+        //   "/bin/sh: cmd: can't execute: Is a directory"     (mksh, 126)
+        //   "sh: cmd: Permission denied"                (dash, 126)
+        let is_shell_exec_error = line.ends_with(": inaccessible or not found")
             || line.ends_with(": not found")
-            || line.ends_with(": command not found");
-        if !is_shell_notfound {
+            || line.ends_with(": command not found")
+            || line.contains(": can't execute: ")
+            || (line.ends_with(": Permission denied") && !line.starts_with("jmake:"))
+            || (line.ends_with(": Is a directory") && !line.starts_with("jmake:"));
+        if !is_shell_exec_error {
             eprintln!("{}", line);
         }
     }
