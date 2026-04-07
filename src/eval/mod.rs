@@ -3457,17 +3457,15 @@ impl MakeState {
 
                 match built {
                     Ok(()) => {
-                        // Check if the file was actually updated (mtime changed or created)
-                        let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
-                        let actually_updated = match (target_mtime, new_mtime) {
-                            (_, None) => false, // file still doesn't exist
-                            (None, Some(_)) => true, // file was created
-                            (Some(old_t), Some(new_t)) => new_t > old_t, // file was updated
-                        };
-                        if actually_updated {
+                        // If the file exists after the recipe ran, consider it rebuilt.
+                        // GNU Make re-execs whenever an included makefile's recipe ran
+                        // successfully, regardless of whether the mtime changed (e.g. a
+                        // future-timestamped file overwritten with current-time content).
+                        // Only skip re-exec if the file still doesn't exist (sv 61226).
+                        if mf_path.exists() {
                             any_really_rebuilt = true;
                         }
-                        // If file not updated (sv 61226): no re-exec, no error
+                        // If file not updated/created (sv 61226): no re-exec, no error
                     }
                     Err(recipe_err) => {
                         return Err(recipe_err);
