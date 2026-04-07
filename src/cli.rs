@@ -475,8 +475,9 @@ pub fn parse_args() -> MakeArgs {
                                 }
                             }
                             if !consumed {
-                                // bare -j with no number = unlimited parallel jobs
-                                result.jobs = usize::MAX;
+                                // bare -j with no number = unlimited parallel jobs.
+                                // Cap at 256 to avoid spawning absurd numbers of threads.
+                                result.jobs = 256;
                             }
                         }
                     }

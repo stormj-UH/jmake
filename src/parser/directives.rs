@@ -238,7 +238,9 @@ pub fn parse_vpath(line: &str) -> ParsedLine {
     let dirs = parts
         .next()
         .map(|d| {
-            d.split(':')
+            // GNU Make accepts both ':' and whitespace as directory separators in vpath
+            // e.g. `vpath % a2 b2` and `vpath % a2:b2` are equivalent
+            d.split(|c: char| c == ':' || c.is_whitespace())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()

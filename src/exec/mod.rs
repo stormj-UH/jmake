@@ -1016,6 +1016,9 @@ impl<'a> Executor<'a> {
                     }
                 }
 
+                // Collect skipped intermediates so we can visit them for their
+                // PHONY/order-only prereqs even when the target is up to date.
+                let mut skipped_intermediates: Vec<String> = Vec::new();
                 let any_prereq_newer = check_prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
                     if self.what_if.iter().any(|w| w == p) { return true; }
@@ -1036,9 +1039,11 @@ impl<'a> Executor<'a> {
                             // Also treat any non-existent file with a rule as needing rebuild:
                             // the rule will be run, and the target may then be out of date.
                             if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                                skipped_intermediates.push(p.clone());
                                 return false; // secondary missing file: skip
                             }
                             if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
+                                skipped_intermediates.push(p.clone());
                                 return false; // deleted intermediate: skip (sources up to date)
                             }
                             // Regular file that doesn't exist: must be built, treat as newer.
@@ -1054,6 +1059,22 @@ impl<'a> Executor<'a> {
                     // rule) which should always execute regardless of the target's state.
                     // GNU Make always builds order-only prereqs before deciding whether
                     // to rebuild the target.
+                    //
+                    // Also visit skipped intermediates so that any PHONY order-only
+                    // prereqs within them still run (e.g. `intermed: | phony`).
+                    // IMPORTANT: We do NOT rebuild the intermediate itself (it was skipped
+                    // because its normal prereqs don't cause a rebuild of the parent).
+                    // We only run its order-only PHONY prereqs.
+                    for skipped in &skipped_intermediates {
+                        let oo_phony: Vec<String> = self.db.rules.get(skipped.as_str())
+                            .map(|rules| rules.iter()
+                                .flat_map(|r| r.order_only_prerequisites.iter().cloned())
+                                .collect())
+                            .unwrap_or_default();
+                        for oo_p in oo_phony {
+                            let _ = self.build_target(&oo_p);
+                        }
+                    }
                     for prereq in all_order_only.clone() {
                         let _ = self.build_target(&prereq);
                     }
@@ -2189,6 +2210,63 @@ impl<'a> Executor<'a> {
             order_only = self.shuffle_list(order_only);
         }
 
+        // Pre-check: if target exists and none of the prerequisites are newer (by
+        // effective mtime, which accounts for deleted intermediate files), return
+        // immediately as "up to date".  This prevents unnecessarily rebuilding deleted
+        // intermediate files when the final target is already fresh.
+        //
+        // GNU Make's rule: if the final target exists and its non-intermediate sources
+        // haven't changed, intermediate files are NOT rebuilt.  Intermediate files that
+        // don't exist are considered to have a "virtual" mtime equal to their sources.
+        //
+        // Skip this check when always_make (-B), the target is phony, the recipe is
+        // empty (we can't decide without building), or when in collect_plans_mode
+        // (parallel build graph collects all dependencies regardless).
+        if !is_phony && !self.always_make && !self.collect_plans_mode {
+            if let Some(target_time) = get_mtime(target).or_else(|| {
+                self.find_in_vpath(target).and_then(|f| get_mtime(&f))
+            }) {
+                let any_prereq_newer = prereqs.iter().any(|p| {
+                    if p == ".WAIT" { return false; }
+                    if self.what_if.iter().any(|w| w == p) { return true; }
+                    if let Some(ref vp) = self.find_in_vpath(p) {
+                        if self.what_if.iter().any(|w| w == vp) { return true; }
+                    }
+                    if self.db.is_phony(p) { return true; }
+                    match self.effective_mtime(p, 0) {
+                        Some(pt) => pt > target_time,
+                        None => {
+                            // Non-existent prereq with no known sources:
+                            if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                                return false;
+                            }
+                            if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
+                                return false;
+                            }
+                            // Explicitly-mentioned missing file: must rebuild.
+                            self.db.is_explicitly_mentioned(p) || self.db.is_notintermediate(p)
+                        }
+                    }
+                });
+                if !any_prereq_newer {
+                    // Build order-only prereqs if needed (they don't affect rebuild decision).
+                    for prereq in &order_only {
+                        let _ = self.build_target(prereq);
+                    }
+                    // Mark also-make siblings as covered (up to date).
+                    for sib in &also_make_siblings {
+                        self.grouped_covered.insert(sib.clone());
+                        self.built.insert(sib.clone(), false);
+                    }
+                    for sib in &concrete_grouped_siblings {
+                        self.grouped_covered.insert(sib.clone());
+                        self.built.insert(sib.clone(), false);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
         // Build prerequisites
         // Push target vars onto stack for inheritance by prerequisites.
         let my_target_vars = self.collect_target_vars(target);
@@ -2780,26 +2858,28 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Search each directory: prefer .a over .so
+        // Search order (GNU Make compatibility):
+        //   1. CWD for .a (CWD static library wins over any VPATH shared library)
+        //   2. VPATH dirs for .a
+        //   3. CWD for .so
+        //   4. VPATH dirs for .so
+        if Path::new(&lib_a).exists() {
+            return Some(lib_a);
+        }
         for dir in &search_dirs {
             let candidate_a = dir.join(&lib_a);
             if candidate_a.exists() {
                 return Some(candidate_a.to_string_lossy().to_string());
             }
         }
+        if Path::new(&lib_so).exists() {
+            return Some(lib_so);
+        }
         for dir in &search_dirs {
             let candidate_so = dir.join(&lib_so);
             if candidate_so.exists() {
                 return Some(candidate_so.to_string_lossy().to_string());
             }
-        }
-
-        // Check current directory
-        if Path::new(&lib_a).exists() {
-            return Some(lib_a);
-        }
-        if Path::new(&lib_so).exists() {
-            return Some(lib_so);
         }
 
         None
@@ -3135,7 +3215,14 @@ impl<'a> Executor<'a> {
                     // If no pre-step-2 entry: don't include in for_prereqs (new private var).
                 }
             } else {
-                for_prereqs.insert(name.clone(), (val.clone(), *is_override, false));
+                // .EXTRA_PREREQS is a special variable that is NEVER inherited by
+                // prerequisites.  GNU Make applies it only to the target that owns it,
+                // not to that target's prerequisites.
+                if name == ".EXTRA_PREREQS" {
+                    // Do not propagate .EXTRA_PREREQS to prerequisites.
+                } else {
+                    for_prereqs.insert(name.clone(), (val.clone(), *is_override, false));
+                }
             }
         }
 
