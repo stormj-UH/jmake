@@ -1094,12 +1094,14 @@ impl<'a> Executor<'a> {
                 se_expanded_prereqs.extend(normal);
                 se_expanded_order_only.extend(oo);
                 // Collect raw SE tokens (including .WAIT) for wait_groups extraction.
+                // Include both normal and order-only tokens, treating '|' as transparent
+                // so that .WAIT before order-only prereqs creates proper ordering.
                 if self.collect_plans_mode {
                     *self.state.in_second_expansion.borrow_mut() = true;
                     let raw_expanded = self.state.expand_with_auto_vars(text, &rule_auto_vars);
                     *self.state.in_second_expansion.borrow_mut() = false;
                     for token in raw_expanded.split_whitespace() {
-                        if token == "|" { break; } // stop at order-only separator
+                        if token == "|" { continue; } // skip '|' but keep processing
                         se_raw_tokens_for_wait.push(token.to_string());
                     }
                 }
@@ -1315,6 +1317,15 @@ impl<'a> Executor<'a> {
                         if !all_prereqs.is_empty() || !plan_order_only.is_empty() {
                             if let Some(ref mut plans) = self.pending_plans {
                                 if !plans.contains_key(target) {
+                                    // Compute effective_wait_groups for .NOTPARALLEL: target
+                                    let effective_wg_uptodate = if wait_groups.is_empty()
+                                        && self.db.not_parallel_targets.contains(target)
+                                        && all_prereqs.len() > 1
+                                    {
+                                        all_prereqs.iter().map(|p| vec![p.clone()]).collect()
+                                    } else {
+                                        wait_groups.clone()
+                                    };
                                     plans.insert(target.to_string(), parallel::TargetPlan {
                                         target: target.to_string(),
                                         prerequisites: all_prereqs.clone(),
@@ -1329,7 +1340,7 @@ impl<'a> Executor<'a> {
                                         extra_exports: HashMap::new(),
                                         extra_unexports: Vec::new(),
                                         is_intermediate: false,
-                                        wait_groups: wait_groups.clone(),
+                                        wait_groups: effective_wg_uptodate,
                                     });
                                 }
                             }
@@ -1754,6 +1765,15 @@ impl<'a> Executor<'a> {
                 if self.collect_plans_mode {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
                     let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
+                    // Compute effective_wait_groups, accounting for .NOTPARALLEL: target.
+                    let effective_wg_here = if wait_groups.is_empty()
+                        && self.db.not_parallel_targets.contains(target)
+                        && all_prereqs.len() > 1
+                    {
+                        all_prereqs.iter().map(|p| vec![p.clone()]).collect()
+                    } else {
+                        wait_groups.clone()
+                    };
                     let plan = parallel::TargetPlan {
                         target: target.to_string(),
                         prerequisites: all_prereqs.clone(),
@@ -1768,7 +1788,7 @@ impl<'a> Executor<'a> {
                         extra_exports: HashMap::new(),
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
-                        wait_groups: wait_groups.clone(),
+                        wait_groups: effective_wg_here,
                     };
                     if let Some(ref mut plans) = self.pending_plans {
                         plans.insert(target.to_string(), plan);
@@ -3122,12 +3142,9 @@ impl<'a> Executor<'a> {
                 // Track intermediate status for also_make siblings.
                 // A sibling is intermediate if:
                 //   1. It is explicitly marked .INTERMEDIATE, OR
-                //   2. The primary target is intermediate AND the sibling:
-                //      - is not a top-level target, AND
-                //      - has no explicit rules of its own (only implicit/pattern rules), AND
-                //      - is not precious, not .NOTINTERMEDIATE, not .SECONDARY
-                // Note: merely appearing as a prerequisite of another rule does NOT
-                // prevent a file from being intermediate (GNU Make behavior).
+                //   2. The sibling is not explicitly mentioned in the makefile AND
+                //      is not a top-level target AND is not precious/NOTINTERMEDIATE/SECONDARY
+                // Note: explicitly mentioned = appears as target or prereq of any explicit rule.
                 if self.db.is_intermediate(sib) {
                     if !self.intermediate_built.contains(sib) {
                         self.intermediate_built.push(sib.clone());
@@ -3136,15 +3153,13 @@ impl<'a> Executor<'a> {
                     && !self.db.is_notintermediate(sib)
                     && !self.db.is_secondary(sib)
                 {
-                    // A sibling is intermediate independently of the primary target —
-                    // it only escapes intermediate status if it is a top-level target
-                    // OR has its own explicit rules (not just pattern rules).
-                    // Note: appearing as a prerequisite of another rule does NOT
-                    // prevent a file from being intermediate (GNU Make behavior).
-                    let has_explicit_rules = self.db.rules.get(sib.as_str())
-                        .map_or(false, |rules| !rules.is_empty());
-                    let is_top_level = self.top_level_targets.contains(sib.as_str());
-                    if !is_top_level && !has_explicit_rules {
+                    // A sibling is intermediate independently of the primary target.
+                    // It escapes intermediate status if it is explicitly mentioned
+                    // in the makefile (as target or prereq of any rule) OR is a
+                    // top-level target.
+                    let is_explicit = self.top_level_targets.contains(sib.as_str())
+                        || self.is_explicitly_mentioned(sib);
+                    if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
                         }
@@ -3154,10 +3169,22 @@ impl<'a> Executor<'a> {
             // In collect_plans_mode, update the plan's is_intermediate flag now that we
             // know the runtime intermediate status (db.is_intermediate only covers explicit
             // .INTERMEDIATE declarations, not pattern-rule-built intermediates).
-            if self.collect_plans_mode && is_target_intermediate {
-                if let Some(ref mut plans) = self.pending_plans {
-                    if let Some(plan) = plans.get_mut(target) {
-                        plan.is_intermediate = true;
+            if self.collect_plans_mode {
+                if is_target_intermediate {
+                    if let Some(ref mut plans) = self.pending_plans {
+                        if let Some(plan) = plans.get_mut(target) {
+                            plan.is_intermediate = true;
+                        }
+                    }
+                }
+                // Also mark sibling plans as intermediate if they were pushed to intermediate_built.
+                for sib in &also_make_siblings {
+                    if self.intermediate_built.contains(sib) {
+                        if let Some(ref mut plans) = self.pending_plans {
+                            if let Some(plan) = plans.get_mut(sib.as_str()) {
+                                plan.is_intermediate = true;
+                            }
+                        }
                     }
                 }
             }
