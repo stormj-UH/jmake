@@ -806,9 +806,15 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
             let after_second = rest_trimmed[second_colon + 1..].trim();
             let targets: Vec<String> = split_filenames(targets_str);
             if !targets.is_empty() {
+                // Normalize the target pattern through the same backslash processing
+                // as split_filenames: `\\` → `\`, `\%` → `\%` (kept as-is).
+                // This is required so that match_pattern can correctly align the
+                // pattern prefix/suffix with the already-normalized target strings.
+                let target_pattern_normalized: String = split_filenames(target_pattern_str)
+                    .into_iter().next().unwrap_or_default();
                 return Some(expand_static_pattern_rule(
                     targets,
-                    target_pattern_str,
+                    &target_pattern_normalized,
                     after_second,
                     is_double_colon,
                 ));
