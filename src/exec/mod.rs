@@ -307,10 +307,6 @@ impl<'a> Executor<'a> {
 
         scheduler.find_initial_ready(targets);
 
-        // DEBUG: show initial ready queue
-        eprintln!("[DBG] initial ready_queue: {:?}", scheduler.ready_queue);
-        eprintln!("[DBG] initial states: {:?}", scheduler.states.keys().collect::<Vec<_>>());
-
         // ------------------------------------------------------------------
         // Phase 3: Scheduler main loop
         // ------------------------------------------------------------------
@@ -335,13 +331,11 @@ impl<'a> Executor<'a> {
 
                 match job {
                     Some(j) => {
-                        eprintln!("[DBG] launching job: {:?}", target);
                         scheduler.states.insert(target.clone(), TargetState::Running);
                         scheduler.running_count += 1;
                         scheduler.send_job(j);
                     }
                     None => {
-                        eprintln!("[DBG] no-recipe target: {:?}", target);
                         // No recipe or not needed — complete immediately without
                         // going through a worker thread.
                         // We mark it done and propagate to dependents directly.
@@ -856,8 +850,10 @@ impl<'a> Executor<'a> {
 
         let mut all_prereqs: Vec<String> = Vec::new();  // non-SE prereqs (direct build + auto vars)
         let mut all_order_only: Vec<String> = Vec::new();
-        let mut se_prereq_texts: Vec<String> = Vec::new();
-        let mut se_order_only_texts: Vec<String> = Vec::new();
+        // SE texts paired with the per-rule static stem (for correct $* expansion when
+        // multiple static pattern rules match the same target with different stems).
+        let mut se_prereq_texts: Vec<(String, String)> = Vec::new();
+        let mut se_order_only_texts: Vec<(String, String)> = Vec::new();
         let mut recipe = Vec::new();
         let mut recipe_source_file = String::new();
 
@@ -865,10 +861,10 @@ impl<'a> Executor<'a> {
             all_prereqs.extend(rule.prerequisites.clone());
             all_order_only.extend(rule.order_only_prerequisites.clone());
             if let Some(ref text) = rule.second_expansion_prereqs {
-                se_prereq_texts.push(text.clone());
+                se_prereq_texts.push((text.clone(), rule.static_stem.clone()));
             }
             if let Some(ref text) = rule.second_expansion_order_only {
-                se_order_only_texts.push(text.clone());
+                se_order_only_texts.push((text.clone(), rule.static_stem.clone()));
             }
             if !rule.recipe.is_empty() {
                 recipe = rule.recipe.clone();
@@ -891,28 +887,36 @@ impl<'a> Executor<'a> {
         let mut se_expanded_order_only: Vec<String> = Vec::new();
 
         if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
-            let stem = rules.iter()
+            // The global static_stem (last rule's stem) is used for $* in the auto-var
+            // base, but each rule's SE text is expanded with that rule's own stem so
+            // that $$* refers to the correct per-rule match.
+            let global_stem = rules.iter()
+                .rev()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
             let oo_refs: Vec<&str> = auto_var_order_only.iter().map(|s| s.as_str()).collect();
-            let mut base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
-            // $? is always empty in second-expansion context (out-of-date status is
-            // not known when computing which prereqs to build).
-            base_auto_vars.insert("?".to_string(), String::new());
 
-            // Merge target-specific and pattern-specific variables into the SE
-            // auto vars, so that e.g. `foo: a := bar; foo: $$a` can see `a`.
             let collected_target_vars = self.collect_target_vars(target);
-            self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut base_auto_vars);
 
-            for text in &se_prereq_texts {
-                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+            for (text, rule_stem) in &se_prereq_texts {
+                // Use per-rule stem for $* so that each static pattern rule's $$*
+                // expands to its own match stem, not the global (last) stem.
+                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
+                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                // $? is always empty in second-expansion context.
+                rule_auto_vars.insert("?".to_string(), String::new());
+                self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
+                let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_prereqs.extend(normal);
                 se_expanded_order_only.extend(oo);
             }
-            for text in &se_order_only_texts {
-                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+            for (text, rule_stem) in &se_order_only_texts {
+                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
+                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                rule_auto_vars.insert("?".to_string(), String::new());
+                self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
+                let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_order_only.extend(normal);
                 se_expanded_order_only.extend(oo);
             }
@@ -960,9 +964,13 @@ impl<'a> Executor<'a> {
                 // to include its prereqs in the check (read-only, no building).
                 if recipe.is_empty() {
                     if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
+                        let matched_pt_pre: String = pat_rule.targets.iter()
+                            .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                            .cloned()
+                            .unwrap_or_else(|| "%".to_string());
                         for p in &pat_rule.prerequisites {
                             if p != ".WAIT" {
-                                check_prereqs.push(subst_stem_in_prereq(p, &stem));
+                                check_prereqs.push(subst_stem_in_prereq_dir(p, &stem, &matched_pt_pre));
                             }
                         }
                     }
@@ -999,6 +1007,16 @@ impl<'a> Executor<'a> {
                     }
                 });
                 if !any_prereq_newer {
+                    // Target is up to date relative to its normal prerequisites.
+                    // However, order-only prerequisites must still be built even when
+                    // the target doesn't need rebuilding.  This is crucial for PHONY
+                    // order-only prereqs (like an output directory or a "baz: touch baz"
+                    // rule) which should always execute regardless of the target's state.
+                    // GNU Make always builds order-only prereqs before deciding whether
+                    // to rebuild the target.
+                    for prereq in all_order_only.clone() {
+                        let _ = self.build_target(&prereq);
+                    }
                     return Ok(false);
                 }
             }
@@ -1352,8 +1370,8 @@ impl<'a> Executor<'a> {
 
         let mut all_prereqs: Vec<String> = Vec::new();
         let mut all_order_only: Vec<String> = Vec::new();
-        let mut se_prereq_texts: Vec<String> = Vec::new();
-        let mut se_order_only_texts: Vec<String> = Vec::new();
+        let mut se_prereq_texts: Vec<(String, String)> = Vec::new();
+        let mut se_order_only_texts: Vec<(String, String)> = Vec::new();
         let mut recipe = Vec::new();
         let mut recipe_source_file = String::new();
 
@@ -1361,10 +1379,10 @@ impl<'a> Executor<'a> {
             all_prereqs.extend(rule.prerequisites.clone());
             all_order_only.extend(rule.order_only_prerequisites.clone());
             if let Some(ref text) = rule.second_expansion_prereqs {
-                se_prereq_texts.push(text.clone());
+                se_prereq_texts.push((text.clone(), rule.static_stem.clone()));
             }
             if let Some(ref text) = rule.second_expansion_order_only {
-                se_order_only_texts.push(text.clone());
+                se_order_only_texts.push((text.clone(), rule.static_stem.clone()));
             }
             if !rule.recipe.is_empty() {
                 recipe = rule.recipe.clone();
@@ -1382,23 +1400,29 @@ impl<'a> Executor<'a> {
         let mut se_expanded_order_only: Vec<String> = Vec::new();
 
         if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
-            let stem = rules.iter()
+            let global_stem = rules.iter()
+                .rev()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
             let oo_refs: Vec<&str> = auto_var_order_only.iter().map(|s| s.as_str()).collect();
-            let mut base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
-            base_auto_vars.insert("?".to_string(), String::new());
             let collected_target_vars = self.collect_target_vars(target);
-            self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut base_auto_vars);
 
-            for text in &se_prereq_texts {
-                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+            for (text, rule_stem) in &se_prereq_texts {
+                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
+                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                rule_auto_vars.insert("?".to_string(), String::new());
+                self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
+                let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_prereqs.extend(normal);
                 se_expanded_order_only.extend(oo);
             }
-            for text in &se_order_only_texts {
-                let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
+            for (text, rule_stem) in &se_order_only_texts {
+                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
+                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                rule_auto_vars.insert("?".to_string(), String::new());
+                self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
+                let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_order_only.extend(normal);
                 se_expanded_order_only.extend(oo);
             }
@@ -1484,11 +1508,15 @@ impl<'a> Executor<'a> {
         // can be used (same logic as build_with_rules).
         let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
+                let matched_pt_bwrp: String = pattern_rule.targets.iter()
+                    .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| "%".to_string());
                 let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
-                    .map(|p| subst_stem_in_prereq(p, &stem))
+                    .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_bwrp))
                     .collect();
                 let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
-                    .map(|p| subst_stem_in_prereq(p, &stem))
+                    .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_bwrp))
                     .collect();
 
                 if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
@@ -1498,13 +1526,13 @@ impl<'a> Executor<'a> {
                     self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
-                        let stem_subst = subst_stem_in_se_text(text, &stem);
+                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt_bwrp);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_prereqs.extend(normal);
                         pat_order_only.extend(oo);
                     }
                     if let Some(ref text) = pattern_rule.second_expansion_order_only {
-                        let stem_subst = subst_stem_in_se_text(text, &stem);
+                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt_bwrp);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_order_only.extend(normal);
                         pat_order_only.extend(oo);
@@ -2386,7 +2414,7 @@ impl<'a> Executor<'a> {
                     } else {
                         rule.prerequisites.iter().all(|p| {
                             if p == ".WAIT" { return true; }
-                            let resolved = subst_stem_in_prereq(p, &stem);
+                            let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                             Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
@@ -2854,9 +2882,13 @@ impl<'a> Executor<'a> {
         }
         // Check pattern rules
         if let Some((rule, stem)) = self.find_pattern_rule(target) {
+            let matched_pt_em: String = rule.targets.iter()
+                .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                .cloned()
+                .unwrap_or_else(|| "%".to_string());
             let max_prereq_time = rule.prerequisites.iter()
                 .filter(|p| p.as_str() != ".WAIT")
-                .map(|p| subst_stem_in_prereq(p, &stem))
+                .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_em))
                 .filter_map(|p| self.effective_mtime(&p, depth + 1))
                 .max();
             return max_prereq_time;
@@ -3446,11 +3478,8 @@ impl<'a> Executor<'a> {
                     self.setup_exports(&mut c);
                     run_cmd_with_error_handling(c, &cmd, &self.progname)
                 };
-                let status = child_status;
-
-                match status {
-                    Ok(s) if !s.success() => {
-                        let code = s.code().unwrap_or(1);
+                match child_status {
+                    Ok(code) if code != 0 => {
                         let loc = make_location(source_file, lineno);
                         if effective_ignore {
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
@@ -4145,12 +4174,15 @@ fn extract_cmd_name(cmd: &str) -> &str {
 /// Run a command through the shell, capturing stderr to intercept and reformat
 /// "command not found" / "permission denied" errors to match GNU Make's output format.
 ///
-/// Returns the exit status.
+/// Returns `Ok(exit_code)` where exit_code is normalized:
+/// - 126/127 for exec errors become 127 (GNU Make normalizes both to 127)
+/// - Other codes are returned as-is
+/// Returns `Err` if the process could not be spawned.
 fn run_cmd_with_error_handling(
     mut cmd: Command,
     recipe_cmd: &str,
     progname: &str,
-) -> std::io::Result<std::process::ExitStatus> {
+) -> std::io::Result<i32> {
     use std::io::Read;
     cmd.stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -4168,6 +4200,7 @@ fn run_cmd_with_error_handling(
 
     // If exit code is 127 (command not found) or 126 (permission/exec error),
     // check if the first word of the command exists and print our own GNU Make-style error.
+    // GNU Make normalizes both to exit 127 when it handles the error itself via exec.
     if (code == 127 || code == 126) && !recipe_cmd.trim().is_empty() {
         let cmd_name = extract_cmd_name(recipe_cmd);
         if !cmd_name.is_empty() {
@@ -4180,8 +4213,8 @@ fn run_cmd_with_error_handling(
             };
             if let Some(msg) = err_msg {
                 eprintln!("{}: {}: {}", progname, cmd_name, msg);
-                // Suppress the shell's error output for this case
-                return Ok(status);
+                // Suppress the shell's error output and normalize to exit 127
+                return Ok(127);
             }
         }
     }
@@ -4191,7 +4224,7 @@ fn run_cmd_with_error_handling(
         let _ = std::io::stderr().lock().write_all(&stderr_bytes);
     }
 
-    Ok(status)
+    Ok(code)
 }
 
 /// Pre-process a recipe line before variable expansion.
