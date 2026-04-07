@@ -259,6 +259,8 @@ impl Parser {
         }
 
         // undefine directive (must be checked before define)
+        // BUT: `undefine:` or `undefine : recipe` is a RULE target named "undefine",
+        // not the undefine directive. Check that this is not a rule.
         if effective.starts_with("undefine ") || effective.starts_with("override undefine ") {
             let is_override = effective.starts_with("override ");
             let rest = if is_override {
@@ -267,7 +269,12 @@ impl Parser {
                 &effective
             };
             let name = rest.strip_prefix("undefine").unwrap().trim().to_string();
-            return ParsedLine::Undefine { name, is_override };
+            // If the name starts with `:` (including `::` for double-colon rules),
+            // this is actually a rule like `undefine: ;recipe`, not a directive.
+            if !name.starts_with(':') {
+                return ParsedLine::Undefine { name, is_override };
+            }
+            // Fall through to rule/assignment parsing
         }
 
         // define directive (also handles "override define" and "export define")
@@ -678,7 +685,20 @@ fn find_assignment_op(line: &str, op: &str) -> Option<usize> {
     None
 }
 
+/// Like `try_parse_rule` but skips target-specific-variable detection.
+/// Use when the ORIGINAL (pre-expansion) line was confirmed to have no
+/// literal assignment operator, so any `=` sign in the expanded line came
+/// from variable expansion (e.g. `ten: one $(EQ) two` → `ten: one = two`).
+/// In that case the line must be treated as a rule, not a TSV assignment.
+pub fn try_parse_rule_force(line: &str) -> Option<ParsedLine> {
+    try_parse_rule_inner(line, true)
+}
+
 pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
+    try_parse_rule_inner(line, false)
+}
+
+fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
     // Find the colon that separates targets from prerequisites.
     // Handles: target: prereqs, target:: prereqs (double-colon),
     //          target&: prereqs (grouped targets, GNU Make 4.3+),
@@ -742,36 +762,40 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     // Check for target-specific variable assignment in rest, but only in the
     // part before any inline recipe (i.e., before a bare `;`).
     // e.g., "target: VAR = value" but NOT "target: ; @echo $(VAR=x)"
-    let prereq_part = match find_semicolon(rest_trimmed) {
-        Some(semi) => &rest_trimmed[..semi],
-        None => rest_trimmed,
-    };
-    let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
-    for op in &ops {
-        if let Some(pos) = find_assignment_op(prereq_part.trim(), op) {
-            let raw_var_name = prereq_part.trim()[..pos].trim();
-            // Strip override/export/unexport/private prefixes from the variable name
-            let (is_override, is_export, is_unexport, is_private, var_name) = strip_var_prefixes(raw_var_name);
-            let var_value = prereq_part.trim()[pos + op.len()..].trim_start().to_string();
-            if !var_name.is_empty() && is_valid_variable_name(var_name) {
-                let flavor = match *op {
-                    "=" => VarFlavor::Recursive,
-                    ":=" | "::=" | ":::=" => VarFlavor::Simple,
-                    "+=" => VarFlavor::Append,
-                    "?=" => VarFlavor::Conditional,
-                    "!=" => VarFlavor::Shell,
-                    _ => VarFlavor::Recursive,
-                };
-                return Some(ParsedLine::VariableAssignment {
-                    name: var_name.to_string(),
-                    value: var_value,
-                    flavor,
-                    is_override,
-                    is_export,
-                    is_unexport,
-                    is_private,
-                    target: Some(targets_str.to_string()),
-                });
+    // Skip this check when the caller knows the original (pre-expansion) line
+    // had no literal `=`, meaning any `=` came from variable expansion.
+    if !skip_tsv {
+        let prereq_part = match find_semicolon(rest_trimmed) {
+            Some(semi) => &rest_trimmed[..semi],
+            None => rest_trimmed,
+        };
+        let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
+        for op in &ops {
+            if let Some(pos) = find_assignment_op(prereq_part.trim(), op) {
+                let raw_var_name = prereq_part.trim()[..pos].trim();
+                // Strip override/export/unexport/private prefixes from the variable name
+                let (is_override, is_export, is_unexport, is_private, var_name) = strip_var_prefixes(raw_var_name);
+                let var_value = prereq_part.trim()[pos + op.len()..].trim_start().to_string();
+                if !var_name.is_empty() && is_valid_variable_name(var_name) {
+                    let flavor = match *op {
+                        "=" => VarFlavor::Recursive,
+                        ":=" | "::=" | ":::=" => VarFlavor::Simple,
+                        "+=" => VarFlavor::Append,
+                        "?=" => VarFlavor::Conditional,
+                        "!=" => VarFlavor::Shell,
+                        _ => VarFlavor::Recursive,
+                    };
+                    return Some(ParsedLine::VariableAssignment {
+                        name: var_name.to_string(),
+                        value: var_value,
+                        flavor,
+                        is_override,
+                        is_export,
+                        is_unexport,
+                        is_private,
+                        target: Some(targets_str.to_string()),
+                    });
+                }
             }
         }
     }
@@ -1120,6 +1144,11 @@ fn expand_static_pattern_rule(
     }
 
     ParsedLine::StaticPatternExpansion(rules)
+}
+
+/// Public wrapper around find_rule_colon for use in the eval loop.
+pub fn find_rule_colon_pub(line: &str) -> Option<usize> {
+    find_rule_colon(line)
 }
 
 fn find_rule_colon(line: &str) -> Option<usize> {

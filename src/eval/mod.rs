@@ -143,6 +143,73 @@ pub fn make_progname() -> String {
     }
 }
 
+/// Execute pre-expanded recipe lines for an include file.
+/// `expanded`: (lineno, expanded_cmd, silent, ignore_error) tuples from expand_include_recipe_lines.
+/// Does NOT require &MakeState — safe to run in a thread.
+pub fn execute_include_recipe_expanded(
+    expanded: &[(usize, String, bool, bool)],
+    target: &str,
+    shell: &str,
+    shell_flags: &str,
+    silent: bool,
+    source_file: &str,
+) -> Result<(), String> {
+    use std::os::unix::process::ExitStatusExt;
+    let progname = make_progname();
+
+    for (lineno, expanded_cmd, cmd_silent, ignore_error) in expanded {
+        if !silent && !cmd_silent && !expanded_cmd.is_empty() {
+            println!("{}", expanded_cmd);
+        }
+
+        if expanded_cmd.is_empty() {
+            continue;
+        }
+
+        let term_msg = format!(
+            "{}: *** [{}:{}: {}] Terminated\n",
+            progname, source_file, lineno, target
+        );
+        crate::signal_handler::set_term_message(&term_msg);
+
+        let status = std::process::Command::new(shell)
+            .arg(shell_flags)
+            .arg(expanded_cmd)
+            .status();
+
+        crate::signal_handler::clear_term_message();
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                if let Some(sig) = s.signal() {
+                    if !ignore_error {
+                        let sig_name = match sig {
+                            libc::SIGTERM => "Terminated",
+                            libc::SIGINT => "Interrupt",
+                            libc::SIGHUP => "Hangup",
+                            libc::SIGKILL => "Killed",
+                            _ => "Signal",
+                        };
+                        return Err(format!("[{}:{}: {}] {}", source_file, lineno, target, sig_name));
+                    }
+                } else {
+                    let code = s.code().unwrap_or(1);
+                    if !ignore_error {
+                        return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
+                    }
+                }
+            }
+            Err(e) => {
+                if !ignore_error {
+                    return Err(format!("shell error: {}", e));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Determine whether "entering/leaving directory" messages should be printed.
 fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
     if args.no_print_directory {
@@ -429,8 +496,11 @@ impl MakeState {
                 Variable::new(mf, VarFlavor::Recursive, VarOrigin::Default));
         }
         // MAKEOVERRIDES: command-line variable assignments portion of MAKEFLAGS.
+        // Only include variables that came from the actual command line (not from env MAKEFLAGS).
         {
-            let ov: Vec<String> = self.args.variables.iter()
+            let cmdline_start = self.args.cmdline_vars_start;
+            let ov: Vec<String> = self.args.variables[cmdline_start..]
+                .iter()
                 .map(|(n, v)| format!("{}={}", n, v))
                 .collect();
             self.db.variables.insert("MAKEOVERRIDES".into(),
@@ -470,10 +540,36 @@ impl MakeState {
             });
         }
 
-        // Command-line variables override everything; GNU Make stores them as recursive
+        // Command-line variables override everything; GNU Make stores them as recursive.
+        // Handle operator suffixes: FOO+=val (append), FOO?=val (conditional), FOO:=val (simple).
         for (name, value) in &self.args.variables {
-            self.db.variables.insert(name.clone(),
-                Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
+            if name.ends_with('+') {
+                // Append operator: strip '+', append value to existing
+                let real_name = name.trim_end_matches('+').to_string();
+                let existing = self.db.variables.get(&real_name)
+                    .map(|v| v.value.clone())
+                    .unwrap_or_default();
+                let new_val = if existing.is_empty() {
+                    value.clone()
+                } else {
+                    format!("{} {}", existing, value)
+                };
+                self.db.variables.insert(real_name,
+                    Variable::new(new_val, VarFlavor::Recursive, VarOrigin::CommandLine));
+            } else if name.ends_with('?') {
+                // Conditional: only set if not already defined
+                let real_name = name.trim_end_matches('?').to_string();
+                self.db.variables.entry(real_name).or_insert_with(||
+                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
+            } else if name.ends_with(':') {
+                // Simple assignment
+                let real_name = name.trim_end_matches(':').to_string();
+                self.db.variables.insert(real_name,
+                    Variable::new(value.clone(), VarFlavor::Simple, VarOrigin::CommandLine));
+            } else {
+                self.db.variables.insert(name.clone(),
+                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
+            }
         }
     }
 
@@ -1174,7 +1270,36 @@ impl MakeState {
                 }
             };
 
-            let parsed = parser.parse_line(&expanded, self);
+            // If the raw line looked like a rule (has a rule colon) but NOT an
+            // assignment (try_parse_variable_assignment returned None above), and
+            // expansion introduced a bare `=` into the prereq portion (e.g.
+            // `ten: one $(EQ) two` → `ten: one = two`), we must not let
+            // parse_line re-detect the result as a target-specific variable.
+            //
+            // Strategy: if the raw line has a rule colon AND try_parse_rule
+            // succeeds on the expanded form, use that result directly.  This
+            // correctly handles the expansion-introduced `=` case while leaving
+            // genuine target-specific variables (where the raw line already had
+            // a literal `=`) to fall through the normal path.
+            let raw_has_rule_colon_no_assignment = {
+                let trimmed_raw = line.trim();
+                !trimmed_raw.starts_with('#')
+                    && parser::try_parse_variable_assignment(trimmed_raw).is_none()
+                    && parser::find_rule_colon_pub(trimmed_raw).is_some()
+            };
+            let parsed = if raw_has_rule_colon_no_assignment {
+                // Try rule parse with TSV detection DISABLED.  The original line
+                // had no literal `=`, so any `=` in `expanded` came from variable
+                // expansion (e.g. `ten: one $(EQ) two` → `ten: one = two`).
+                // We must not treat the expanded `=` as a target-specific variable.
+                if let Some(rule_result) = parser::try_parse_rule_force(&expanded) {
+                    rule_result
+                } else {
+                    parser.parse_line(&expanded, self)
+                }
+            } else {
+                parser.parse_line(&expanded, self)
+            };
 
             // Handle conditionals
             match &parsed {
@@ -1585,6 +1710,12 @@ impl MakeState {
                 ParsedLine::Undefine { name, is_override } => {
                     // Remove the variable from the database entirely.
                     // Without override, a command-line variable cannot be undefined.
+                    // Empty name (from `undefine $empty`) is a fatal error.
+                    if name.is_empty() {
+                        let fname = parser.filename.to_string_lossy();
+                        eprintln!("{}:{}: *** empty variable name.  Stop.", fname, lineno);
+                        std::process::exit(2);
+                    }
                     let is_cmdline = self.db.variables.get(&name)
                         .map_or(false, |v| v.origin == VarOrigin::CommandLine);
                     if is_override || !is_cmdline {
@@ -1973,8 +2104,30 @@ impl MakeState {
             self.db.explicit_dep_names.insert(prereq.clone());
         }
 
-        // Register explicit rules
-        for target in &rule.targets.clone() {
+        // Register explicit rules.
+        // Expand glob wildcards in target names (GNU Make expands them at parse time).
+        // For example, `a.o[Nn][Ee] a.t*: ; @echo $@` is expanded to the matching files.
+        let mut expanded_targets: Vec<String> = Vec::new();
+        for target in &rule.targets {
+            if (target.contains('*') || target.contains('?') || target.contains('['))
+                && !target.contains('%')
+            {
+                let mut matched: Vec<String> = Vec::new();
+                if let Ok(paths) = ::glob::glob(target) {
+                    for entry in paths.flatten() {
+                        matched.push(entry.to_string_lossy().to_string());
+                    }
+                }
+                if matched.is_empty() {
+                    expanded_targets.push(target.clone());
+                } else {
+                    expanded_targets.extend(matched);
+                }
+            } else {
+                expanded_targets.push(target.clone());
+            }
+        }
+        for target in &expanded_targets {
             if SpecialTarget::from_str(target).is_some() {
                 continue;
             }
@@ -2803,6 +2956,33 @@ impl MakeState {
             }
         }
         Ok(())
+    }
+
+    /// Pre-expand recipe lines for an include file recipe into (lineno, expanded_cmd, silent, ignore_error).
+    /// This is used to separate the variable expansion (requires &self) from the execution
+    /// (can run in a thread without &self).
+    fn expand_include_recipe_lines(
+        &self, target: &str, stem: &str, recipe: &[(usize, String)]
+    ) -> Vec<(usize, String, bool, bool)> {
+        let mut auto_vars = HashMap::new();
+        auto_vars.insert("@".to_string(), target.to_string());
+        auto_vars.insert("*".to_string(), stem.to_string());
+
+        recipe.iter().map(|(lineno, cmd_template)| {
+            let mut cmd = cmd_template.trim_start().to_string();
+            let mut cmd_silent = false;
+            let mut ignore_error = false;
+            loop {
+                match cmd.chars().next().unwrap_or(' ') {
+                    '@' => { cmd_silent = true; cmd = cmd[1..].to_string(); }
+                    '-' => { ignore_error = true; cmd = cmd[1..].to_string(); }
+                    '+' => { cmd = cmd[1..].to_string(); }
+                    _ => break,
+                }
+            }
+            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
+            (*lineno, expanded_cmd, cmd_silent, ignore_error)
+        }).collect()
     }
 
     fn find_include_file(&self, file: &str) -> Option<PathBuf> {
