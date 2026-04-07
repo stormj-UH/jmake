@@ -341,6 +341,10 @@ impl Parser {
             }
         }
         if !effective.is_empty() {
+            // A bare colon (empty target from variable expansion) is silently ignored
+            if effective.starts_with(':') || effective.trim() == ":" {
+                return ParsedLine::Empty;
+            }
             // Check for ifeq/ifneq without whitespace
             if effective.starts_with("ifeq(") || effective.starts_with("ifneq(") {
                 return ParsedLine::MissingSeparator(

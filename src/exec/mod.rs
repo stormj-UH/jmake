@@ -507,9 +507,20 @@ impl<'a> Executor<'a> {
                         Some(pt) => pt > target_time,
                         None => {
                             // File doesn't exist and has no known sources to determine mtime.
-                            // For .NOTINTERMEDIATE files: they must be built (not skipped),
-                            // so treat as "needs rebuild" to force the build to proceed.
-                            self.db.is_notintermediate(p)
+                            // For secondary/intermediate files whose sources are all up to date
+                            // (effective_mtime could not be determined), we can skip.
+                            // But for explicitly-mentioned files and .NOTINTERMEDIATE files
+                            // that are absent, we MUST build (they are "infinitely new").
+                            // Also treat any non-existent file with a rule as needing rebuild:
+                            // the rule will be run, and the target may then be out of date.
+                            if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                                return false; // secondary missing file: skip
+                            }
+                            if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
+                                return false; // deleted intermediate: skip (sources up to date)
+                            }
+                            // Regular file that doesn't exist: must be built, treat as newer.
+                            true
                         }
                     }
                 });
