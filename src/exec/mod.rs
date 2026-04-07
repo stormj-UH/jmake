@@ -54,7 +54,9 @@ pub struct Executor<'a> {
     /// Stack of inherited target-specific variables from parent targets.
     /// When building a target's prerequisites, the parent's collected target vars
     /// are pushed here so that prereqs can inherit them.
-    inherited_vars_stack: Vec<HashMap<String, (String, bool, bool)>>,
+    /// Each entry: HashMap<var_name, (value, is_override, is_private, export_status)>
+    /// where export_status is Some(true)=exported, Some(false)=unexported, None=use global default.
+    inherited_vars_stack: Vec<HashMap<String, (String, bool, bool, Option<bool>)>>,
     /// Extra variables to export to child processes for the current target.
     /// Set before calling execute_recipe and cleared after.
     /// Used for target-specific and pattern-specific variables with export=Some(true).
@@ -1212,21 +1214,53 @@ impl<'a> Executor<'a> {
         }
 
         // Step 0.5: if there is no recipe from explicit rules, peek at the matching
-        // pattern rule to get its (non-SE) prereqs and build them BEFORE explicit
-        // prereqs.  GNU Make always builds pattern-rule prereqs first, then explicit
-        // prereqs, regardless of rule declaration order.
-        // We only do this pre-build step; the full pattern-rule logic (SE expansion,
-        // recipe selection, all_prereqs reordering) happens later at the pattern rule block.
+        // pattern rule to get its prereqs and build them BEFORE explicit prereqs.
+        // GNU Make always builds pattern-rule prereqs first, then explicit prereqs.
+        //
+        // For SE pattern rules, we perform the SE expansion HERE (using all_prereqs as
+        // the basis for $^/$+/$< — the list is known before building) and CACHE the
+        // result. The pattern rule block later uses this cached expansion to avoid
+        // double-expansion (which would trigger $(info ...) side effects twice).
+        //
+        // pre_pat_se_expansion: if non-None, means we already SE-expanded the pattern
+        // rule's prereqs and the pattern rule block should skip its own SE expansion.
+        let mut pre_pat_se_expansion: Option<(Vec<String>, Vec<String>)> = None;
         let pre_pat_prereqs: Vec<String> = if recipe.is_empty() {
             if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
                 let matched_pt: String = pat_rule.targets.iter()
                     .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                     .cloned()
                     .unwrap_or_else(|| "%".to_string());
-                pat_rule.prerequisites.iter()
+                let mut prereqs: Vec<String> = pat_rule.prerequisites.iter()
                     .filter(|p| p.as_str() != ".WAIT")
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
-                    .collect()
+                    .collect();
+                // For SE pattern rules, also compute the SE expansion now (using current
+                // all_prereqs for auto vars) so we can build those prereqs first.
+                if pat_rule.second_expansion_prereqs.is_some() || pat_rule.second_expansion_order_only.is_some() {
+                    let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                    pat_se_auto_vars.insert("?".to_string(), String::new());
+                    let collected_target_vars = self.collect_target_vars(target);
+                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
+                    let mut se_normal: Vec<String> = Vec::new();
+                    let mut se_oo: Vec<String> = Vec::new();
+                    if let Some(ref text) = pat_rule.second_expansion_prereqs.clone() {
+                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        se_normal.extend(normal.iter().cloned());
+                        se_oo.extend(oo.iter().cloned());
+                        prereqs.extend(normal);
+                    }
+                    if let Some(ref text) = pat_rule.second_expansion_order_only.clone() {
+                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
+                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        se_oo.extend(normal);
+                        se_oo.extend(oo);
+                    }
+                    pre_pat_se_expansion = Some((se_normal, se_oo));
+                }
+                prereqs
             } else {
                 Vec::new()
             }
@@ -1357,27 +1391,37 @@ impl<'a> Executor<'a> {
                 pat_order_only = Self::glob_expand_prereqs(pat_order_only);
 
                 // Handle second expansion for the pattern rule.
-                // Auto vars are built from the ALREADY-accumulated explicit prereqs
-                // (all_prereqs at this point), giving $+ the value from the explicit
-                // rule(s) - which is what GNU Make uses for $+ in SE pattern rules.
+                // If Step 0.5 already performed the SE expansion (and cached the result),
+                // reuse it to avoid double-expansion (which would trigger $(info ...) twice).
+                // Otherwise, perform the SE expansion now using the accumulated explicit prereqs.
                 if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
-                    let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
-                    pat_se_auto_vars.insert("?".to_string(), String::new());
-                    let collected_target_vars = self.collect_target_vars(target);
-                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
+                    if let Some((cached_normal, cached_oo)) = pre_pat_se_expansion.take() {
+                        // Use cached expansion from Step 0.5 - already built, just add to lists.
+                        pat_prereqs.extend(cached_normal);
+                        pat_order_only.extend(cached_oo);
+                    } else {
+                        // SE expansion not yet done (Step 0.5 didn't apply) - do it now.
+                        // Auto vars are built from the ALREADY-accumulated explicit prereqs
+                        // (all_prereqs at this point), giving $+ the value from the explicit
+                        // rule(s) - which is what GNU Make uses for $+ in SE pattern rules.
+                        let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+                        let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                        pat_se_auto_vars.insert("?".to_string(), String::new());
+                        let collected_target_vars = self.collect_target_vars(target);
+                        self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
-                    if let Some(ref text) = pattern_rule.second_expansion_prereqs {
-                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
-                        pat_prereqs.extend(normal);
-                        pat_order_only.extend(oo);
-                    }
-                    if let Some(ref text) = pattern_rule.second_expansion_order_only {
-                        let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
-                        pat_order_only.extend(normal);
-                        pat_order_only.extend(oo);
+                        if let Some(ref text) = pattern_rule.second_expansion_prereqs {
+                            let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
+                            let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            pat_prereqs.extend(normal);
+                            pat_order_only.extend(oo);
+                        }
+                        if let Some(ref text) = pattern_rule.second_expansion_order_only {
+                            let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
+                            let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            pat_order_only.extend(normal);
+                            pat_order_only.extend(oo);
+                        }
                     }
                 }
 
@@ -1385,8 +1429,10 @@ impl<'a> Executor<'a> {
                 // (including duplicates) to all_prereqs so that $+ is computed correctly.
                 // The pattern rule's prereqs are prepended so they come first in $^/$+.
 
-                // Apply GNU Make prereq ordering: standalone-explicit prereqs first,
-                // then intermediates / explicit prereqs sharing a rule with an intermediate.
+                // Apply GNU Make prereq ordering (same as build_with_pattern_rule):
+                //  1. Standalone-explicit: explicitly mentioned, NOT sharing a rule with any intermediate.
+                //  2. Non-explicit (intermediate): not explicitly mentioned.
+                //  3. Shared-explicit: explicitly mentioned, but sharing a rule with an intermediate.
                 // Must compute before the mutable borrow loop below.
                 let pat_prereqs_build_order: Vec<String> = {
                     let standalone: Vec<String> = pat_prereqs.iter()
@@ -1396,15 +1442,20 @@ impl<'a> Executor<'a> {
                         })
                         .cloned()
                         .collect();
-                    let rest: Vec<String> = pat_prereqs.iter()
+                    let intermediates_list: Vec<String> = pat_prereqs.iter()
+                        .filter(|p| !self.db.is_explicitly_mentioned(p))
+                        .cloned()
+                        .collect();
+                    let shared_explicit: Vec<String> = pat_prereqs.iter()
                         .filter(|p| {
-                            !(self.db.is_explicitly_mentioned(p)
-                                && !self.prereq_shares_rule_with_intermediate(p, &pat_prereqs))
+                            self.db.is_explicitly_mentioned(p)
+                                && self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
                         })
                         .cloned()
                         .collect();
                     let mut ordered = standalone;
-                    ordered.extend(rest);
+                    ordered.extend(intermediates_list);
+                    ordered.extend(shared_explicit);
                     ordered
                 };
 
@@ -2322,6 +2373,8 @@ impl<'a> Executor<'a> {
             .filter(|p| p.as_str() != ".WAIT")
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
+        // Glob-expand wildcard patterns in the substituted prerequisites (e.g. a.t* → a.three a.two).
+        prereqs = Self::glob_expand_prereqs(prereqs);
 
         // Also expand any explicit prerequisites that came from `build_target_inner`
         // combining explicit rules with this pattern rule.
@@ -2332,6 +2385,7 @@ impl<'a> Executor<'a> {
             .filter(|p| p.as_str() != ".WAIT")
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
+        order_only = Self::glob_expand_prereqs(order_only);
 
         if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some() {
             // Build base auto vars from normal prereqs (before SE)
@@ -2363,6 +2417,10 @@ impl<'a> Executor<'a> {
             // Restore file context after pattern rule SE expansion.
             *self.state.current_file.borrow_mut() = saved_file;
             *self.state.current_line.borrow_mut() = saved_line;
+
+            // Glob-expand wildcard patterns introduced by SE expansion.
+            prereqs = Self::glob_expand_prereqs(prereqs);
+            order_only = Self::glob_expand_prereqs(order_only);
         }
 
         // Apply shuffle to pattern rule prerequisites.
@@ -2446,7 +2504,14 @@ impl<'a> Executor<'a> {
         //
         // This must be computed before the mutable borrow below (inherited_vars_stack.push).
         let prereqs_ordered: Vec<String> = {
-            // Partition: standalone-explicit vs rest, preserving relative order within each group.
+            // Three groups (GNU Make order):
+            //  1. Standalone-explicit: explicitly mentioned, NOT sharing a rule with any intermediate.
+            //     These are built FIRST (they must exist before intermediates can be checked).
+            //  2. Non-explicit (intermediate): not explicitly mentioned.
+            //     Built second, in original list order.
+            //  3. Shared-explicit: explicitly mentioned, but SHARING a rule with an intermediate.
+            //     Built last; typically they will already be built as also-make siblings of the
+            //     intermediate and can be skipped.
             let standalone: Vec<String> = prereqs.iter()
                 .filter(|p| {
                     self.db.is_explicitly_mentioned(p)
@@ -2454,16 +2519,20 @@ impl<'a> Executor<'a> {
                 })
                 .cloned()
                 .collect();
-            let rest: Vec<String> = prereqs.iter()
+            let intermediates: Vec<String> = prereqs.iter()
+                .filter(|p| !self.db.is_explicitly_mentioned(p))
+                .cloned()
+                .collect();
+            let shared_explicit: Vec<String> = prereqs.iter()
                 .filter(|p| {
-                    !(self.db.is_explicitly_mentioned(p)
-                        && !self.prereq_shares_rule_with_intermediate(p, &prereqs))
+                    self.db.is_explicitly_mentioned(p)
+                        && self.prereq_shares_rule_with_intermediate(p, &prereqs)
                 })
                 .cloned()
                 .collect();
-            // standalone first, then rest (intermediates + shared-explicit in original order)
             let mut ordered = standalone;
-            ordered.extend(rest);
+            ordered.extend(intermediates);
+            ordered.extend(shared_explicit);
             ordered
         };
 
@@ -3139,7 +3208,7 @@ impl<'a> Executor<'a> {
     ///                    pre-override inherited values, so that `b: private F = b` does
     ///                    NOT block `a: F = a` from reaching `c` through `b`)
     /// Pattern-specific variables are matched with shortest-stem semantics.
-    fn collect_target_vars(&self, target: &str) -> (HashMap<String, (String, bool, bool)>, HashMap<String, (String, bool, bool)>) {
+    fn collect_target_vars(&self, target: &str) -> (HashMap<String, (String, bool, bool)>, HashMap<String, (String, bool, bool, Option<bool>)>) {
         // We use a two-pass approach for Recursive variables:
         //  Pass 1: collect Simple/Conditional/Shell vars (expanded immediately) and
         //          store Recursive/Append vars' raw values.
@@ -3162,7 +3231,7 @@ impl<'a> Executor<'a> {
         // The inherited vars come from the parent target's collected vars pushed onto
         // inherited_vars_stack before building this target as a prerequisite.
         if let Some(inherited) = self.inherited_vars_stack.last() {
-            for (name, (val, is_override, is_private_flag)) in inherited {
+            for (name, (val, is_override, is_private_flag, _export_status)) in inherited {
                 if *is_private_flag { continue; } // private vars are not inherited
                 let idx = staging.len();
                 staging.push((name.clone(), val.clone(), true, *is_override, VarFlavor::Simple));
@@ -3449,7 +3518,37 @@ impl<'a> Executor<'a> {
         // Pattern-specific private vars (set in step 1) should NOT pass through at all.
         // Target-specific private vars (set in step 2) that override an existing value should
         // let the pre-override value pass through to prerequisites.
-        let mut for_prereqs: HashMap<String, (String, bool, bool)> = HashMap::new();
+        // Collect the effective export status for each variable for propagation to prerequisites.
+        // export_status: Some(true)=exported, Some(false)=unexported, None=use global/inherited.
+        // Priority: explicit TSV export flag > inherited export status from parent.
+        let mut var_export_status: HashMap<String, Option<bool>> = HashMap::new();
+
+        // Start with inherited export statuses from the parent.
+        if let Some(inherited) = self.inherited_vars_stack.last() {
+            for (name, (_, _, _, export_status)) in inherited {
+                var_export_status.insert(name.clone(), *export_status);
+            }
+        }
+
+        // Pattern-specific vars can set export status.
+        for (_, _, psv) in &pattern_vars_with_stem {
+            if psv.var.export.is_some() {
+                var_export_status.insert(psv.var_name.clone(), psv.var.export);
+            }
+        }
+
+        // Target-specific vars override the export status (if explicitly set).
+        if let Some(rules) = self.db.rules.get(target) {
+            for rule in rules {
+                for (var_name, var) in &rule.target_specific_vars {
+                    if var.export.is_some() {
+                        var_export_status.insert(var_name.clone(), var.export);
+                    }
+                }
+            }
+        }
+
+        let mut for_prereqs: HashMap<String, (String, bool, bool, Option<bool>)> = HashMap::new();
         for (name, (val, is_override, is_priv)) in &result {
             if *is_priv {
                 if step1_private_flags.contains(name.as_str()) {
@@ -3460,7 +3559,8 @@ impl<'a> Executor<'a> {
                     // For prereqs, use the pre-step-2 value if it existed.
                     if let Some((pre_val, pre_is_override)) = pre_step2_snap.get(name) {
                         // Carry through the pre-override value, marking it as non-private.
-                        for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false));
+                        let export_st = var_export_status.get(name.as_str()).copied().flatten();
+                        for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false, export_st));
                     }
                     // If no pre-step-2 entry: don't include in for_prereqs (new private var).
                 }
@@ -3471,7 +3571,8 @@ impl<'a> Executor<'a> {
                 if name == ".EXTRA_PREREQS" {
                     // Do not propagate .EXTRA_PREREQS to prerequisites.
                 } else {
-                    for_prereqs.insert(name.clone(), (val.clone(), *is_override, false));
+                    let export_st = var_export_status.get(name.as_str()).copied().flatten();
+                    for_prereqs.insert(name.clone(), (val.clone(), *is_override, false, export_st));
                 }
             }
         }
@@ -4383,6 +4484,53 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // Collect explicit export/unexport decisions for this target (pattern + target-specific).
+        // Used below to decide whether inherited export_status can be overridden.
+        let mut explicit_exports: HashSet<String> = HashSet::new();
+        for psv in &self.db.pattern_specific_vars {
+            if match_pattern_simple(&psv.pattern, target).is_some() {
+                if psv.var.export == Some(true) {
+                    explicit_exports.insert(psv.var_name.clone());
+                }
+            }
+        }
+        if let Some(rules) = self.db.rules.get(target) {
+            for rule in rules {
+                for (var_name, var) in &rule.target_specific_vars {
+                    if var.export == Some(true) {
+                        explicit_exports.insert(var_name.clone());
+                    }
+                }
+            }
+        }
+
+        // Also apply inherited export status from the parent target's for_prereqs stack.
+        // When a parent target has `unexport VAR=val`, its for_prereqs carries
+        // export_status=Some(false) for VAR. This suppresses VAR in the shell env
+        // of this target's recipe, even if this target itself has no explicit unexport.
+        // Similarly, `export VAR=val` in a parent propagates export_status=Some(true).
+        if let Some(inherited) = self.inherited_vars_stack.last() {
+            for (var_name, (_, _, _, export_status)) in inherited {
+                match export_status {
+                    Some(false) => {
+                        // Only add to unexports if this target doesn't explicitly export it.
+                        if !explicit_exports.contains(var_name.as_str()) {
+                            unexports.insert(var_name.clone());
+                        }
+                    }
+                    Some(true) => {
+                        // Inherited explicit export: remove from unexports (unless target explicitly
+                        // unexports it, which was already handled above).
+                        if !unexports.contains(var_name.as_str()) {
+                            // Mark as inherited-exported so the loop below includes this var.
+                            explicit_exports.insert(var_name.clone());
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+
         // For all target-specific/pattern-specific vars:
         // - If explicitly exported with 'export' keyword → add to exports
         // - If corresponding global var is exported → override global value with target-specific value
@@ -4400,15 +4548,8 @@ impl<'a> Executor<'a> {
                 continue;
             }
             // Check if the var should be exported (either explicitly or via global setting).
-            // Check for explicit target-specific export.
-            let target_explicitly_exported = self.db.rules.get(target)
-                .map(|rules| rules.iter().any(|r| r.target_specific_vars.iter().any(|(n, v)| n == var_name && v.export == Some(true))))
-                .unwrap_or(false)
-                || self.db.pattern_specific_vars.iter().any(|psv| {
-                    match_pattern_simple(&psv.pattern, target).is_some()
-                    && &psv.var_name == var_name
-                    && psv.var.export == Some(true)
-                });
+            // Check for explicit target-specific export (also covers inherited export status).
+            let target_explicitly_exported = explicit_exports.contains(var_name.as_str());
             if target_explicitly_exported || global_should_export(var_name) {
                 exports.insert(var_name.clone(), value.clone());
             }
@@ -4441,6 +4582,29 @@ impl<'a> Executor<'a> {
                         unexports.insert(var_name.clone());
                     } else if var.export == Some(true) {
                         unexports.remove(var_name);
+                    }
+                }
+            }
+        }
+
+        // Also apply inherited unexport propagation from the parent target's for_prereqs stack.
+        // When a parent target has `unexport VAR=val`, the for_prereqs entry carries
+        // export_status=Some(false), which must suppress VAR in this target's recipe env
+        // (even if this target itself has no explicit unexport for VAR).
+        if let Some(inherited) = self.inherited_vars_stack.last() {
+            for (var_name, (_, _, _, export_status)) in inherited {
+                if *export_status == Some(false) && !unexports.contains(var_name.as_str()) {
+                    // Check that this target doesn't explicitly re-export the var.
+                    let target_explicitly_exports = self.db.rules.get(target)
+                        .map(|rules| rules.iter().any(|r| r.target_specific_vars.iter().any(|(n, v)| n == var_name && v.export == Some(true))))
+                        .unwrap_or(false)
+                        || self.db.pattern_specific_vars.iter().any(|psv| {
+                            match_pattern_simple(&psv.pattern, target).is_some()
+                            && &psv.var_name == var_name
+                            && psv.var.export == Some(true)
+                        });
+                    if !target_explicitly_exports {
+                        unexports.insert(var_name.clone());
                     }
                 }
             }
@@ -4659,7 +4823,9 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
 
         // Collect one top-level word, respecting $(...)/${...} groups so that
         // whitespace inside function calls doesn't split words.
-        // Within a word, replace only the first bare (top-level) '%'.
+        // Within a word, replace only the first '%' (at ANY depth level, including
+        // inside function calls like $(%_a) → $(x_a) when stem=x).
+        // GNU Make substitutes % in SE text at all depths, not just top level.
         let mut depth: i32 = 0;
         let mut first_percent_replaced = false;
         while i < n {
@@ -4682,8 +4848,8 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
                 i += 1;
                 continue;
             }
-            // Bare % at top level: substitute stem (only once per word).
-            if c == '%' && depth == 0 && !first_percent_replaced {
+            // '%' at ANY depth: substitute stem (only once per word).
+            if c == '%' && !first_percent_replaced {
                 result.push_str(stem_to_use);
                 first_percent_replaced = true;
                 i += 1;
@@ -4768,9 +4934,12 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
             continue;
         }
         // Collect one top-level word (respecting $(...)/${...} nesting depth).
+        // Scan through ALL characters (including inside function calls) to find the FIRST '%'.
+        // The dir-logic is based on the POSITION of % relative to the start of the word.
         let word_start = i;
         let mut depth: i32 = 0;
-        let mut pct_rel: Option<usize> = None; // position of first bare '%' relative to word_start
+        // pct_abs: absolute index of first '%' in the word (at any depth level).
+        let mut pct_abs: Option<usize> = None;
         let mut j = i;
         while j < n {
             let c = chars[j];
@@ -4785,22 +4954,21 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
                 j += 1;
                 continue;
             }
-            if c == '%' && depth == 0 && pct_rel.is_none() {
-                pct_rel = Some(j - word_start);
+            if c == '%' && pct_abs.is_none() {
+                pct_abs = Some(j);
             }
             j += 1;
         }
         // The word is chars[word_start..j].
-        if let Some(rel_pct) = pct_rel {
-            // Word contains '%'.
-            // Determine whether to use full stem or base stem.
-            // rel_pct == 0 means '%' is the very first character of the word: use full stem.
-            // rel_pct > 0: use base stem.  For function calls (word starts with '$'),
-            // we wrap with $(addprefix dir,...) so all result words get dir prepended.
-            let use_full = rel_pct == 0;
+        if let Some(pct_pos) = pct_abs {
+            // Word contains '%' (possibly inside a function call).
+            // Determine dir-logic based on position of '%' relative to the word start.
+            // If '%' is the very first character of the word: use full stem, no dir prepend.
+            // Otherwise: use base stem and apply dir prepend.
+            let use_full = pct_pos == word_start;
             let stem_for_subst = if use_full { escaped_full.as_str() } else { escaped_base.as_str() };
             // Determine if wrapping with addprefix is needed.
-            // Wrapping is needed when: !use_full AND the word looks like a function call
+            // Wrapping is needed when: !use_full AND the word is a function call
             // (starts with '$(' or '${'), because dir-prepend must apply to each expanded word.
             let needs_addprefix = !use_full && word_start < n
                 && chars[word_start] == '$'

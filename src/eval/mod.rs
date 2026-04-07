@@ -1287,38 +1287,32 @@ impl MakeState {
             // correctly handles the expansion-introduced `=` case while leaving
             // genuine target-specific variables (where the raw line already had
             // a literal `=`) to fall through the normal path.
-            let raw_has_rule_colon_no_assignment = {
+            // IMPORTANT: Custom recipe-prefix lines must NOT be passed through the
+            // rule-colon heuristic below (they look like rules because a recipe line
+            // like `> @cmd '...' > $@` may contain a colon).  Detect them here and
+            // go directly to parse_line so that parse_line's recipe-prefix check runs.
+            let raw_has_rule_colon_no_assignment = if line.starts_with('\t') || is_custom_recipe_line {
+                // Tab-prefixed and custom-prefix lines are always recipes:
+                // skip the rule-colon heuristic entirely.
+                false
+            } else {
                 let trimmed_raw = line.trim();
                 !trimmed_raw.starts_with('#')
                     && parser::try_parse_variable_assignment(trimmed_raw).is_none()
                     && parser::find_rule_colon_pub(trimmed_raw).is_some()
             };
-            if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
-                eprintln!("DEBUG parse: raw={:?} expanded={:?} raw_has_rule_colon={}", line.trim(), expanded, raw_has_rule_colon_no_assignment);
-            }
             let parsed = if raw_has_rule_colon_no_assignment {
                 // Try rule parse with TSV detection DISABLED.  The original line
                 // had no literal `=`, so any `=` in `expanded` came from variable
                 // expansion (e.g. `ten: one $(EQ) two` → `ten: one = two`).
                 // We must not treat the expanded `=` as a target-specific variable.
                 if let Some(rule_result) = parser::try_parse_rule_force(&expanded) {
-                    if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
-                        eprintln!("DEBUG parse: -> try_parse_rule_force returned rule {:?}", rule_result);
-                    }
                     rule_result
                 } else {
-                    let r = parser.parse_line(&expanded, self);
-                    if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
-                        eprintln!("DEBUG parse: -> parse_line returned {:?}", r);
-                    }
-                    r
+                    parser.parse_line(&expanded, self)
                 }
             } else {
-                let r = parser.parse_line(&expanded, self);
-                if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
-                    eprintln!("DEBUG parse: -> parse_line (no rule colon) returned {:?}", r);
-                }
-                r
+                parser.parse_line(&expanded, self)
             };
 
             // Handle conditionals
@@ -2247,6 +2241,12 @@ impl MakeState {
                             eprintln!("make: warning: overriding recipe for target '{}'", target);
                         }
                         existing.recipe = rule.recipe.clone();
+                        // Also update source_file and lineno to reflect the rule that
+                        // provides the recipe (so error messages reference the correct file/line).
+                        if !rule.source_file.is_empty() {
+                            existing.source_file = rule.source_file.clone();
+                            existing.lineno = rule.lineno;
+                        }
                     }
                     // Update grouped_siblings: if the new rule brings grouped siblings
                     // (e.g. `a b&: ; recipe` following a standalone `a:`), adopt them.
