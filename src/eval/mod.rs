@@ -353,7 +353,12 @@ impl MakeState {
         if self.args.debug_short { single_flags.push('d'); }
         if self.args.environment_overrides { single_flags.push('e'); }
         if self.args.ignore_errors { single_flags.push('i'); }
-        if self.args.keep_going { single_flags.push('k'); }
+        if self.args.keep_going {
+            single_flags.push('k');
+        } else if self.args.no_keep_going_explicit {
+            // -S was explicitly set; output 'S' to indicate keep-going was disabled.
+            single_flags.push('S');
+        }
         if self.args.dry_run { single_flags.push('n'); }
         if self.args.question { single_flags.push('q'); }
         if self.args.no_builtin_rules { single_flags.push('r'); }
