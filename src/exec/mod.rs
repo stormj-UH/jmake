@@ -633,9 +633,9 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // Collect in reverse build order: intermediates closer to the top-level target
-        // (built last) should appear first in the rm command, matching GNU Make's output.
-        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
+        // Collect in prerequisite/encounter order (the order they were built), matching
+        // GNU Make's deletion output order.
+        let to_delete: Vec<String> = self.intermediate_built.iter()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -3219,38 +3219,37 @@ impl<'a> Executor<'a> {
             // GNU Make tracks also_make siblings BEFORE the primary target in the
             // intermediate deletion list (so they are removed first).
 
-            // First, determine if the primary target is intermediate.
-            // Siblings inherit this status if they themselves are not explicitly mentioned.
+            // Compute the set of LITERAL (non-%) prereqs from the original pattern rule.
+            // Only these make the invocation "explicit" for sv 60188 purposes.
+            // Pattern prereqs like %.in do NOT count even if the expanded form (e.g. foo.in)
+            // happens to be explicitly mentioned elsewhere.
+            // Note: literal prereqs in a pattern rule have no % so they are already concrete.
+            let literal_rule_prereqs: std::collections::HashSet<&str> = rule.prerequisites.iter()
+                .filter(|p| !p.contains('%'))
+                .map(|p| p.as_str())
+                .collect();
+
+            // Determine if the primary target is intermediate (without pushing to
+            // intermediate_built yet — siblings must be pushed FIRST so that the
+            // deletion order matches GNU Make: siblings are removed before primary).
             let is_target_intermediate;
-            if self.db.is_intermediate(target) {
-                // Explicitly marked .INTERMEDIATE
-                if !self.intermediate_built.contains(&target.to_string()) {
-                    self.intermediate_built.push(target.to_string());
-                }
-                is_target_intermediate = true;
-            } else if !self.db.is_precious(target)
+            let primary_is_intermediate_explicit = self.db.is_intermediate(target);
+            let primary_is_intermediate_implicit = if !primary_is_intermediate_explicit
+                && !self.db.is_precious(target)
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
             {
-                // Only mark as intermediate if the target is NOT explicitly mentioned
-                // in the makefile and NOT a top-level target.
-                // "Explicitly mentioned" includes literal prereqs of pattern rules (e.g.
-                // `test.z` in `%.tsk: %.z test.z`) — these are NOT intermediate.
                 let is_explicit = self.top_level_targets.contains(target)
                     || self.is_explicitly_mentioned(target);
-                if !is_explicit {
-                    if !self.intermediate_built.contains(&target.to_string()) {
-                        self.intermediate_built.push(target.to_string());
-                    }
-                    is_target_intermediate = true;
-                } else {
-                    is_target_intermediate = false;
-                }
+                !is_explicit
             } else {
-                is_target_intermediate = false;
-            }
+                false
+            };
+            is_target_intermediate = primary_is_intermediate_explicit || primary_is_intermediate_implicit;
 
-            // Now handle also_make siblings (after we know if primary is intermediate).
+            // Handle also_make siblings FIRST (before adding primary to intermediate_built).
+            // This ensures siblings appear before the primary in intermediate_built so they
+            // are deleted first (GNU Make behavior).
             for sib in &also_make_siblings {
                 // Mark as built/covered so we don't run the recipe again for them.
                 self.grouped_covered.insert(sib.clone());
@@ -3273,19 +3272,28 @@ impl<'a> Executor<'a> {
                     // A sibling is intermediate independently of the primary target.
                     // It escapes intermediate status if it is explicitly mentioned
                     // in the makefile (as target or prereq of any rule) OR is a
-                    // top-level target, OR if any of the rule's concrete prerequisites
+                    // top-level target, OR if any LITERAL (non-%) prereq of the rule
                     // is explicitly mentioned (sv 60188: literal non-% prereqs of a
                     // pattern rule make the entire rule invocation "explicit").
-                    let any_prereq_explicit = prereqs.iter()
-                        .any(|p| self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p));
+                    // NOTE: pattern prereqs (%.in → foo.in) do NOT count here even
+                    // if the expanded form is explicitly mentioned elsewhere.
+                    let any_literal_prereq_explicit = literal_rule_prereqs.iter()
+                        .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib)
-                        || any_prereq_explicit;
+                        || any_literal_prereq_explicit;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
                         }
                     }
+                }
+            }
+            // Now add the primary target to intermediate_built (AFTER siblings so that
+            // the deletion order matches GNU Make: siblings are removed first).
+            if is_target_intermediate {
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
                 }
             }
             // In collect_plans_mode, update the plan's is_intermediate flag now that we

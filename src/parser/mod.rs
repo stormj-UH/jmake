@@ -1108,7 +1108,12 @@ pub fn match_pattern(target: &str, pattern: &str) -> Option<String> {
 /// whitespace-delimited word.  Subsequent `%` characters in the same word are left as-is.
 /// This is used when storing the SE text for static pattern rules at parse time.
 pub fn subst_first_percent_per_word_in_se_text(text: &str, stem: &str) -> String {
-    let mut result = String::with_capacity(text.len() + stem.len() * 4);
+    // Escape '$' in stem to '$$' so that when the SE text is later expanded at
+    // build time, the stem characters are not mis-interpreted as variable references.
+    // E.g. stem "oo$ba" must be stored as "oo$$ba" so second expansion yields
+    // "oo$ba" (a literal dollar sign) not "ooa" (where $b evaluates to empty).
+    let escaped_stem: String = stem.replace('$', "$$");
+    let mut result = String::with_capacity(text.len() + escaped_stem.len() * 4);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     let n = chars.len();
@@ -1122,7 +1127,7 @@ pub fn subst_first_percent_per_word_in_se_text(text: &str, stem: &str) -> String
         while i < n && !chars[i].is_whitespace() {
             let c = chars[i];
             if c == '%' && !first_percent_replaced {
-                result.push_str(stem);
+                result.push_str(&escaped_stem);
                 first_percent_replaced = true;
             } else {
                 result.push(c);
@@ -1148,7 +1153,9 @@ pub fn subst_dollar_star_in_se_text(text: &str, stem: &str) -> String {
     if !text.contains("$*") {
         return text.to_string();
     }
-    let mut result = String::with_capacity(text.len() + stem.len() * 4);
+    // Escape '$' in stem to '$$' to prevent mis-interpretation at second expansion time.
+    let escaped_stem: String = stem.replace('$', "$$");
+    let mut result = String::with_capacity(text.len() + escaped_stem.len() * 4);
     let bytes = text.as_bytes();
     let n = bytes.len();
     let mut i = 0;
@@ -1158,7 +1165,7 @@ pub fn subst_dollar_star_in_se_text(text: &str, stem: &str) -> String {
             // which would be part of a longer variable reference.
             let next_next = if i + 2 < n { bytes[i + 2] } else { 0 };
             if next_next != b'(' && next_next != b'{' {
-                result.push_str(stem);
+                result.push_str(&escaped_stem);
                 i += 2; // skip `$*`
                 continue;
             }

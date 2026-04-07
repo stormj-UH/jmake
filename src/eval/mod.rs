@@ -3410,9 +3410,14 @@ impl MakeState {
                         .get(&SpecialTarget::Phony)
                         .cloned()
                         .unwrap_or_default();
+                    let what_if = self.args.what_if.clone();
                     rule_info.prerequisites.iter().any(|prereq| {
                         if phony_targets.contains(prereq.as_str()) {
                             // Phony prerequisite → always out of date
+                            return true;
+                        }
+                        // -W/--what-if: if the prereq is what-if, it appears infinitely new.
+                        if what_if.iter().any(|w| w == prereq) {
                             return true;
                         }
                         // A prereq that has a rule but no file → was "built" (via empty rule
@@ -3839,11 +3844,7 @@ impl MakeState {
                         Some(true) => {
                             // Primary recipe succeeded.
                             if file_path.exists() {
-                                if let Err(e) = self.read_makefile(file_path.as_path()) {
-                                    if !pi_ignore_missing {
-                                        return Err(format!("{}:{}: {}", pi_parent, pi_lineno, e));
-                                    }
-                                }
+                                // Do NOT read the rebuilt file now: re-exec will handle it.
                                 any_really_rebuilt = true;
                             } else {
                                 // Recipe ran but file not created → imagined
@@ -3875,11 +3876,10 @@ impl MakeState {
                     match result {
                         Ok(()) => {
                             if file_path.exists() {
-                                if let Err(e) = self.read_makefile(file_path.as_path()) {
-                                    if !pi_ignore_missing {
-                                        return Err(format!("{}:{}: {}", pi_parent, pi_lineno, e));
-                                    }
-                                }
+                                // Do NOT read the rebuilt file here: we are about to re-exec
+                                // and the re-exec'd process will read it with the updated content.
+                                // Reading it now would cause $(info) and similar side-effect
+                                // directives in the rebuilt file to fire twice.
                                 any_really_rebuilt = true;
                                 // Emit peer-target warning if siblings weren't created.
                                 // This mirrors the warning in build_with_pattern_rule for
