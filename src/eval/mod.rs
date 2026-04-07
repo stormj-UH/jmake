@@ -97,6 +97,13 @@ pub struct MakeState {
     /// During the main build phase, these files are treated as if they were already attempted
     /// so we don't re-run their recipes and avoid duplicate output.
     pub include_imagined: HashSet<String>,
+    /// Stack of call parameter contexts for $(call).
+    /// Each entry is a HashMap mapping "0", "1", "2", etc. to their values.
+    /// Pushed when entering a $(call) and popped when leaving.
+    /// When variable `1`, `2`, etc. is looked up and not found in db.variables,
+    /// the top of this stack is checked. This allows $(eval) inside $(call) to
+    /// correctly expand `$1` to the call argument.
+    pub call_context_stack: RefCell<Vec<HashMap<String, String>>>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -169,6 +176,7 @@ impl MakeState {
             makeoverrides_cleared: false,
             stdin_temp_path: None,
             include_imagined: HashSet::new(),
+            call_context_stack: RefCell::new(Vec::new()),
         };
 
         // Change directory if requested

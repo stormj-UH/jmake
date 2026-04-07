@@ -308,8 +308,20 @@ impl MakeState {
                     self.eval_pending.borrow_mut().push(expanded);
                 } else {
                     let expanded = self.expand_with_auto_vars(args_str, auto_vars);
-                    // Push to eval_pending (processed after expansion via RefCell)
-                    self.eval_pending.borrow_mut().push(expanded);
+                    // Push to eval_pending (processed after expansion via RefCell).
+                    // Note: if we're inside a $(call), auto_vars contains $1, $2, etc.
+                    // After the first expansion pass, `$$1` → `$1` (literal dollar-one).
+                    // GNU Make resolves `$1` in the eval content using the call context.
+                    // We replicate this by doing a second expansion of the eval content
+                    // with the same auto_vars, which resolves any remaining `$N` references
+                    // that were produced by `$$N` in the original body.
+                    let has_call_params = auto_vars.keys().any(|k| k.parse::<u32>().is_ok());
+                    let final_content = if has_call_params && expanded.contains('$') {
+                        self.expand_with_auto_vars(&expanded, auto_vars)
+                    } else {
+                        expanded
+                    };
+                    self.eval_pending.borrow_mut().push(final_content);
                 }
                 return String::new();
             }
@@ -555,18 +567,50 @@ impl MakeState {
         let var_value = if let Some(var) = self.db.variables.get(&var_name) {
             var.value.clone()
         } else {
-            return String::new();
+            // Not a user-defined variable — fall through to calling as a builtin.
+            // The remaining args are passed as a comma-separated args_str to expand_function.
+            // We pass them unexpanded so that expand_function expands them in the normal way
+            // (with access to the current auto_vars context).
+            if args.len() > 1 {
+                let builtin_args = args[1..].join(",");
+                return self.expand_function(&var_name, &builtin_args, auto_vars);
+            } else {
+                return self.expand_function(&var_name, "", auto_vars);
+            }
         };
 
-        // Set up $1, $2, etc.
-        let mut call_auto_vars = auto_vars.clone();
+        // Build a new call frame: inherit non-numeric auto_vars (automatic variables
+        // like @, <, ^, etc.) but do NOT inherit numeric args ($1, $2, ...) from the
+        // outer call context — those must be eclipsed by the explicit args we receive.
+        // Unset positions are explicitly set to empty string.
+        let mut call_auto_vars: HashMap<String, String> = auto_vars
+            .iter()
+            .filter(|(k, _)| k.parse::<u32>().is_err())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         call_auto_vars.insert("0".into(), var_name);
+
+        // Expand each positional arg using the *outer* auto_vars context.
+        let passed_count = args.len() - 1; // number of explicit args
         for (i, arg) in args.iter().skip(1).enumerate() {
             let expanded = self.expand_with_auto_vars(arg, auto_vars);
             call_auto_vars.insert((i + 1).to_string(), expanded);
         }
+        // Explicitly clear any higher positions that were not passed, up to the
+        // highest number used anywhere in practice (GNU Make supports $1..$9 directly;
+        // beyond that via $(10) etc., but we clear up to a reasonable limit).
+        for i in (passed_count + 1)..=9 {
+            call_auto_vars.entry(i.to_string()).or_insert_with(String::new);
+        }
 
-        self.expand_with_auto_vars(&var_value, &call_auto_vars)
+        // Push the call context so that $(eval) inside the body can access $1, $2, etc.
+        // This allows `$(eval undefine $$1)` inside a define called via $(call) to correctly
+        // see the call arguments (since after $$1 → $1, the eval processes $1 in this context).
+        self.call_context_stack.borrow_mut().push(call_auto_vars.clone());
+        let result = self.expand_with_auto_vars(&var_value, &call_auto_vars);
+        self.call_context_stack.borrow_mut().pop();
+        result
     }
 
     fn expand_foreach(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
