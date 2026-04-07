@@ -1908,9 +1908,11 @@ impl<'a> Executor<'a> {
             v.retain(|p| p != ".WAIT");
             v
         };
+        // Use all_order_only for $| auto var: this includes the pattern rule's order-only
+        // prerequisites (added at the pattern rule block above), not just the original
+        // explicit-rule order-only prereqs (auto_var_order_only) or SE-expanded ones.
         let auto_vars_order_only_for_recipe: Vec<String> = {
-            let mut v = auto_var_order_only.clone();
-            v.extend(se_expanded_order_only.clone());
+            let mut v = all_order_only.clone();
             v.retain(|p| p != ".WAIT");
             v
         };
@@ -2696,62 +2698,18 @@ impl<'a> Executor<'a> {
             .collect();
         order_only = Self::glob_expand_prereqs(order_only);
 
-        if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some() {
-            // Build base auto vars from normal prereqs (before SE)
-            let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
-            let mut base_auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
-            base_auto_vars.insert("?".to_string(), String::new());
-
-            // For pattern rule SE expansion, GNU Make does not include a file:line prefix
-            // in error messages (unlike explicit rule SE).  Temporarily clear the file context.
-            let saved_file = self.state.current_file.borrow().clone();
-            let saved_line = *self.state.current_line.borrow();
-            *self.state.current_file.borrow_mut() = String::new();
-            *self.state.current_line.borrow_mut() = 0;
-
-            if let Some(ref text) = rule.second_expansion_prereqs {
-                // Substitute first % per word in the raw text for the stem before SE expanding,
-                // using dir-aware substitution.
-                let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
-                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                // Mark SE prereqs as explicitly mentioned if their source text had no '%'
-                // (meaning they're not derived from the stem, so they're "explicitly mentioned"
-                // files that should not be treated as intermediate).
-                // This matches GNU Make's behavior: files that expand to fixed values
-                // regardless of the stem are explicitly mentioned.
-                if !se_text_has_percent(text) {
-                    for p in &normal {
-                        self.se_explicitly_mentioned.insert(p.clone());
-                    }
-                }
-                prereqs.extend(normal);
-                order_only.extend(oo);
-            }
-            if let Some(ref text) = rule.second_expansion_order_only {
-                let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
-                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                if !se_text_has_percent(text) {
-                    for p in &normal {
-                        self.se_explicitly_mentioned.insert(p.clone());
-                    }
-                }
-                order_only.extend(normal);
-                order_only.extend(oo);
-            }
-            // Restore file context after pattern rule SE expansion.
-            *self.state.current_file.borrow_mut() = saved_file;
-            *self.state.current_line.borrow_mut() = saved_line;
-
-            // Glob-expand wildcard patterns introduced by SE expansion.
-            prereqs = Self::glob_expand_prereqs(prereqs);
-            order_only = Self::glob_expand_prereqs(order_only);
-        }
+        // SE expansion is deferred until AFTER non-SE prereqs are built (see below).
+        // This matches GNU Make behavior where $(info ...) in SE prereqs fires after
+        // the immediately-available (non-SE) prerequisites have been visited.
+        // `has_se` tracks whether we need to do SE expansion later.
+        let has_se = rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some();
 
         // Save original prereq order before shuffling, so auto vars ($^, $<, etc.)
         // reflect the original declaration order (shuffle only affects BUILD order,
         // not the values of automatic variables — GNU Make behavior).
-        let prereqs_original_order = prereqs.clone();
-        let order_only_original_order = order_only.clone();
+        // For SE rules this will be extended after SE expansion adds more prereqs.
+        let mut prereqs_original_order = prereqs.clone();
+        let mut order_only_original_order = order_only.clone();
 
         // Apply shuffle to pattern rule prerequisites.
         if self.shuffle.is_some() && !self.db.not_parallel {
@@ -2769,9 +2727,15 @@ impl<'a> Executor<'a> {
         // don't exist are considered to have a "virtual" mtime equal to their sources.
         //
         // Skip this check when always_make (-B), the target is phony, the recipe is
-        // empty (we can't decide without building), or when in collect_plans_mode
-        // (parallel build graph collects all dependencies regardless).
-        if !is_phony && !self.always_make && !self.collect_plans_mode {
+        // empty (we can't decide without building), when in collect_plans_mode
+        // (parallel build graph collects all dependencies regardless), or when the
+        // rule has SE prerequisites that might expand to explicitly-mentioned files
+        // (we cannot determine up-to-date status until SE is done and those files
+        // are recognized as explicitly mentioned — sv 60188 subtest 2).
+        if !is_phony && !self.always_make && !self.collect_plans_mode
+            && rule.second_expansion_prereqs.is_none()
+            && rule.second_expansion_order_only.is_none()
+        {
             if let Some(target_time) = self.file_mtime(target).or_else(|| {
                 self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
             }) {
@@ -2918,10 +2882,14 @@ impl<'a> Executor<'a> {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
                     if rebuilt { any_rebuilt = true; }
-                    // For terminal pattern rules (%::), prerequisites must ACTUALLY EXIST
-                    // on disk (or in VPATH) after being built — chaining through implicit
-                    // rules that produce no file is not allowed.
-                    if rule.is_terminal && !self.db.is_phony(&prereq) {
+                    // For terminal pattern rules (%::), prerequisites built via implicit
+                    // (pattern) rules must ACTUALLY EXIST on disk — chaining through
+                    // implicit rules that produce no file is not allowed.
+                    // However, prerequisites with EXPLICIT rules are fine even if they
+                    // don't create files (an explicit rule with empty recipe is valid).
+                    if rule.is_terminal && !self.db.is_phony(&prereq)
+                        && !self.db.rules.contains_key(prereq.as_str())
+                    {
                         let exists = std::path::Path::new(&prereq).exists()
                             || self.find_in_vpath(&prereq).is_some();
                         if !exists {
@@ -4323,13 +4291,18 @@ impl<'a> Executor<'a> {
         vars.insert("+".to_string(), all_prereqs.join(" "));
 
         // $? - prerequisites that are newer than the target.
-        // Includes prereqs that:
+        // With -B (always_make), all prerequisites are considered newer.
+        // Otherwise includes prereqs that:
         //   - exist on disk AND are newer than the target
         //   - target doesn't exist but prereq exists on disk
         //   - prereq doesn't exist on disk but was visited/built this make run and target doesn't exist
         let target_time = self.file_mtime(target);
         let newer: Vec<String> = prereqs.iter()
             .filter(|p| {
+                if self.always_make {
+                    // -B: all prerequisites are considered newer than the target
+                    return true;
+                }
                 let resolved = resolve_prereq(p);
                 let prereq_mtime = self.file_mtime(&resolved).or_else(|| {
                     self.find_in_vpath(p).and_then(|found| self.file_mtime(&found))

@@ -116,8 +116,18 @@ impl MakeState {
                     }
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                // Copy the current character to result. For ASCII bytes this is
+                // straightforward; for multi-byte UTF-8 sequences we must copy
+                // the full character (not byte-by-byte) to avoid double-encoding.
+                if bytes[i].is_ascii() {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                } else {
+                    // Find the full UTF-8 character starting at position i.
+                    let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+                    result.push(ch);
+                    i += ch.len_utf8();
+                }
             }
         }
 

@@ -476,6 +476,20 @@ pub fn strip_comment(line: &str) -> String {
     let mut i = 0;
     let mut depth = 0; // track $(...) and ${...} nesting
 
+    // Helper: push the character at byte position i and return the number of bytes consumed.
+    // For ASCII bytes this is just 1; for multi-byte UTF-8 sequences it copies the whole char.
+    let push_char_at = |result: &mut String, line: &str, bytes: &[u8], i: usize| -> usize {
+        let b = bytes[i];
+        if b.is_ascii() {
+            result.push(b as char);
+            1
+        } else {
+            let ch = line[i..].chars().next().unwrap_or('\u{FFFD}');
+            result.push(ch);
+            ch.len_utf8()
+        }
+    };
+
     while i < bytes.len() {
         let ch = bytes[i];
         if ch == b'\\' && i + 1 < bytes.len() {
@@ -487,35 +501,34 @@ pub fn strip_comment(line: &str) -> String {
                     i += 2;
                     continue;
                 }
-                result.push(ch as char);
-                result.push(bytes[i + 1] as char);
-                i += 2;
+                result.push('\\');
+                i += 1;
+                i += push_char_at(&mut result, line, bytes, i);
                 continue;
             } else {
                 // Inside $(...) / ${...}: push both characters verbatim.
-                result.push(ch as char);
-                result.push(bytes[i + 1] as char);
-                i += 2;
+                result.push('\\');
+                i += 1;
+                i += push_char_at(&mut result, line, bytes, i);
                 continue;
             }
         }
         if ch == b'$' && i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') {
             depth += 1;
-            result.push(ch as char);
+            result.push('$');
             i += 1;
             continue;
         }
         if depth > 0 && (ch == b')' || ch == b'}') {
             depth -= 1;
-            result.push(ch as char);
+            result.push(ch as char); // ')' and '}' are ASCII
             i += 1;
             continue;
         }
         if ch == b'#' && depth == 0 {
             break;
         }
-        result.push(ch as char);
-        i += 1;
+        i += push_char_at(&mut result, line, bytes, i);
     }
 
     result
@@ -1472,11 +1485,15 @@ pub fn split_filenames(s: &str) -> Vec<String> {
                     i += 2;
                     continue;
                 }
+                b'\\' => {
+                    // Escaped backslash: `\\` → `\`
+                    current.push('\\');
+                    i += 2;
+                    continue;
+                }
                 _ => {
-                    // All other backslash sequences (including `\\` and `\%`):
-                    // keep both characters verbatim.  GNU Make does NOT collapse
-                    // `\\` to `\` in file-name lists — only `\ ` (escaped space)
-                    // is processed.
+                    // All other backslash sequences (e.g. `\%`):
+                    // keep both characters verbatim.
                     current.push('\\');
                     current.push(next as char);
                     i += 2;
