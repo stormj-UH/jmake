@@ -467,15 +467,20 @@ impl MakeState {
                     std::process::exit(2);
                 }
                 match trimmed.parse::<i64>() {
-                    Ok(n) if n < 0 || (!allow_zero && n == 0) => {
-                        eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg.trim_start());
+                    Ok(n) if !allow_zero && n == 0 => {
+                        // Special message for zero (only when zero is disallowed)
+                        eprintln!("{}*** first argument to '{}' function must be greater than 0.  Stop.", loc, func_name);
+                        std::process::exit(2);
+                    }
+                    Ok(n) if n < 0 => {
+                        eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg);
                         std::process::exit(2);
                     }
                     Err(_) => {
                         if trimmed.chars().all(|c| c.is_ascii_digit()) {
                             eprintln!("{}*** invalid {} argument to '{}' function: '{}' out of range.  Stop.", loc, ordinal, func_name, trimmed);
                         } else {
-                            eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg.trim_start());
+                            eprintln!("{}*** invalid {} argument to '{}' function: '{}'.  Stop.", loc, ordinal, func_name, arg);
                         }
                         std::process::exit(2);
                     }

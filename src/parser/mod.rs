@@ -94,6 +94,9 @@ impl Parser {
         // Handle backslash line continuations
         // For recipe lines (tab-prefixed), preserve the backslash-newline so the
         // shell can handle continuation. For other lines, collapse to a single space.
+        // EXCEPTION: For inline recipes (lines of the form "target:;recipe"), once
+        // we have accumulated past the `;`, we must also preserve \<newline> so the
+        // shell can handle multi-line inline recipes correctly (GNU Make 4.4 behavior).
         while line.ends_with('\\') && self.pos < self.lines.len() {
             if line.starts_with('\t') {
                 // Recipe line: preserve \<newline> for the shell.
@@ -108,6 +111,22 @@ impl Parser {
                     &next[1..]
                 } else {
                     next   // Preserve leading spaces; only strip one tab above
+                };
+                line.push_str(stripped);
+            } else if line_has_inline_recipe(&line) {
+                // Inline recipe (e.g. "target:;@echo fa\<nl>st"): preserve
+                // the \<newline> so the shell can join lines itself, mirroring
+                // how GNU Make 4.4+ passes inline recipe continuations to the
+                // shell without collapsing them.
+                // Strip exactly ONE leading tab from the continuation line
+                // (the recipe-prefix character), but preserve any other
+                // leading whitespace (spaces).
+                line.push('\n');
+                let next = &self.lines[self.pos];
+                let stripped = if next.starts_with('\t') {
+                    &next[1..]
+                } else {
+                    next
                 };
                 line.push_str(stripped);
             } else {
@@ -290,6 +309,49 @@ impl Parser {
         }
         ParsedLine::Empty
     }
+}
+
+/// Return true if `line` contains an inline recipe: a bare `;` that is
+/// preceded somewhere by a bare `:` (both outside variable references).
+/// This is used by `next_logical_line` to decide whether to preserve
+/// backslash-newline continuations (shell handles them) vs. collapse them
+/// (make handles them).
+fn line_has_inline_recipe(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut depth = 0i32;
+    let mut found_colon = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' if i + 1 < bytes.len() => {
+                match bytes[i + 1] {
+                    b'(' | b'{' => { depth += 1; i += 2; continue; }
+                    _ => { i += 2; continue; }
+                }
+            }
+            b'(' | b'{' if depth > 0 => depth += 1,
+            b')' | b'}' if depth > 0 => depth -= 1,
+            b':' if depth == 0 => {
+                // Skip \: (escaped colon)
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    i += 1;
+                    continue;
+                }
+                // Skip ::= and :=
+                if i + 2 < bytes.len() && bytes[i+1] == b':' && bytes[i+2] == b'=' {
+                    i += 1; continue;
+                }
+                if i + 1 < bytes.len() && bytes[i+1] == b'=' {
+                    i += 1; continue;
+                }
+                found_colon = true;
+            }
+            b';' if depth == 0 && found_colon => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 pub fn strip_comment(line: &str) -> String {
@@ -547,7 +609,7 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
         let target_pattern_str = rest_before_semi[..second_colon].trim();
         if target_pattern_str.contains('%') {
             let after_second = rest_trimmed[second_colon + 1..].trim();
-            let targets: Vec<String> = split_words(targets_str);
+            let targets: Vec<String> = split_filenames(targets_str);
             if !targets.is_empty() {
                 return Some(expand_static_pattern_rule(
                     targets,
@@ -596,7 +658,8 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
         }
     }
 
-    let targets: Vec<String> = split_words(targets_str);
+    // Use split_filenames to handle escaped spaces (`\ `) and escaped colons (`\:`)
+    let targets: Vec<String> = split_filenames(targets_str);
     if targets.is_empty() {
         return None;
     }
@@ -877,6 +940,21 @@ fn find_rule_colon(line: &str) -> Option<usize> {
             b'(' | b'{' if paren_depth > 0 => paren_depth += 1,
             b')' | b'}' if paren_depth > 0 => paren_depth -= 1,
             b':' if paren_depth == 0 => {
+                // Skip \: (escaped colon - literal colon in target/prereq name)
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    // Count consecutive backslashes before this ':'
+                    let mut nb = 0usize;
+                    let mut j = i;
+                    while j > 0 && bytes[j - 1] == b'\\' {
+                        nb += 1;
+                        j -= 1;
+                    }
+                    if nb % 2 == 1 {
+                        // Odd number of backslashes: the colon is escaped, skip it
+                        i += 1;
+                        continue;
+                    }
+                }
                 // Make sure this isn't a drive letter (e.g., C:)
                 if i == 1 && bytes[0].is_ascii_alphabetic() && i + 1 < bytes.len() && (bytes[i+1] == b'\\' || bytes[i+1] == b'/') {
                     i += 1;
@@ -976,6 +1054,68 @@ pub fn split_words(s: &str) -> Vec<String> {
     s.split_whitespace().map(String::from).collect()
 }
 
+/// Split a targets/prerequisites string into individual file names,
+/// respecting backslash escaping of whitespace (`\ `, `\<tab>`) and
+/// converting escape sequences to their literal equivalents:
+///   `\:` → `:`   `\\` → `\`   `\#` → `#`   `\ ` → ` ` (within a word)
+///
+/// This mirrors GNU Make's `PARSE_FILE_SEQ` / `unescape_char` behaviour for
+/// target and prerequisite lists.
+pub fn split_filenames(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            match next {
+                // Escaped special chars: consume the backslash, keep the char
+                b':' | b'#' => {
+                    current.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                b' ' | b'\t' => {
+                    // Escaped whitespace: part of the current word
+                    current.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                b'\\' => {
+                    // Two backslashes -> one backslash
+                    current.push('\\');
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    // Other backslash sequences: keep both
+                    current.push('\\');
+                    current.push(next as char);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        if ch == b' ' || ch == b'\t' {
+            // Unescaped whitespace: word separator
+            if !current.is_empty() {
+                result.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch as char);
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
 pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>) {
     // First, find a bare `;` (not inside variable references).
     // Everything before it is the prereq/order-only part; everything after is
@@ -996,10 +1136,10 @@ pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>
     if let Some(pipe_pos) = find_pipe(prereq_part) {
         let normal = &prereq_part[..pipe_pos];
         let oo = &prereq_part[pipe_pos + 1..];
-        prereqs = split_words(normal.trim());
-        order_only = split_words(oo.trim());
+        prereqs = split_filenames(normal.trim());
+        order_only = split_filenames(oo.trim());
     } else {
-        prereqs = split_words(prereq_part.trim());
+        prereqs = split_filenames(prereq_part.trim());
     }
 
     (prereqs, order_only, inline_recipe)
