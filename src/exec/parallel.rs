@@ -71,6 +71,11 @@ pub struct TargetPlan {
     /// The scheduler uses this to enforce .WAIT ordering within a target's prerequisites.
     /// The flat `prerequisites` field still contains ALL prereqs for auto_var/rebuild purposes.
     pub wait_groups: Vec<Vec<String>>,
+    /// Intermediate also_make siblings produced by this target's recipe (for parallel mode).
+    /// When this target completes with rebuilt=true, these siblings are also added to
+    /// intermediate_built (they were implicitly created by this target's recipe).
+    /// The order here matches the desired deletion order (same as intermediate_built insertion).
+    pub intermediate_also_make: Vec<String>,
 }
 
 /// A unit of work dispatched to a worker thread.

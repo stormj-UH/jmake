@@ -1219,19 +1219,39 @@ impl<'a> Executor<'a> {
 
                 // If there is no recipe from explicit rules yet, peek at the pattern rule
                 // to include its prereqs in the check (read-only, no building).
+                // If the pattern rule has SE prereqs, we cannot determine up-to-date status
+                // without performing the expansion (the SE might produce explicitly-mentioned
+                // files that need building).  In that case skip the precheck entirely.
+                let mut pat_rule_has_se = false;
+                eprintln!("DEBUG: precheck target='{}' recipe.is_empty={} se_prereq_texts.len={}", target, recipe.is_empty(), se_prereq_texts.len());
                 if recipe.is_empty() {
-                    if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
-                        let matched_pt_pre: String = pat_rule.targets.iter()
-                            .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
-                            .cloned()
-                            .unwrap_or_else(|| "%".to_string());
-                        for p in &pat_rule.prerequisites {
-                            if p != ".WAIT" {
-                                check_prereqs.push(subst_stem_in_prereq_dir(p, &stem, &matched_pt_pre));
+                    let pat_find = self.find_pattern_rule_inner(target, &all_prereqs);
+                    eprintln!("DEBUG: find_pattern_rule_inner for '{}' returned: {}", target, pat_find.is_some());
+                    if let Some((pat_rule, stem)) = pat_find {
+                        eprintln!("DEBUG: precheck for '{}' found pattern rule targets={:?} se_prereqs={:?}", target, pat_rule.targets, pat_rule.second_expansion_prereqs);
+                        if pat_rule.second_expansion_prereqs.is_some()
+                            || pat_rule.second_expansion_order_only.is_some()
+                        {
+                            // Can't precheck without SE expansion — fall through to full build.
+                            pat_rule_has_se = true;
+                        } else {
+                            let matched_pt_pre: String = pat_rule.targets.iter()
+                                .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                                .cloned()
+                                .unwrap_or_else(|| "%".to_string());
+                            for p in &pat_rule.prerequisites {
+                                if p != ".WAIT" {
+                                    check_prereqs.push(subst_stem_in_prereq_dir(p, &stem, &matched_pt_pre));
+                                }
                             }
                         }
                     }
                 }
+
+                if pat_rule_has_se {
+                    // Skip precheck: pattern rule has SE prereqs that we can't evaluate here.
+                    // Fall through to the full build path which handles SE expansion.
+                } else {
 
                 // Collect skipped intermediates so we can visit them for their
                 // PHONY/order-only prereqs even when the target is up to date.
@@ -1357,6 +1377,7 @@ impl<'a> Executor<'a> {
 
                     return Ok(false);
                 }
+                } // end else (pat_rule_has_se == false)
             }
         }
 
@@ -3250,11 +3271,18 @@ impl<'a> Executor<'a> {
             // Handle also_make siblings FIRST (before adding primary to intermediate_built).
             // This ensures siblings appear before the primary in intermediate_built so they
             // are deleted first (GNU Make behavior).
+            // Step 1: mark all siblings as built/covered (order doesn't matter for these).
             for sib in &also_make_siblings {
-                // Mark as built/covered so we don't run the recipe again for them.
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), true);
-
+            }
+            // Step 2: push siblings to intermediate_built in REVERSE declaration order.
+            // GNU Make builds the also_make chain and iterates it such that siblings are
+            // removed in reverse order relative to their declaration in the pattern rule.
+            // For rule `%.1 %.15 %.3:` with primary `a.3`, siblings are [a.1, a.15] in
+            // declaration order, so we push them reversed: a.15 then a.1, giving deletion
+            // order a.15, a.1 (i.e., `rm a.15 a.1`).
+            for sib in also_make_siblings.iter().rev() {
                 // Track intermediate status for also_make siblings.
                 // A sibling is intermediate if:
                 //   1. It is explicitly marked .INTERMEDIATE, OR
@@ -3276,9 +3304,9 @@ impl<'a> Executor<'a> {
                     // is explicitly mentioned (sv 60188: literal non-% prereqs of a
                     // pattern rule make the entire rule invocation "explicit").
                     // Also: if any EXPANDED (stem-substituted) prereq is explicitly
-                    // mentioned AND not intermediate, the rule invocation is treated as
-                    // "explicit" (e.g. `%.z %.q: %.x` with `unrelated: hello.x` makes
-                    // hello.x explicitly mentioned and thus hello.q is not intermediate).
+                    // mentioned AND is not marked .INTERMEDIATE, the rule invocation is
+                    // treated as "explicit" (e.g. `%.z %.q: %.x` with `unrelated: hello.x`
+                    // makes hello.x explicitly mentioned → hello.q is not intermediate).
                     let any_literal_prereq_explicit = literal_rule_prereqs.iter()
                         .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
                     let any_expanded_prereq_not_intermediate = prereqs.iter()
@@ -3313,12 +3341,31 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // Also mark sibling plans as intermediate if they were pushed to intermediate_built.
+                // If the sibling doesn't have a plan yet (it was only covered as a sibling,
+                // never explicitly planned), create a minimal plan so the parallel scheduler
+                // can track its intermediate status.
                 for sib in &also_make_siblings {
                     if self.intermediate_built.contains(sib) {
                         if let Some(ref mut plans) = self.pending_plans {
-                            if let Some(plan) = plans.get_mut(sib.as_str()) {
-                                plan.is_intermediate = true;
-                            }
+                            let plan = plans.entry(sib.clone()).or_insert_with(|| {
+                                parallel::TargetPlan {
+                                    target: sib.clone(),
+                                    prerequisites: Vec::new(),
+                                    order_only: Vec::new(),
+                                    recipe: Vec::new(),
+                                    source_file: String::new(),
+                                    auto_vars: std::collections::HashMap::new(),
+                                    is_phony: false,
+                                    needs_rebuild: false,
+                                    grouped_primary: None,
+                                    grouped_siblings: Vec::new(),
+                                    extra_exports: std::collections::HashMap::new(),
+                                    extra_unexports: Vec::new(),
+                                    is_intermediate: false,
+                                    wait_groups: Vec::new(),
+                                }
+                            });
+                            plan.is_intermediate = true;
                         }
                     }
                 }
