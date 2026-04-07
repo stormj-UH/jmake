@@ -2924,6 +2924,96 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // Perform second expansion NOW — after building non-SE prereqs — so that
+        // $(info ...) and other side effects in SE text fire in the correct order:
+        // each target's non-SE prerequisites (and their own SE expansions) are fully
+        // processed before the current target's SE side effects appear.
+        // This matches GNU Make behavior (sv 62706 ordering test).
+        if has_se {
+            let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
+            let mut base_auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
+            base_auto_vars.insert("?".to_string(), String::new());
+
+            // For pattern rule SE expansion, GNU Make does not include a file:line prefix
+            // in error messages (unlike explicit rule SE).  Temporarily clear the file context.
+            let saved_file = self.state.current_file.borrow().clone();
+            let saved_line = *self.state.current_line.borrow();
+            *self.state.current_file.borrow_mut() = String::new();
+            *self.state.current_line.borrow_mut() = 0;
+
+            let mut se_added_prereqs: Vec<String> = Vec::new();
+            let mut se_added_oo: Vec<String> = Vec::new();
+
+            if let Some(ref text) = rule.second_expansion_prereqs.clone() {
+                let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
+                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                // Mark SE prereqs as explicitly mentioned if their source text had no '%'
+                // (meaning they're not derived from the stem).
+                if !se_text_has_percent(text) {
+                    for p in &normal {
+                        self.se_explicitly_mentioned.insert(p.clone());
+                    }
+                }
+                se_added_prereqs.extend(normal);
+                se_added_oo.extend(oo);
+            }
+            if let Some(ref text) = rule.second_expansion_order_only.clone() {
+                let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
+                let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                if !se_text_has_percent(text) {
+                    for p in &normal {
+                        self.se_explicitly_mentioned.insert(p.clone());
+                    }
+                }
+                se_added_oo.extend(normal);
+                se_added_oo.extend(oo);
+            }
+
+            // Restore file context after pattern rule SE expansion.
+            *self.state.current_file.borrow_mut() = saved_file;
+            *self.state.current_line.borrow_mut() = saved_line;
+
+            // Glob-expand wildcard patterns introduced by SE expansion.
+            se_added_prereqs = Self::glob_expand_prereqs(se_added_prereqs);
+            se_added_oo = Self::glob_expand_prereqs(se_added_oo);
+            se_added_prereqs.retain(|p| p != ".WAIT");
+            se_added_oo.retain(|p| p != ".WAIT");
+
+            // Build SE-expanded prerequisites.
+            for se_prereq in &se_added_prereqs {
+                match self.build_target(se_prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        // SE prereq errors are propagated without the no-rule swallowing
+                        // (SE-generated prereqs that don't exist ARE real errors).
+                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
+                }
+            }
+            for se_oo in &se_added_oo {
+                let _ = self.build_target(se_oo);
+            }
+
+            // Extend prereqs and order_only with SE results for auto vars and rebuild check.
+            prereqs.extend(se_added_prereqs);
+            order_only.extend(se_added_oo);
+            prereqs = Self::glob_expand_prereqs(prereqs);
+            order_only = Self::glob_expand_prereqs(order_only);
+
+            // Update original-order lists to include SE prereqs for correct auto vars.
+            prereqs_original_order = prereqs.clone();
+            order_only_original_order = order_only.clone();
+        }
+
         for prereq in order_only.clone() {
             let _ = self.build_target(&prereq);
         }

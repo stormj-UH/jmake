@@ -34,7 +34,14 @@ fn main() {
             .unwrap_or(false);
 
         if is_write_error {
-            // Exit with code 1, matching GNU Make's behaviour on stdout errors.
+            // Print GNU Make-compatible error message to stderr, then exit(1).
+            let raw = std::env::args().next().unwrap_or_else(|| "make".to_string());
+            let progname = std::path::Path::new(&raw)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&raw)
+                .to_string();
+            eprintln!("{}: write error", progname);
             process::exit(1);
         }
 
