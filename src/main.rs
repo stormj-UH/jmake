@@ -41,7 +41,12 @@ fn main() {
         Ok(()) => process::exit(0),
         Err(e) => {
             if !e.is_empty() {
-                let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                let raw = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                let progname = std::path::Path::new(&raw)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&raw)
+                    .to_string();
                 eprintln!("{}: *** {}", progname, e);
             }
             process::exit(2);

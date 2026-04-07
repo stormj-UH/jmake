@@ -201,8 +201,18 @@ impl Parser {
             return ParsedLine::Recipe(stripped.to_string());
         }
 
-        // Strip inline comments (not in recipe context)
-        let effective = strip_comment(trimmed);
+        // Strip inline comments (not in recipe context).
+        // For rule lines with an inline recipe (target: ; cmd), only strip
+        // comments from the part before the semicolon — the recipe content
+        // must not have its '#' characters treated as makefile comments.
+        let effective = if let Some(semi_pos) = find_inline_recipe_semi_pos(trimmed) {
+            let before_semi = strip_comment(&trimmed[..semi_pos]);
+            // Append the semicolon and everything after (the recipe) verbatim.
+            // Trailing whitespace after stripping is fine; preserve the recipe exactly.
+            format!("{};{}", before_semi.trim_end(), &trimmed[semi_pos+1..])
+        } else {
+            strip_comment(trimmed)
+        };
 
         // Conditional directives
         if let Some(cond) = parse_conditional(&effective) {
@@ -349,6 +359,14 @@ impl Parser {
 /// backslash-newline continuations (shell handles them) vs. collapse them
 /// (make handles them).
 fn line_has_inline_recipe(line: &str) -> bool {
+    find_inline_recipe_semi_pos(line).is_some()
+}
+
+/// Returns the byte position of the `;` that begins an inline recipe in a rule line.
+/// Returns None if there is no inline recipe.
+/// An inline recipe `;` is one that appears after a rule colon (`:`) at $() depth 0,
+/// not part of `:=` / `::=` / `:::=` / `::`, and with an unescaped colon.
+fn find_inline_recipe_semi_pos(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut depth = 0i32;
     let mut found_colon = false;
@@ -378,12 +396,12 @@ fn line_has_inline_recipe(line: &str) -> bool {
                 }
                 found_colon = true;
             }
-            b';' if depth == 0 && found_colon => return true,
+            b';' if depth == 0 && found_colon => return Some(i),
             _ => {}
         }
         i += 1;
     }
-    false
+    None
 }
 
 pub fn strip_comment(line: &str) -> String {
@@ -787,6 +805,20 @@ fn find_bare_colon(s: &str) -> Option<usize> {
             b'(' | b'{' if paren_depth > 0 => paren_depth += 1,
             b')' | b'}' if paren_depth > 0 => paren_depth -= 1,
             b':' if paren_depth == 0 => {
+                // Skip \: (escaped colon — literal colon in a filename).
+                // Count consecutive backslashes; if odd, colon is escaped.
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    let mut nb = 0usize;
+                    let mut j = i;
+                    while j > 0 && bytes[j - 1] == b'\\' {
+                        nb += 1;
+                        j -= 1;
+                    }
+                    if nb % 2 == 1 {
+                        i += 1;
+                        continue;
+                    }
+                }
                 // Skip ::= (it is a variable-assignment operator, not a rule separator)
                 if i + 2 < bytes.len() && bytes[i + 1] == b':' && bytes[i + 2] == b'=' {
                     return None;

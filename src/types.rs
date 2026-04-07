@@ -359,31 +359,71 @@ impl MakeDatabase {
 
     pub fn is_notintermediate(&self, target: &str) -> bool {
         // Check if explicitly marked as .NOTINTERMEDIATE
-        // .NOTINTERMEDIATE with no prereqs means ALL targets are not intermediate
+        // .NOTINTERMEDIATE with no prereqs means ALL targets are not intermediate.
+        //
+        // Priority rules (matches GNU Make behavior):
+        //   - An explicit file listing in .INTERMEDIATE beats any .NOTINTERMEDIATE
+        //     (whether pattern, explicit, or global).
+        //   - An explicit file listing in .SECONDARY (non-empty set, meaning the
+        //     target was named explicitly) beats a global/pattern .NOTINTERMEDIATE.
+        //   - A global .SECONDARY: (empty = all secondary) does NOT beat an explicit
+        //     .NOTINTERMEDIATE: target_name or .NOTINTERMEDIATE: pattern.
         let set = match self.special_targets.get(&SpecialTarget::NotIntermediate) {
             Some(s) => s,
             None => return false,
         };
-        if set.is_empty() {
-            return true;
-        }
-        // Pattern matching: check if any pattern in the set matches target
-        for pat in set {
-            if pat.contains('%') {
-                // Simple % wildcard matching
-                if let Some(pct) = pat.find('%') {
-                    let prefix = &pat[..pct];
-                    let suffix = &pat[pct+1..];
-                    if target.starts_with(prefix) && target.ends_with(suffix)
-                        && target.len() >= prefix.len() + suffix.len() {
-                        return true;
+
+        // Determine if .NOTINTERMEDIATE would match this target at all.
+        let notintermediate_matches = if set.is_empty() {
+            true
+        } else {
+            let mut matched = false;
+            for pat in set {
+                if pat.contains('%') {
+                    if let Some(pct) = pat.find('%') {
+                        let prefix = &pat[..pct];
+                        let suffix = &pat[pct+1..];
+                        if target.starts_with(prefix) && target.ends_with(suffix)
+                            && target.len() >= prefix.len() + suffix.len() {
+                            matched = true;
+                            break;
+                        }
                     }
+                } else if pat == target {
+                    matched = true;
+                    break;
                 }
-            } else if pat == target {
-                return true;
+            }
+            matched
+        };
+
+        if !notintermediate_matches {
+            return false;
+        }
+
+        // Explicit .INTERMEDIATE on this target beats any .NOTINTERMEDIATE.
+        if self.special_targets.get(&SpecialTarget::Intermediate)
+            .map_or(false, |s| s.contains(target)) {
+            return false;
+        }
+
+        // Explicit (by name, not global) .SECONDARY on this target beats
+        // a global or pattern .NOTINTERMEDIATE but NOT an explicit .NOTINTERMEDIATE.
+        // "Explicit .SECONDARY" means the .SECONDARY set is non-empty and contains
+        // this target's name.
+        // But if .NOTINTERMEDIATE also names this target explicitly (not just via
+        // pattern or global), then .NOTINTERMEDIATE wins.
+        let ni_explicit = set.contains(target); // target explicitly named in .NOTINTERMEDIATE
+        if !ni_explicit {
+            // .NOTINTERMEDIATE matched via pattern or global.
+            // Check if target is explicitly in .SECONDARY (non-empty set containing target name).
+            if self.special_targets.get(&SpecialTarget::Secondary)
+                .map_or(false, |s| !s.is_empty() && s.contains(target)) {
+                return false;
             }
         }
-        false
+
+        true
     }
 
     pub fn is_silent_target(&self, target: &str) -> bool {

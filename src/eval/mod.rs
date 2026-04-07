@@ -121,7 +121,13 @@ pub fn logical_cwd() -> std::path::PathBuf {
 /// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
 /// The level is read from the MAKELEVEL environment variable (set by parent make).
 pub fn make_progname() -> String {
-    let base = env::args().next().unwrap_or_else(|| "make".to_string());
+    let raw = env::args().next().unwrap_or_else(|| "make".to_string());
+    // Use basename only (GNU Make behavior: program name is always the filename, not full path)
+    let base = std::path::Path::new(&raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&raw)
+        .to_string();
     match env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()) {
         Some(level) if level > 0 => format!("{}[{}]", base, level),
         _ => base,
@@ -1490,12 +1496,13 @@ impl MakeState {
                     }
                     SpecialTarget::NotIntermediate => {
                         // Check for conflicts with .INTERMEDIATE and .SECONDARY
+                        let progname = make_progname();
                         if prereqs.is_empty() {
                             // .NOTINTERMEDIATE: (all) conflicts with .SECONDARY: (all)
                             let secondary_set = self.db.special_targets.get(&SpecialTarget::Secondary);
                             if secondary_set.map_or(false, |s| s.is_empty()) {
-                                eprintln!("{}:{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
-                                    rule.source_file, rule.lineno);
+                                eprintln!("{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
+                                    progname);
                                 std::process::exit(2);
                             }
                         } else {
@@ -1503,14 +1510,14 @@ impl MakeState {
                             for name in &prereqs {
                                 if self.db.special_targets.get(&SpecialTarget::Intermediate)
                                     .map_or(false, |s| s.contains(name)) {
-                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
-                                        rule.source_file, rule.lineno, name);
+                                    eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
+                                        progname, name);
                                     std::process::exit(2);
                                 }
                                 if self.db.special_targets.get(&SpecialTarget::Secondary)
                                     .map_or(false, |s| s.contains(name)) {
-                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
-                                        rule.source_file, rule.lineno, name);
+                                    eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
+                                        progname, name);
                                     std::process::exit(2);
                                 }
                             }
@@ -1520,11 +1527,12 @@ impl MakeState {
                     }
                     SpecialTarget::Intermediate => {
                         // Check for conflicts with .NOTINTERMEDIATE
+                        let progname = make_progname();
                         for name in &prereqs {
                             if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
                                 .map_or(false, |s| s.contains(name) || s.is_empty()) {
-                                eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
-                                    rule.source_file, rule.lineno, name);
+                                eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
+                                    progname, name);
                                 std::process::exit(2);
                             }
                         }
@@ -1532,12 +1540,13 @@ impl MakeState {
                         set.extend(prereqs);
                     }
                     SpecialTarget::Secondary => {
+                        let progname = make_progname();
                         if prereqs.is_empty() {
                             // .SECONDARY: (all) conflicts with .NOTINTERMEDIATE: (all)
                             let ni_set = self.db.special_targets.get(&SpecialTarget::NotIntermediate);
                             if ni_set.map_or(false, |s| s.is_empty()) {
-                                eprintln!("{}:{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
-                                    rule.source_file, rule.lineno);
+                                eprintln!("{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
+                                    progname);
                                 std::process::exit(2);
                             }
                         } else {
@@ -1545,8 +1554,8 @@ impl MakeState {
                             for name in &prereqs {
                                 if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
                                     .map_or(false, |s| s.contains(name) || s.is_empty()) {
-                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
-                                        rule.source_file, rule.lineno, name);
+                                    eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
+                                        progname, name);
                                     std::process::exit(2);
                                 }
                             }
@@ -2481,8 +2490,18 @@ impl MakeState {
 
         // exec() replaces the current process. It only returns on failure.
         let err = cmd.exec();
-        // exec failed
-        eprintln!("{}: {}: {}", progname, exe.display(), err);
+        // exec failed - format the error message without the "(os error N)" suffix
+        // that Rust's io::Error adds on Linux (GNU Make doesn't include it).
+        let err_str = {
+            let s = err.to_string();
+            // Strip trailing " (os error N)" if present
+            if let Some(pos) = s.rfind(" (os error ") {
+                s[..pos].to_string()
+            } else {
+                s
+            }
+        };
+        eprintln!("{}: {}: {}", progname, exe.display(), err_str);
         // Try to clean up the temp stdin file on exec failure
         if let Some(ref tp) = temp_stdin_path {
             let _ = std::fs::remove_file(tp);
@@ -2699,16 +2718,26 @@ impl MakeState {
                 true
             } else {
                 let target_time = target_mtime.unwrap();
-                // Check if any prerequisite is newer
-                let any_prereq_newer = rule_info.prerequisites.iter().any(|prereq| {
-                    if let Ok(m) = std::fs::metadata(prereq) {
-                        if let Ok(pt) = m.modified() {
-                            return pt > target_time;
+                // Check if any prerequisite makes the target out of date.
+                // A prereq makes the target out of date if:
+                // 1. The prereq file doesn't exist (missing file → always out of date), OR
+                // 2. The prereq file exists and is newer than the target.
+                // Exception: if the prereq doesn't exist but HAS a rule (like `force:`),
+                // it's a phony/force target that always triggers a rebuild.
+                let any_prereq_outdated = rule_info.prerequisites.iter().any(|prereq| {
+                    match std::fs::metadata(prereq) {
+                        Ok(m) => {
+                            // File exists: check if newer than target
+                            m.modified().ok().map_or(false, |pt| pt > target_time)
+                        }
+                        Err(_) => {
+                            // File doesn't exist: always out of date
+                            // (whether or not there's a rule - if it doesn't exist, target is stale)
+                            true
                         }
                     }
-                    false
                 });
-                any_prereq_newer
+                any_prereq_outdated
             };
 
             if !needs_rebuild {

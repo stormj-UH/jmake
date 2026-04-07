@@ -270,7 +270,12 @@ pub fn parse_args() -> MakeArgs {
                     // Accepted but not implemented
                 }
                 _ => {
-                    let progname = env::args().next().unwrap_or_else(|| "make".to_string());
+                    let raw = env::args().next().unwrap_or_else(|| "make".to_string());
+                    let progname = std::path::Path::new(&raw)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&raw)
+                        .to_string();
                     eprintln!("{}: invalid option -- '{}'", progname, arg);
                     eprintln!("Usage: {} [options] [target] ...", progname);
                     eprintln!("This program built for aarch64-unknown-linux-gnu");

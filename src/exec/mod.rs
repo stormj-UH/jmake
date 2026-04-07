@@ -442,7 +442,7 @@ impl<'a> Executor<'a> {
             // Merge target-specific and pattern-specific variables into the SE
             // auto vars, so that e.g. `foo: a := bar; foo: $$a` can see `a`.
             let collected_target_vars = self.collect_target_vars(target);
-            self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut base_auto_vars);
+            self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut base_auto_vars);
 
             for text in &se_prereq_texts {
                 let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
@@ -473,8 +473,11 @@ impl<'a> Executor<'a> {
         // accounts for deleted intermediates) are newer than the target, skip rebuilding.
         // This handles the case where intermediate files were deleted after a previous build:
         // they should not cause an unnecessary rebuild if their sources are still old.
-        // Only applicable for non-phony targets with no SE prereqs and no always-make.
-        if !is_phony && !self.always_make && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
+        // Only applicable for non-phony targets with no SE prereqs and no always-make,
+        // and only when we already have a recipe (otherwise a pattern rule may contribute
+        // additional prerequisites that we haven't examined yet).
+        if !is_phony && !self.always_make && !recipe.is_empty()
+            && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
             if let Some(target_time) = get_mtime(target).or_else(|| {
                 self.find_in_vpath(target).and_then(|f| get_mtime(&f))
             }) {
@@ -499,9 +502,11 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Push this target's collected vars onto the inheritance stack.
+        // Push this target's "for_prereqs" vars onto the inheritance stack.
+        // Use for_prereqs (index 1) so that private target-specific vars don't block
+        // ancestor non-private vars from propagating to prerequisites.
         let my_target_vars = self.collect_target_vars(target);
-        self.inherited_vars_stack.push(my_target_vars);
+        self.inherited_vars_stack.push(my_target_vars.1);
 
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
@@ -596,7 +601,7 @@ impl<'a> Executor<'a> {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
                     let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
                     let collected_target_vars = self.collect_target_vars(target);
-                    self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut pat_se_auto_vars);
+                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                         let stem_subst = text.replace('%', &stem);
@@ -687,7 +692,7 @@ impl<'a> Executor<'a> {
         // Merge target-specific and pattern-specific variables into auto_vars,
         // respecting command-line variable priority and override semantics.
         let collected_target_vars = self.collect_target_vars(target);
-        self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
+        self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut auto_vars);
 
         if self.question {
             // In question mode: expand the recipe and run make-function side-effects,
@@ -768,7 +773,7 @@ impl<'a> Executor<'a> {
             let oo_refs: Vec<&str> = auto_var_order_only.iter().map(|s| s.as_str()).collect();
             let mut base_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, &stem);
             let collected_target_vars = self.collect_target_vars(target);
-            self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut base_auto_vars);
+            self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut base_auto_vars);
 
             for text in &se_prereq_texts {
                 let (normal, oo) = self.second_expand_prereqs(text, &base_auto_vars, target);
@@ -786,7 +791,7 @@ impl<'a> Executor<'a> {
         se_expanded_order_only.retain(|p| p != ".WAIT");
 
         let my_target_vars = self.collect_target_vars(target);
-        self.inherited_vars_stack.push(my_target_vars);
+        self.inherited_vars_stack.push(my_target_vars.1);
 
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
@@ -869,7 +874,7 @@ impl<'a> Executor<'a> {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
                     let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
                     let collected_target_vars = self.collect_target_vars(target);
-                    self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut pat_se_auto_vars);
+                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                         let stem_subst = text.replace('%', &stem);
@@ -1005,7 +1010,7 @@ impl<'a> Executor<'a> {
         let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
         let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
         let collected_target_vars = self.collect_target_vars(target);
-        self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
+        self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut auto_vars);
 
         if self.question {
             let has_real_cmds = self.recipe_has_real_commands(&recipe, &auto_vars);
@@ -1134,7 +1139,7 @@ impl<'a> Executor<'a> {
             // Build this rule's prerequisites
             // Push target vars onto stack for inheritance by prerequisites.
             let my_target_vars = self.collect_target_vars(target);
-            self.inherited_vars_stack.push(my_target_vars);
+            self.inherited_vars_stack.push(my_target_vars.1);
 
             let mut any_prereq_rebuilt = false;
             let mut prereq_errors = Vec::new();
@@ -1199,7 +1204,7 @@ impl<'a> Executor<'a> {
 
             // Apply target-specific and pattern-specific variables
             let collected_target_vars = self.collect_target_vars(target);
-            self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
+            self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut auto_vars);
 
             if self.question {
                 // In question mode: check if real shell commands would run.
@@ -1294,7 +1299,7 @@ impl<'a> Executor<'a> {
         // Build prerequisites
         // Push target vars onto stack for inheritance by prerequisites.
         let my_target_vars = self.collect_target_vars(target);
-        self.inherited_vars_stack.push(my_target_vars);
+        self.inherited_vars_stack.push(my_target_vars.1);
 
         let mut any_rebuilt = false;
         for prereq in prereqs.clone() {
@@ -1347,7 +1352,7 @@ impl<'a> Executor<'a> {
 
         // Apply target-specific and pattern-specific variables
         let collected_target_vars = self.collect_target_vars(target);
-        self.apply_target_vars_to_auto_vars(&collected_target_vars, &mut auto_vars);
+        self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut auto_vars);
 
         if self.question {
             // In question mode: check if real shell commands would run.
@@ -1601,9 +1606,13 @@ impl<'a> Executor<'a> {
     }
 
     /// Collect all applicable target-specific and pattern-specific variables for a target.
-    /// Returns a map of variable name → (value, is_override, is_private).
+    /// Returns two maps:
+    ///   0: for_recipe  — vars for this target's own recipe expansion (includes private vars)
+    ///   1: for_prereqs — vars to pass to prerequisites (private vars replaced by their
+    ///                    pre-override inherited values, so that `b: private F = b` does
+    ///                    NOT block `a: F = a` from reaching `c` through `b`)
     /// Pattern-specific variables are matched with shortest-stem semantics.
-    fn collect_target_vars(&self, target: &str) -> HashMap<String, (String, bool, bool)> {
+    fn collect_target_vars(&self, target: &str) -> (HashMap<String, (String, bool, bool)>, HashMap<String, (String, bool, bool)>) {
         // We use a two-pass approach for Recursive variables:
         //  Pass 1: collect Simple/Conditional/Shell vars (expanded immediately) and
         //          store Recursive/Append vars' raw values.
@@ -1735,6 +1744,18 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+
+        // Snapshot the staging state before step 2 (target-specific vars).
+        // This is used to build the "for_prereqs" result: when a target-specific private
+        // var overrides an inherited value, the inherited value should still pass through
+        // to prerequisites (GNU Make private semantics: only blocks THIS target's override).
+        let pre_step2_snap: HashMap<String, (String, bool)> = staging_idx.iter()
+            .map(|(name, &i)| {
+                let (_, val, is_expanded, is_override, _) = &staging[i];
+                // For snapshot we just want to know the key existed and its is_override
+                (name.clone(), (val.clone(), *is_override))
+            })
+            .collect();
 
         // 2. Apply target-specific variables (they override pattern-specific).
         if let Some(rules) = self.db.rules.get(target) {
@@ -1889,7 +1910,25 @@ impl<'a> Executor<'a> {
             result.insert(name.clone(), (val, *is_override, is_priv));
         }
 
-        result
+        // Build for_prereqs: like result, but for private vars that overrode an existing
+        // inherited/pattern value, use the pre-step-2 (inherited/pattern) value instead.
+        // Private vars that were NEW in step 2 (no pre-step-2 entry) are omitted entirely.
+        let mut for_prereqs: HashMap<String, (String, bool, bool)> = HashMap::new();
+        for (name, (val, is_override, is_priv)) in &result {
+            if *is_priv {
+                // This var was made private by this target's own assignment.
+                // For prereqs, use the pre-step-2 value if it existed.
+                if let Some((pre_val, pre_is_override)) = pre_step2_snap.get(name) {
+                    // Carry through the pre-override value, marking it as non-private.
+                    for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false));
+                }
+                // If no pre-step-2 entry: don't include in for_prereqs at all.
+            } else {
+                for_prereqs.insert(name.clone(), (val.clone(), *is_override, false));
+            }
+        }
+
+        (result, for_prereqs)
     }
 
     /// Apply collected target vars to auto_vars, respecting command-line variable priority.
@@ -1997,17 +2036,27 @@ impl<'a> Executor<'a> {
                         if self.db.is_secondary(prereq) && !self.db.is_notintermediate(prereq) {
                             continue;
                         }
-                        // A prereq that was visited (has a rule, even an empty one) but
-                        // still doesn't exist as a file always triggers a rebuild.
-                        // GNU Make treats such prerequisites as "newer than everything".
-                        if self.built.contains_key(prereq.as_str()) {
+                        // A prereq that was visited and its recipe actually ran (commands
+                        // were executed) but the file still doesn't exist always triggers
+                        // a rebuild.  GNU Make treats such prerequisites as "newer than
+                        // everything".
+                        if self.built.get(prereq.as_str()) == Some(&true) {
+                            return true;
+                        }
+                        // If the prereq is explicitly mentioned (not intermediate), a
+                        // missing file is treated as infinitely new: always rebuild.
+                        // Intermediate files that are absent use effective_mtime instead.
+                        if self.db.is_explicitly_mentioned(prereq) {
                             return true;
                         }
                         // For non-existent non-phony prereqs (potentially intermediate files
                         // that were deleted), compute effective mtime from their sources.
                         // If sources are all older than the target, no rebuild needed.
+                        // Exception: .NOTINTERMEDIATE files are "real" files; when they
+                        // don't exist (no effective mtime), treat as needing rebuild.
                         match self.effective_mtime(prereq, 0) {
                             Some(eff_t) if eff_t > target_time => return true,
+                            None if self.db.is_notintermediate(prereq) => return true,
                             _ => continue,
                         }
                     }
@@ -2523,7 +2572,7 @@ impl<'a> Executor<'a> {
     fn compute_target_exports(&self, target: &str) -> HashMap<String, String> {
         // Use the collect_target_vars result to find the final values of all
         // applicable target-specific and pattern-specific variables.
-        let target_vars = self.collect_target_vars(target);
+        let (target_vars, _) = self.collect_target_vars(target);
         let mut exports: HashMap<String, String> = HashMap::new();
         // Track vars that are explicitly unexported for this target.
         let mut unexports: HashSet<String> = HashSet::new();
