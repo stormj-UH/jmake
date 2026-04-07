@@ -803,8 +803,15 @@ impl<'a> Executor<'a> {
             return self.build_with_pattern_rule(target, &pattern_rule, &stem, is_phony);
         }
 
-        // Check if file exists (no rule needed)
-        if Path::new(target).exists() {
+        // Check if file exists (no rule needed).
+        // When -L/--check-symlink-times is set, also treat dangling symlinks as "existing"
+        // (we use the symlink's own mtime rather than following it to its target).
+        let target_exists = if self.state.args.check_symlink_times {
+            Path::new(target).symlink_metadata().is_ok()
+        } else {
+            Path::new(target).exists()
+        };
+        if target_exists {
             if self.collect_plans_mode {
                 self.record_leaf_plan(target, is_phony);
             }
@@ -1044,9 +1051,44 @@ impl<'a> Executor<'a> {
         all_order_only = Self::glob_expand_prereqs(all_order_only);
 
         // Apply shuffle to prerequisite ordering (unless .NOTPARALLEL is set).
+        // GNU Make shuffles regular and order-only prerequisites together as one combined
+        // list, then splits the result back into regular/order-only by original membership.
+        // This ensures the shuffled execution order interleaves both categories, matching
+        // GNU Make behavior for --shuffle=reverse (e.g. `a_: b_ c_ | d_ e_` reversed
+        // gives `e_ d_ c_ b_` not `c_ b_` then `e_ d_`).
+        //
+        // `combined_build_order`: if Some, contains the interleaved execution order
+        // (tagged with is_regular) that steps 1 and 2 below should use instead of
+        // the separate all_prereqs/all_order_only loops.
+        let mut combined_build_order: Option<Vec<(String, bool)>> = None;
         if self.shuffle.is_some() && !self.db.not_parallel {
-            all_prereqs = self.shuffle_list(all_prereqs);
-            all_order_only = self.shuffle_list(all_order_only);
+            // Tag each prereq with whether it's regular (true) or order-only (false).
+            let mut tagged: Vec<(String, bool)> = all_prereqs.drain(..)
+                .map(|p| (p, true))
+                .chain(all_order_only.drain(..).map(|p| (p, false)))
+                .collect();
+            // Shuffle by extracting names, shuffling them, then re-applying the permutation
+            // to the tagged list (preserving the regular/order-only flag with each element).
+            let names: Vec<String> = tagged.iter().map(|(s, _)| s.clone()).collect();
+            let shuffled_names = self.shuffle_list(names);
+            // Reconstruct with correct flags: match each shuffled name back to its
+            // first remaining tagged entry (handles duplicates correctly).
+            let mut new_tagged: Vec<(String, bool)> = Vec::with_capacity(tagged.len());
+            for name in shuffled_names {
+                let pos = tagged.iter().position(|(s, _)| s == &name).unwrap_or(0);
+                new_tagged.push(tagged.remove(pos));
+            }
+            // Split back into regular and order-only (still in original declaration order
+            // for auto vars, but `combined_build_order` holds the interleaved order).
+            for (name, is_regular) in &new_tagged {
+                if *is_regular {
+                    all_prereqs.push(name.clone());
+                } else {
+                    all_order_only.push(name.clone());
+                }
+            }
+            combined_build_order = Some(new_tagged);
+
             se_expanded_prereqs = self.shuffle_list(se_expanded_prereqs);
             se_expanded_order_only = self.shuffle_list(se_expanded_order_only);
         }
@@ -1062,8 +1104,8 @@ impl<'a> Executor<'a> {
         // .NOTINTERMEDIATE pattern-rule prereqs correctly trigger a rebuild.
         if !is_phony && !self.always_make
             && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
-            if let Some(target_time) = get_mtime(target).or_else(|| {
-                self.find_in_vpath(target).and_then(|f| get_mtime(&f))
+            if let Some(target_time) = self.file_mtime(target).or_else(|| {
+                self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
             }) {
                 // Start with the explicitly-collected prereqs.
                 let mut check_prereqs: Vec<String> = all_prereqs.clone();
@@ -1302,8 +1344,14 @@ impl<'a> Executor<'a> {
             Vec::new()
         };
         // Build pattern-rule prereqs first (before explicit prereqs).
+        // When shuffle is active, skip prereqs that are already in all_prereqs
+        // (they will be built in the correct shuffled order by step 1 below).
         let mut pre_pat_built: std::collections::HashSet<String> = std::collections::HashSet::new();
         for prereq in &pre_pat_prereqs {
+            if self.shuffle.is_some() && !self.db.not_parallel && all_prereqs.contains(prereq) {
+                pre_pat_built.insert(prereq.clone());
+                continue;
+            }
             if !pre_pat_built.contains(prereq) {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
@@ -1326,35 +1374,70 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Step 1: build non-SE normal prereqs
-        for prereq in all_prereqs.clone() {
-            match self.build_target(&prereq) {
-                Ok(rebuilt) => {
-                    if rebuilt { any_prereq_rebuilt = true; }
+        // Step 1+2: build non-SE normal prereqs and order-only prereqs.
+        // When shuffle is active, use the combined_build_order that interleaves regular
+        // and order-only in the shuffled order (GNU Make behavior: both are shuffled together).
+        // When no shuffle, use the original separate loops (regular first, then order-only).
+        if let Some(ref combined_order) = combined_build_order {
+            for (prereq, is_regular) in combined_order.clone() {
+                if is_regular {
+                    match self.build_target(&prereq) {
+                        Ok(rebuilt) => {
+                            if rebuilt { any_prereq_rebuilt = true; }
+                        }
+                        Err(e) => {
+                            let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                            let propagated = if is_new {
+                                let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                                format!("{}, needed by '{}'.  Stop.", base, target)
+                            } else {
+                                e
+                            };
+                            if self.keep_going {
+                                if is_new { self.print_error_keep_going(&propagated); }
+                                prereq_errors.push(propagated);
+                            } else {
+                                self.inherited_vars_stack.pop();
+                                return Err(propagated);
+                            }
+                        }
+                    }
+                } else {
+                    // order-only: errors are ignored
+                    let _ = self.build_target(&prereq);
                 }
-                Err(e) => {
-                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
-                    let propagated = if is_new {
-                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                        format!("{}, needed by '{}'.  Stop.", base, target)
-                    } else {
-                        e
-                    };
-                    if self.keep_going {
-                        // Only print at the first occurrence (when we just added "needed by").
-                        if is_new { self.print_error_keep_going(&propagated); }
-                        prereq_errors.push(propagated);
-                    } else {
-                        self.inherited_vars_stack.pop();
-                        return Err(propagated);
+            }
+        } else {
+            // Step 1: build non-SE normal prereqs
+            for prereq in all_prereqs.clone() {
+                match self.build_target(&prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_prereq_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            // Only print at the first occurrence (when we just added "needed by").
+                            if is_new { self.print_error_keep_going(&propagated); }
+                            prereq_errors.push(propagated);
+                        } else {
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
                     }
                 }
             }
-        }
 
-        // Step 2: build non-SE order-only prereqs
-        for prereq in all_order_only.clone() {
-            let _ = self.build_target(&prereq);
+            // Step 2: build non-SE order-only prereqs
+            for prereq in all_order_only.clone() {
+                let _ = self.build_target(&prereq);
+            }
         }
 
         // Step 3: build SE-expanded normal prereqs
@@ -1388,8 +1471,10 @@ impl<'a> Executor<'a> {
         }
 
         // Combine all prereqs for needs_rebuild and auto-var computation.
-        all_prereqs.extend(se_expanded_prereqs);
-        all_order_only.extend(se_expanded_order_only);
+        // Use clone() here so se_expanded_prereqs/se_expanded_order_only remain available
+        // for the auto-var computation below (which needs the original SE-expanded list).
+        all_prereqs.extend(se_expanded_prereqs.clone());
+        all_order_only.extend(se_expanded_order_only.clone());
         all_prereqs.retain(|p| p != ".WAIT");
         all_order_only.retain(|p| p != ".WAIT");
 
@@ -1677,8 +1762,24 @@ impl<'a> Executor<'a> {
         }
 
         // Set up automatic variables (extra_prereqs are excluded from auto vars).
-        let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-        let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
+        // Use the original (pre-shuffle) prerequisite order for auto vars ($^, $<, $|, etc.)
+        // so that shuffle only affects BUILD ORDER, not the values of automatic variables.
+        // Append SE-expanded prereqs (which are always new, no pre-shuffle version).
+        let auto_vars_prereqs_for_recipe: Vec<String> = {
+            let mut v = auto_var_prereqs.clone();
+            // Append SE-expanded prereqs (they have no pre-shuffle original; append at end).
+            v.extend(se_expanded_prereqs.clone());
+            v.retain(|p| p != ".WAIT");
+            v
+        };
+        let auto_vars_order_only_for_recipe: Vec<String> = {
+            let mut v = auto_var_order_only.clone();
+            v.extend(se_expanded_order_only.clone());
+            v.retain(|p| p != ".WAIT");
+            v
+        };
+        let oo_refs: Vec<&str> = auto_vars_order_only_for_recipe.iter().map(|s| s.as_str()).collect();
+        let mut auto_vars = self.make_auto_vars(target, &auto_vars_prereqs_for_recipe, &oo_refs, &pattern_stem);
 
         // Merge target-specific and pattern-specific variables into auto_vars,
         // respecting command-line variable priority and override semantics.
@@ -2499,6 +2600,12 @@ impl<'a> Executor<'a> {
             order_only = Self::glob_expand_prereqs(order_only);
         }
 
+        // Save original prereq order before shuffling, so auto vars ($^, $<, etc.)
+        // reflect the original declaration order (shuffle only affects BUILD order,
+        // not the values of automatic variables — GNU Make behavior).
+        let prereqs_original_order = prereqs.clone();
+        let order_only_original_order = order_only.clone();
+
         // Apply shuffle to pattern rule prerequisites.
         if self.shuffle.is_some() && !self.db.not_parallel {
             prereqs = self.shuffle_list(prereqs);
@@ -2518,8 +2625,8 @@ impl<'a> Executor<'a> {
         // empty (we can't decide without building), or when in collect_plans_mode
         // (parallel build graph collects all dependencies regardless).
         if !is_phony && !self.always_make && !self.collect_plans_mode {
-            if let Some(target_time) = get_mtime(target).or_else(|| {
-                self.find_in_vpath(target).and_then(|f| get_mtime(&f))
+            if let Some(target_time) = self.file_mtime(target).or_else(|| {
+                self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
             }) {
                 let any_prereq_newer = prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
@@ -2529,8 +2636,8 @@ impl<'a> Executor<'a> {
                     }
                     if self.db.is_phony(p) { return true; }
                     // Check if the file actually exists on disk.
-                    let file_exists = get_mtime(p).is_some()
-                        || self.find_in_vpath(p).and_then(|f| get_mtime(&f)).is_some();
+                    let file_exists = self.file_mtime(p).is_some()
+                        || self.find_in_vpath(p).and_then(|f| self.file_mtime(&f)).is_some();
                     if !file_exists {
                         // File doesn't exist. Determine if it needs to be built:
                         if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
@@ -2789,8 +2896,10 @@ impl<'a> Executor<'a> {
             return Ok(false);
         }
 
-        let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
-        let mut auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
+        // Use original (pre-shuffle) order for auto vars so $^, $<, etc. reflect
+        // declaration order regardless of shuffle mode (GNU Make behavior).
+        let oo_refs: Vec<&str> = order_only_original_order.iter().map(|s| s.as_str()).collect();
+        let mut auto_vars = self.make_auto_vars(target, &prereqs_original_order, &oo_refs, stem);
 
         // Apply target-specific and pattern-specific variables
         let collected_target_vars = self.collect_target_vars(target);
@@ -3732,7 +3841,7 @@ impl<'a> Executor<'a> {
         if depth > 10 { return None; }
         // If target exists, use its actual mtime — but check if what-if or rule prereqs
         // would cause a rebuild; if so, treat this target as infinitely new.
-        if let Some(t) = get_mtime(target).or_else(|| self.find_in_vpath(target).and_then(|f| get_mtime(&f))) {
+        if let Some(t) = self.file_mtime(target).or_else(|| self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))) {
             // Check explicit rules for this target
             if let Some(rules) = self.db.rules.get(target) {
                 for rule in rules {
@@ -4086,13 +4195,13 @@ impl<'a> Executor<'a> {
     /// Used in question mode to determine if the target is "out of date".
     fn recipe_has_real_commands(&mut self, recipe: &[(usize, String)], auto_vars: &HashMap<String, String>) -> bool {
         for (_lineno, line) in recipe {
-            // Collapse backslash-newline continuations before expanding, so that
-            // a recipe like `\<newline> $(.XY)` (where $(.XY) is empty) is correctly
-            // seen as an empty command rather than a non-empty `\`.
-            let preprocessed = preprocess_recipe_bsnl(line);
-            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+            let expanded = self.state.expand_with_auto_vars(line, auto_vars);
             let cmd = strip_recipe_prefixes(&expanded);
-            if !cmd.trim().is_empty() {
+            // Collapse all backslash-newline continuations in the expanded text so
+            // that `\<newline> ` (from `\<newline> $(.XY)` where .XY is empty) is
+            // treated as empty, not as a `\` character.
+            let collapsed = collapse_backslash_newlines(&cmd);
+            if !collapsed.trim().is_empty() {
                 return true;
             }
         }
@@ -5404,6 +5513,31 @@ fn run_cmd_with_error_handling(
     }
 
     Ok(code)
+}
+
+/// Collapse all `\<newline>` sequences in `s` unconditionally (at all depths).
+/// Used to determine whether an expanded recipe line is truly empty: after
+/// expansion, `\<newline> ` should be treated as an empty (whitespace-only)
+/// string rather than containing a `\` character.
+fn collapse_backslash_newlines(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            // Skip the backslash, newline, and any leading whitespace on next line
+            i += 2;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            // Replace with a single space (GNU Make semantics)
+            result.push(' ');
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Pre-process a recipe line before variable expansion.
