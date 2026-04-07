@@ -935,6 +935,36 @@ pub fn match_pattern(target: &str, pattern: &str) -> Option<String> {
     }
 }
 
+/// Apply `%` → stem substitution to a raw SE prerequisite text (for static pattern rules).
+/// GNU Make rule: in the SE prerequisite text, replace only the FIRST `%` in each
+/// whitespace-delimited word.  Subsequent `%` characters in the same word are left as-is.
+/// This is used when storing the SE text for static pattern rules at parse time.
+pub fn subst_first_percent_per_word_in_se_text(text: &str, stem: &str) -> String {
+    let mut result = String::with_capacity(text.len() + stem.len() * 4);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let n = chars.len();
+    while i < n {
+        if chars[i].is_whitespace() {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut first_percent_replaced = false;
+        while i < n && !chars[i].is_whitespace() {
+            let c = chars[i];
+            if c == '%' && !first_percent_replaced {
+                result.push_str(stem);
+                first_percent_replaced = true;
+            } else {
+                result.push(c);
+            }
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Replace the **first** occurrence of `%` in `pattern` with `stem`.
 /// Subsequent `%` characters are left unchanged (GNU Make semantics).
 pub fn apply_stem(pattern: &str, stem: &str) -> String {
@@ -993,17 +1023,19 @@ fn expand_static_pattern_rule(
         };
 
         // Substitute the stem into every prerequisite pattern.
-        // Empty results (e.g. when the pattern is just `%` and the stem is
-        // empty, or after substitution the word becomes empty) are kept — GNU
-        // Make keeps them; filtering them out would change semantics.
+        // GNU Make filters out empty-string prerequisites that result from an
+        // empty stem (e.g. `foo: foo%: %` with stem `` gives empty prereq `""`
+        // which is silently discarded).
         let prereqs: Vec<String> = prereq_patterns
             .iter()
             .map(|p| apply_stem(p, &stem))
+            .filter(|p| !p.is_empty())
             .collect();
 
         let order_only: Vec<String> = order_only_patterns
             .iter()
             .map(|p| apply_stem(p, &stem))
+            .filter(|p| !p.is_empty())
             .collect();
 
         let mut rule = Rule::new();
@@ -1017,16 +1049,16 @@ fn expand_static_pattern_rule(
         rule.static_stem = stem.clone();
 
         // Store raw SE texts for second expansion.
-        // We store the raw prereq text with `%` replaced by the stem, so that
-        // at build time `$*` (not `%`) is used for stem references while
-        // `$$@`, `$$<` etc. still expand to the per-target automatic vars.
+        // We store the raw prereq text with only the FIRST `%` per word replaced by the stem,
+        // so that `$*` (not `%`) is used for stem references while `$$@`, `$$<` etc. still
+        // expand to the per-target automatic vars.  Subsequent `%` characters in a word are
+        // left unchanged (GNU Make rule: only the first `%` per word is the wildcard).
         if raw_prereq_text.contains('$') {
-            // Replace `%` with the stem in the raw text (same as non-SE static pattern).
-            let raw_with_stem = raw_prereq_text.replace('%', &stem);
+            let raw_with_stem = subst_first_percent_per_word_in_se_text(&raw_prereq_text, &stem);
             rule.second_expansion_prereqs = Some(raw_with_stem);
         }
         if raw_order_only_text.contains('$') {
-            let raw_oo_with_stem = raw_order_only_text.replace('%', &stem);
+            let raw_oo_with_stem = subst_first_percent_per_word_in_se_text(&raw_order_only_text, &stem);
             rule.second_expansion_order_only = Some(raw_oo_with_stem);
         }
 
