@@ -762,7 +762,7 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
     };
     if let Some(second_colon) = find_bare_colon(rest_before_semi) {
         let target_pattern_str = rest_before_semi[..second_colon].trim();
-        if target_pattern_str.contains('%') {
+        if find_unescaped_percent(target_pattern_str).is_some() {
             let after_second = rest_trimmed[second_colon + 1..].trim();
             let targets: Vec<String> = split_filenames(targets_str);
             if !targets.is_empty() {
@@ -942,18 +942,54 @@ fn find_bare_colon(s: &str) -> Option<usize> {
     None
 }
 
+/// Find the position of the first UNESCAPED `%` in a pattern string.
+/// An unescaped `%` is one not preceded by an odd number of backslashes.
+/// Returns `None` if no unescaped `%` exists.
+fn find_unescaped_percent(pattern: &str) -> Option<usize> {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Count consecutive backslashes
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let num_backslashes = i - start;
+            if i < bytes.len() && bytes[i] == b'%' {
+                if num_backslashes % 2 == 0 {
+                    // Even number of backslashes: % is NOT escaped
+                    return Some(i);
+                } else {
+                    // Odd number of backslashes: % IS escaped (literal)
+                    i += 1; // skip the %
+                }
+            }
+            // Otherwise continue (the backslashes escaped something else)
+        } else if bytes[i] == b'%' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Match `target` against `pattern` (which contains at most one `%`) and
 /// return the stem — the substring that `%` stands for — or `None` if the
 /// target does not match.
 ///
 /// GNU Make rules:
+///   - In the pattern, `\%` is a literal `%` (escaped), and the first unescaped
+///     `%` is the wildcard.
 ///   - The literal text before `%` must be a prefix of `target`.
 ///   - The literal text after  `%` must be a suffix of `target`.
 ///   - The prefix and suffix together must not exceed `target.len()`.
 pub fn match_pattern(target: &str, pattern: &str) -> Option<String> {
-    match pattern.find('%') {
+    match find_unescaped_percent(pattern) {
         None => {
-            // Literal pattern — only matches an identical target.
+            // No wildcard — treat pattern as literal (but unescape \% → % for comparison).
+            // The target also has \% stored as \%, so compare raw bytes.
             if target == pattern {
                 Some(String::new())
             } else {
@@ -1049,7 +1085,7 @@ pub fn subst_dollar_star_in_se_text(text: &str, stem: &str) -> String {
 }
 
 pub fn apply_stem(pattern: &str, stem: &str) -> String {
-    match pattern.find('%') {
+    match find_unescaped_percent(pattern) {
         None => pattern.to_string(),
         Some(pct) => {
             let mut result = String::with_capacity(pattern.len() + stem.len());

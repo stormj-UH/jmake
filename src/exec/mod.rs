@@ -84,6 +84,9 @@ pub struct Executor<'a> {
     pending_plan_prereqs: Vec<String>,
     /// Order-only prerequisites for the current target (set before execute_recipe).
     pending_plan_order_only: Vec<String>,
+    /// .WAIT groups for the current target (set before execute_recipe in collect_plans_mode).
+    /// Non-empty only when the target's prerequisites contain .WAIT markers.
+    pending_plan_wait_groups: Vec<Vec<String>>,
     /// When true, skip applying .EXTRA_PREREQS for the current target.
     /// Set when building a target that is itself an extra prerequisite, to prevent
     /// recursive/circular application of .EXTRA_PREREQS.
@@ -166,6 +169,7 @@ impl<'a> Executor<'a> {
             parallel_plans: None,
             pending_plan_prereqs: Vec::new(),
             pending_plan_order_only: Vec::new(),
+            pending_plan_wait_groups: Vec::new(),
             skip_extra_prereqs: false,
             lib_search_results: HashMap::new(),
             se_explicitly_mentioned: HashSet::new(),
@@ -840,6 +844,7 @@ impl<'a> Executor<'a> {
                 if self.collect_plans_mode {
                     self.pending_plan_prereqs = Vec::new();
                     self.pending_plan_order_only = Vec::new();
+                    self.pending_plan_wait_groups = Vec::new();
                 }
                 let result = self.execute_recipe(target, &default_rule.recipe, &default_rule.source_file, &auto_vars, false);
                 self.target_extra_exports.clear();
@@ -952,6 +957,15 @@ impl<'a> Executor<'a> {
                 recipe_source_file = rule.source_file.clone();
             }
         }
+
+        // In collect_plans_mode (parallel build), extract .WAIT groups before filtering.
+        // These groups encode the ordering constraint: targets in group N+1 must not start
+        // until all targets in group N (and the barrier sentinel for group N) are Done.
+        let wait_groups = if self.collect_plans_mode {
+            extract_wait_groups(&all_prereqs)
+        } else {
+            Vec::new()
+        };
 
         // Filter .WAIT markers early so they don't appear in auto vars ($^, $<, $+, $|).
         all_prereqs.retain(|p| p != ".WAIT");
@@ -1160,6 +1174,7 @@ impl<'a> Executor<'a> {
                                         extra_exports: HashMap::new(),
                                         extra_unexports: Vec::new(),
                                         is_intermediate: false,
+                                        wait_groups: Vec::new(),
                                     });
                                 }
                             }
@@ -1555,6 +1570,7 @@ impl<'a> Executor<'a> {
                         extra_exports: HashMap::new(),
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
+                        wait_groups: wait_groups.clone(),
                     };
                     if let Some(ref mut plans) = self.pending_plans {
                         plans.insert(target.to_string(), plan);
@@ -1642,6 +1658,7 @@ impl<'a> Executor<'a> {
                 extra_exports: self.compute_target_exports(target),
                 extra_unexports: self.compute_target_unexports(target).into_iter().collect(),
                 is_intermediate: self.db.is_intermediate(target),
+                wait_groups: wait_groups.clone(),
             };
             if let Some(ref mut plans) = self.pending_plans {
                 plans.insert(target.to_string(), plan);
@@ -1680,6 +1697,7 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             self.pending_plan_prereqs = all_prereqs.clone();
             self.pending_plan_order_only = all_order_only.clone();
+            self.pending_plan_wait_groups = wait_groups.clone();
         }
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
@@ -2018,6 +2036,7 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             self.pending_plan_prereqs = all_prereqs.clone();
             self.pending_plan_order_only = all_order_only.clone();
+            self.pending_plan_wait_groups = wait_groups.clone();
         }
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
@@ -2280,6 +2299,7 @@ impl<'a> Executor<'a> {
                     extra_exports,
                     extra_unexports,
                     is_intermediate: self.db.is_intermediate(target),
+                    wait_groups: Vec::new(),
                 };
                 if let Some(ref mut plans) = self.pending_plans {
                     plans.insert(virtual_key.clone(), virtual_plan);
@@ -2332,6 +2352,7 @@ impl<'a> Executor<'a> {
                         extra_exports: HashMap::new(),
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
+                        wait_groups: Vec::new(),
                     });
                 } else if !plans.contains_key(target) {
                     // No rules needed rebuilding. Record a no-op plan so the
@@ -2350,6 +2371,7 @@ impl<'a> Executor<'a> {
                         extra_exports: HashMap::new(),
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
+                        wait_groups: Vec::new(),
                     });
                 }
             }
@@ -2771,6 +2793,7 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             self.pending_plan_prereqs = prereqs.clone();
             self.pending_plan_order_only = order_only.clone();
+            self.pending_plan_wait_groups = Vec::new(); // pattern rules: no .WAIT groups
         }
         let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
@@ -2783,30 +2806,19 @@ impl<'a> Executor<'a> {
         // 4. Marked .NOTINTERMEDIATE
         // 5. Marked .SECONDARY
         if let Ok(true) = &result {
-            // For multi-target pattern rules: mark also_make siblings as built and
-            // potentially intermediate. These siblings were produced by the same recipe.
-            // GNU Make tracks also_make siblings BEFORE the primary target in the
-            // intermediate deletion list (so they are removed first).
+            // For multi-target pattern rules: mark also_make siblings as built.
+            // GNU Make does NOT delete also_make siblings as intermediates — they are
+            // produced together with the primary target and treated as real outputs.
+            // Only mark them intermediate if explicitly declared via .INTERMEDIATE.
             for sib in &also_make_siblings {
                 // Mark as built/covered so we don't run the recipe again for them.
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), true);
 
-                // Track intermediate status for also_make siblings.
+                // Only track as intermediate if explicitly declared .INTERMEDIATE.
                 if self.db.is_intermediate(sib) {
                     if !self.intermediate_built.contains(sib) {
                         self.intermediate_built.push(sib.clone());
-                    }
-                } else if !self.db.is_precious(sib)
-                    && !self.db.is_notintermediate(sib)
-                    && !self.db.is_secondary(sib)
-                {
-                    let is_explicit = self.top_level_targets.contains(sib.as_str())
-                        || self.is_explicitly_mentioned(sib);
-                    if !is_explicit {
-                        if !self.intermediate_built.contains(sib) {
-                            self.intermediate_built.push(sib.clone());
-                        }
                     }
                 }
             }
@@ -2953,9 +2965,9 @@ impl<'a> Executor<'a> {
                     if prereqs_ok {
                         pass1_candidates.push(((**rule).clone(), stem));
                         break; // Only take first matching pattern_target per rule
-                    } else if found_compat && compat_rule.is_none() {
-                        // Use as compat (last-resort) candidate. Terminal rules can also
-                        // be compat candidates when their prereq is explicitly mentioned.
+                    } else if found_compat && compat_rule.is_none() && !rule.is_terminal {
+                        // Use as compat (last-resort) candidate. Terminal rules are NOT
+                        // used as compat candidates — they require prereqs to already exist.
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
@@ -3093,7 +3105,7 @@ impl<'a> Executor<'a> {
                                 // Allowing recursion here causes infinite expansion when
                                 // a terminal rule's prereq pattern resolves to a longer name
                                 // that re-matches the same terminal rule (e.g. %:: %.c → hello.c → hello.c.c → ...).
-                                || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited))
+                                || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, depth + 1))
                         })
                     };
                     if prereqs_ok { return true; }
@@ -4055,6 +4067,11 @@ impl<'a> Executor<'a> {
                     plan.auto_vars = auto_vars.clone();
                     plan.extra_exports = self.target_extra_exports.clone();
                     plan.extra_unexports = self.target_extra_unexports.iter().cloned().collect();
+                    // Update wait_groups if we have pending ones (from build_with_rules).
+                    let wg = std::mem::take(&mut self.pending_plan_wait_groups);
+                    if !wg.is_empty() {
+                        plan.wait_groups = wg;
+                    }
                 } else {
                     // Plan not pre-created (e.g. pattern rule or .DEFAULT); create it now.
                     let plan = parallel::TargetPlan {
@@ -4071,6 +4088,7 @@ impl<'a> Executor<'a> {
                         extra_exports: self.target_extra_exports.clone(),
                         extra_unexports: self.target_extra_unexports.iter().cloned().collect(),
                         is_intermediate: self.db.is_intermediate(target),
+                        wait_groups: std::mem::take(&mut self.pending_plan_wait_groups),
                     };
                     plans.insert(target.to_string(), plan);
                 }
@@ -4747,6 +4765,7 @@ impl<'a> Executor<'a> {
                     extra_exports: HashMap::new(),
                     extra_unexports: Vec::new(),
                     is_intermediate: false,
+                    wait_groups: Vec::new(),
                 });
             }
         }
@@ -4755,6 +4774,31 @@ impl<'a> Executor<'a> {
 
 /// Format a "file:line: " location prefix for error messages.
 /// If source_file is empty or lineno is 0, returns an empty string.
+/// Extract ".WAIT groups" from a prerequisite list that may contain ".WAIT" markers.
+///
+/// Returns a Vec of groups, where each group is the list of prereqs between two consecutive
+/// .WAIT markers (or between a .WAIT and the start/end of the list).  An empty Vec is
+/// returned when there are no .WAIT markers (the caller should treat the list as a single
+/// group with no ordering constraints).
+///
+/// Example: [A, B, .WAIT, C, D, .WAIT, E] → [[A,B], [C,D], [E]]
+fn extract_wait_groups(prereqs: &[String]) -> Vec<Vec<String>> {
+    if !prereqs.iter().any(|p| p == ".WAIT") {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for p in prereqs {
+        if p == ".WAIT" {
+            groups.push(std::mem::take(&mut current));
+        } else {
+            current.push(p.clone());
+        }
+    }
+    groups.push(current);
+    groups
+}
+
 fn make_location(source_file: &str, lineno: usize) -> String {
     if source_file.is_empty() {
         String::new()
@@ -4890,6 +4934,14 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
             let c = chars[i];
             // Whitespace at top level ends the word.
             if c.is_whitespace() && depth == 0 { break; }
+            // Whitespace inside a function call (depth > 0) is also a word boundary
+            // for % substitution.  Reset the flag and copy the whitespace verbatim.
+            if c.is_whitespace() && depth > 0 {
+                first_percent_replaced = false;
+                result.push(c);
+                i += 1;
+                continue;
+            }
             // Track $(  and ${  depth.
             if c == '$' && i + 1 < n && (chars[i + 1] == '(' || chars[i + 1] == '{') {
                 depth += 1;
@@ -4906,7 +4958,7 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
                 i += 1;
                 continue;
             }
-            // '%' at ANY depth: substitute stem (only once per word).
+            // '%' at ANY depth: substitute stem (only once per whitespace-delimited word).
             if c == '%' && !first_percent_replaced {
                 result.push_str(stem_to_use);
                 first_percent_replaced = true;
@@ -5039,11 +5091,35 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
             } else if !use_full {
                 result.push_str(dir);
             }
-            // Copy word chars, substituting '%' with the chosen stem (first occurrence only).
+            // Copy word chars, substituting '%' with the chosen stem (first once per
+            // whitespace-delimited word, including words inside function calls).
             let mut replaced = false;
+            let mut copy_depth: i32 = 0;
             let mut k = word_start;
             while k < j {
                 let c = chars[k];
+                // Track depth in the copy loop.
+                if c == '$' && k + 1 < j && (chars[k + 1] == '(' || chars[k + 1] == '{') {
+                    copy_depth += 1;
+                    result.push(c);
+                    k += 1;
+                    result.push(chars[k]);
+                    k += 1;
+                    continue;
+                }
+                if (c == ')' || c == '}') && copy_depth > 0 {
+                    copy_depth -= 1;
+                    result.push(c);
+                    k += 1;
+                    continue;
+                }
+                // Whitespace inside a function call: reset the replaced flag (new word boundary).
+                if c.is_whitespace() && copy_depth > 0 {
+                    replaced = false;
+                    result.push(c);
+                    k += 1;
+                    continue;
+                }
                 if c == '%' && !replaced {
                     result.push_str(stem_for_subst);
                     replaced = true;

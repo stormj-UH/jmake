@@ -202,7 +202,33 @@ impl MakeState {
 
         // Warn if requested
         if self.args.warn_undefined_variables {
-            eprintln!("jmake: warning: undefined variable '{}'", expanded_name);
+            // Use the outermost caller context (expansion_caller_stack) when available,
+            // as it reflects the location in the user's makefile where the expansion
+            // was triggered (not the variable's definition site).
+            // Fall back to current_file/current_line if no caller stack entry.
+            let loc = {
+                let stack = self.expansion_caller_stack.borrow();
+                if let Some((cf, cl)) = stack.first() {
+                    if !cf.is_empty() && *cl > 0 {
+                        format!("{}:{}: ", cf, cl)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    let file = self.current_file.borrow();
+                    let line = *self.current_line.borrow();
+                    if !file.is_empty() && line > 0 {
+                        format!("{}:{}: ", file, line)
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+            if loc.is_empty() {
+                eprintln!("jmake: warning: undefined variable '{}'", expanded_name);
+            } else {
+                eprintln!("{}warning: undefined variable '{}'", loc, expanded_name);
+            }
         }
 
         String::new()
@@ -319,14 +345,43 @@ impl MakeState {
                     // If we're inside a $(call), auto_vars contains $1, $2, etc.
                     // After the first expansion pass, `$$1` → `$1` (literal dollar-one).
                     // GNU Make resolves `$1` in the eval content using the call context.
-                    // Similarly, if we're inside a $(foreach x,...), auto_vars contains
-                    // `x` → current value, and any $(x) in the eval content (from
-                    // $(value VAR) which returns unexpanded text) must be resolved with
-                    // the foreach-iteration value, not the post-foreach global value.
-                    // We do a second expansion pass whenever auto_vars is non-empty and
-                    // the expanded content still has `$` references.
+                    // Similarly, if we're inside a $(foreach x,...) or $(let VAR,val,...),
+                    // auto_vars contains the loop/let variable values. Any $(var) in the
+                    // eval content (typically from $(value VAR) which returns unexpanded
+                    // text) must be resolved with the current iteration value.
+                    //
+                    // We do a second expansion pass, but ONLY for the non-recipe parts
+                    // of each line (recipe lines start with \t or come after `;`).
+                    // This prevents let/foreach variable bindings from incorrectly
+                    // expanding variable references that are meant to be evaluated at
+                    // build time (e.g., $(AR) in a recipe when AR is bound by $(let)).
                     let final_content = if !auto_vars.is_empty() && expanded.contains('$') {
-                        self.expand_with_auto_vars(&expanded, auto_vars)
+                        // Process line by line, expanding only non-recipe parts.
+                        let lines: Vec<&str> = expanded.split('\n').collect();
+                        let processed: Vec<String> = lines.iter().map(|line| {
+                            if line.starts_with('\t') {
+                                // Pure recipe line: do not expand
+                                line.to_string()
+                            } else if let Some(semi_pos) = crate::parser::find_semicolon(line) {
+                                // Has inline recipe: expand only the header part
+                                let header = &line[..semi_pos];
+                                let recipe = &line[semi_pos..]; // includes the ';'
+                                let expanded_header = if header.contains('$') {
+                                    self.expand_with_auto_vars(header, auto_vars)
+                                } else {
+                                    header.to_string()
+                                };
+                                format!("{}{}", expanded_header, recipe)
+                            } else {
+                                // Non-recipe line: expand fully
+                                if line.contains('$') {
+                                    self.expand_with_auto_vars(line, auto_vars)
+                                } else {
+                                    line.to_string()
+                                }
+                            }
+                        }).collect();
+                        processed.join("\n")
                     } else {
                         expanded
                     };

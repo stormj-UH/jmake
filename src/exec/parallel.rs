@@ -66,6 +66,11 @@ pub struct TargetPlan {
     pub extra_unexports: Vec<String>,
     /// Whether this target is an intermediate file (tracked for post-build deletion).
     pub is_intermediate: bool,
+    /// When non-empty, the normal prerequisites are split into ".WAIT groups".
+    /// Group 0 runs first; once all of group 0 are Done, group 1 is eligible, etc.
+    /// The scheduler uses this to enforce .WAIT ordering within a target's prerequisites.
+    /// The flat `prerequisites` field still contains ALL prereqs for auto_var/rebuild purposes.
+    pub wait_groups: Vec<Vec<String>>,
 }
 
 /// A unit of work dispatched to a worker thread.
