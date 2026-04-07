@@ -645,26 +645,46 @@ impl ParallelScheduler {
             }
         }
 
-        // Among reachable targets that need rebuilding, find those with all deps done.
+        // Among reachable targets, find those with all deps done.
         // Process in BFS order to maintain the order targets were specified as prerequisites.
         // This ensures `all: first second` processes `first` before `second`, preserving
         // the user-specified order in the ready queue.
+        let mut newly_done: Vec<String> = Vec::new();
         for t in &visited_order {
             if self.states.contains_key(t.as_str()) {
                 // Already handled (Done or grouped sibling).
                 continue;
             }
-            let plan = match self.plans.get(t.as_str()) {
-                Some(p) => p,
+            let (needs_rebuild, grouped_siblings) = match self.plans.get(t.as_str()) {
+                Some(p) => {
+                    if p.grouped_primary.is_some() {
+                        continue; // sibling — handled by primary
+                    }
+                    (p.needs_rebuild, p.grouped_siblings.clone())
+                }
                 None => continue,
             };
-            if plan.grouped_primary.is_some() {
-                continue; // sibling — handled by primary
-            }
             if self.all_prereqs_done(t) {
-                self.states.insert(t.clone(), TargetState::Ready);
-                self.ready_queue.push_back(t.clone());
+                if needs_rebuild {
+                    // Target needs to run its recipe.
+                    self.states.insert(t.clone(), TargetState::Ready);
+                    self.ready_queue.push_back(t.clone());
+                } else {
+                    // Target is up-to-date: mark Done.
+                    self.states.insert(t.clone(), TargetState::Done(false));
+                    // Also complete grouped siblings if any.
+                    for sib in grouped_siblings {
+                        self.states.insert(sib, TargetState::Done(false));
+                    }
+                    newly_done.push(t.clone());
+                }
             }
+        }
+        // Propagate completion for newly-Done up-to-date targets.
+        // This handles cases where a Done target's dependents were visited before
+        // the target itself in BFS order (top-down BFS from roots processes parents first).
+        for t in newly_done {
+            self.propagate_completion(&t);
         }
     }
 
@@ -853,22 +873,50 @@ impl ParallelScheduler {
                 }
             }
 
-            // Check dependents — any that now have all prereqs done become Ready.
-            if let Some(deps) = self.dependents_of.get(&target) {
-                for dep in deps.clone() {
-                    // Skip if already in a terminal or active state.
-                    if self.states.contains_key(dep.as_str()) {
-                        continue;
-                    }
-                    if !self.has_error || self.keep_going {
-                        if self.all_prereqs_done(&dep) && !self.any_prereq_failed(&dep) {
-                            self.states.insert(dep.clone(), TargetState::Ready);
-                            self.ready_queue.push_back(dep);
-                        } else if self.any_prereq_failed(&dep) {
-                            self.states.insert(dep.clone(), TargetState::Failed(
-                                format!("prerequisite of '{}' failed", dep)
-                            ));
+            // Check dependents — any that now have all prereqs done become Ready or Done.
+            self.propagate_completion(&target);
+        }
+    }
+
+    /// After a target completes, check its dependents and either mark them Ready
+    /// (if they need rebuilding) or Done (if they're up-to-date), then recursively
+    /// propagate to their dependents. This handles chains of up-to-date targets.
+    fn propagate_completion(&mut self, target: &str) {
+        let deps = match self.dependents_of.get(target) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        for dep in deps {
+            // Skip if already in a terminal or active state.
+            if self.states.contains_key(dep.as_str()) {
+                continue;
+            }
+            if !self.has_error || self.keep_going {
+                if self.any_prereq_failed(&dep) {
+                    self.states.insert(dep.clone(), TargetState::Failed(
+                        format!("prerequisite of '{}' failed", dep)
+                    ));
+                    continue;
+                }
+                if self.all_prereqs_done(&dep) {
+                    // Check if this dependent needs rebuilding.
+                    let needs_rebuild = self.plans.get(dep.as_str())
+                        .map_or(true, |p| p.needs_rebuild);
+                    if needs_rebuild {
+                        self.states.insert(dep.clone(), TargetState::Ready);
+                        self.ready_queue.push_back(dep.clone());
+                    } else {
+                        // Up-to-date target: mark Done and propagate further.
+                        self.states.insert(dep.clone(), TargetState::Done(false));
+                        // Complete grouped siblings.
+                        let siblings = self.plans.get(dep.as_str())
+                            .map(|p| p.grouped_siblings.clone())
+                            .unwrap_or_default();
+                        for sib in &siblings {
+                            self.states.insert(sib.clone(), TargetState::Done(false));
                         }
+                        // Recursively propagate to this dep's dependents.
+                        self.propagate_completion(&dep);
                     }
                 }
             }

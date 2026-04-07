@@ -3492,6 +3492,12 @@ impl MakeState {
             outcome: PendingOutcome,
             /// If true, print "No such file or directory" in Phase C before reporting error.
             deferred_no_such_file: bool,
+            /// For pattern rules with multiple targets: sibling targets that should also be
+            /// updated. If any sibling doesn't exist after the recipe, emit a peer warning.
+            also_make_siblings: Vec<String>,
+            /// Source file and line for the rule (for the peer warning message).
+            rule_source_file: String,
+            rule_lineno: usize,
         }
 
         let pending = std::mem::take(&mut self.pending_includes);
@@ -3516,6 +3522,9 @@ impl MakeState {
                     pi_lineno: pi.lineno,
                     outcome: PendingOutcome::AlreadyExists,
                     deferred_no_such_file: false,
+                    also_make_siblings: Vec::new(),
+                    rule_source_file: String::new(),
+                    rule_lineno: 0,
                 });
                 continue;
             }
@@ -3540,11 +3549,18 @@ impl MakeState {
                         PendingOutcome::Error(String::new())
                     },
                     deferred_no_such_file: !pi.ignore_missing,
+                    also_make_siblings: Vec::new(),
+                    rule_source_file: String::new(),
+                    rule_lineno: 0,
                 });
                 continue;
             }
 
             let rule_info = self.find_include_rule(&pi.file);
+            // Capture sibling info for the peer-target warning (emitted in Phase C).
+            let mut also_make_siblings_for_work: Vec<String> = Vec::new();
+            let mut rule_source_file_for_work = String::new();
+            let mut rule_lineno_for_work: usize = 0;
             let (outcome, deferred_no_such_file) = match rule_info {
                 None => {
                     // No rule to rebuild this include.
@@ -3571,7 +3587,11 @@ impl MakeState {
                 Some(IncludeRuleInfo { imagined: true, .. }) => {
                     (PendingOutcome::Imagined, false)
                 }
-                Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, stem, .. }) => {
+                Some(IncludeRuleInfo { recipe, source_file, recipe_lineno, prerequisites, sibling_targets, stem, .. }) => {
+                    // Capture sibling info for peer-target warning.
+                    also_make_siblings_for_work = sibling_targets.clone();
+                    rule_source_file_for_work = source_file.clone();
+                    rule_lineno_for_work = recipe_lineno;
                     if self.include_recipe_ran.contains(&pi.file) {
                         // This file's recipe was already queued by a previous work item
                         // (either the same file included twice, or a sibling pattern rule).
@@ -3644,6 +3664,9 @@ impl MakeState {
                 pi_lineno: pi.lineno,
                 outcome,
                 deferred_no_such_file,
+                also_make_siblings: also_make_siblings_for_work,
+                rule_source_file: rule_source_file_for_work,
+                rule_lineno: rule_lineno_for_work,
             });
         }
 
@@ -3732,6 +3755,9 @@ impl MakeState {
             let pi_parent = work_items_vec[i].pi_parent.clone();
             let pi_lineno = work_items_vec[i].pi_lineno;
             let deferred_no_such_file = work_items_vec[i].deferred_no_such_file;
+            let also_make_siblings = work_items_vec[i].also_make_siblings.clone();
+            let rule_source_file = work_items_vec[i].rule_source_file.clone();
+            let rule_lineno = work_items_vec[i].rule_lineno;
 
             match &work_items_vec[i].outcome {
                 PendingOutcome::AlreadyExists => {
@@ -3821,6 +3847,21 @@ impl MakeState {
                                     }
                                 }
                                 any_really_rebuilt = true;
+                                // Emit peer-target warning if siblings weren't created.
+                                // This mirrors the warning in build_with_pattern_rule for
+                                // the include-rebuild path (e.g. `include gta` with `%a %b: ...`).
+                                if !also_make_siblings.is_empty() {
+                                    let loc = if !rule_source_file.is_empty() && rule_lineno > 0 {
+                                        format!("{}:{}: ", rule_source_file, rule_lineno)
+                                    } else {
+                                        String::new()
+                                    };
+                                    for sib in &also_make_siblings {
+                                        if !std::path::Path::new(sib).exists() {
+                                            eprintln!("{}warning: pattern recipe did not update peer target '{}'.", loc, sib);
+                                        }
+                                    }
+                                }
                             } else {
                                 // sv 61226: recipe ran but file not created → imagined
                                 self.include_imagined.insert(pi_file.clone());
