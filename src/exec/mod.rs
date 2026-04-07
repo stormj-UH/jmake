@@ -86,6 +86,9 @@ pub struct Executor<'a> {
     /// Set when building a target that is itself an extra prerequisite, to prevent
     /// recursive/circular application of .EXTRA_PREREQS.
     skip_extra_prereqs: bool,
+    /// Maps -lname prerequisites to their resolved library paths (e.g., -l1 → a1/lib1.a).
+    /// Used to substitute the resolved path in $^ and $< auto-variable expansion.
+    lib_search_results: HashMap<String, String>,
 }
 
 impl<'a> Executor<'a> {
@@ -157,6 +160,7 @@ impl<'a> Executor<'a> {
             pending_plan_prereqs: Vec::new(),
             pending_plan_order_only: Vec::new(),
             skip_extra_prereqs: false,
+            lib_search_results: HashMap::new(),
         }
     }
 
@@ -654,6 +658,24 @@ impl<'a> Executor<'a> {
     }
 
     fn build_target_inner(&mut self, target: &str) -> Result<bool, String> {
+        // Handle -lname library prerequisites: search for libname.a or libname.so
+        // in VPATH directories. If found, redirect the build to the resolved path.
+        if let Some(lib_name) = target.strip_prefix("-l") {
+            if let Some(resolved) = self.find_library(lib_name) {
+                // Mark the resolved path as already built (it's a found file, no recipe).
+                self.built.insert(resolved.clone(), false);
+                // Also mark the original -lname as built, mapping to the resolved file.
+                // We do this by re-inserting the target in the parent prerequisite list;
+                // the caller sees Ok(false) meaning "found, no rebuild needed".
+                // But we need the parent to use the resolved path for $^ — GNU Make
+                // actually substitutes -lname → resolved path in the prerequisite list.
+                // Store the mapping for auto-var expansion.
+                self.lib_search_results.insert(target.to_string(), resolved);
+                return Ok(false);
+            }
+            return Err(format!("No rule to make target '{}'.  Stop.", target));
+        }
+
         // Find rule for this target
         let rules = self.db.rules.get(target).cloned();
         let is_phony = self.db.is_phony(target);
@@ -714,6 +736,16 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // Check if VPATH resolves the target to a path with an explicit rule.
+        // This must happen BEFORE pattern rule lookup: when `vpa/foo.x` has an
+        // explicit rule and VPATH contains `vpa`, that explicit VPATH rule takes
+        // priority over any matching pattern rule.
+        if let Some(found) = self.find_in_vpath(target) {
+            if found != target && self.db.rules.contains_key(&found) {
+                return self.build_target(&found);
+            }
+        }
+
         // Try pattern rules
         if let Some((pattern_rule, stem)) = self.find_pattern_rule(target) {
             return self.build_with_pattern_rule(target, &pattern_rule, &stem, is_phony);
@@ -727,7 +759,7 @@ impl<'a> Executor<'a> {
             return Ok(false);
         }
 
-        // Try VPATH
+        // Try VPATH (file exists in a vpath directory, no explicit rule needed)
         if let Some(found) = self.find_in_vpath(target) {
             if found == target {
                 // Shouldn't happen, but guard against infinite recursion.
@@ -735,12 +767,6 @@ impl<'a> Executor<'a> {
                     self.record_leaf_plan(target, is_phony);
                 }
                 return Ok(false);
-            }
-            // If the vpath-resolved path has an explicit rule, build it.
-            // This handles cases like `vpath %.te vpath-d/` where `vpath-d/fail.te:`
-            // has a rule but `fail.te` doesn't exist yet.
-            if self.db.rules.contains_key(&found) {
-                return self.build_target(&found);
             }
             // File exists in a vpath directory (no rule needed), treat as up-to-date.
             if self.collect_plans_mode {
@@ -1045,45 +1071,50 @@ impl<'a> Executor<'a> {
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
 
-        // Step 0: build .EXTRA_PREREQS first (before regular prereqs).
-        // Extra prereqs are built before regular prereqs but are excluded from
-        // automatic variables ($^, $<, $+, $?, $|).
+        // Resolve .EXTRA_PREREQS.
+        // Global extra prereqs are built BEFORE regular prereqs.
+        // Target-specific extra prereqs are built AFTER regular prereqs.
         // When this target is itself being built as an extra prereq (skip_extra_prereqs==true),
         // skip .EXTRA_PREREQS to prevent circular/recursive application.
-        let extra_prereqs = if self.skip_extra_prereqs {
-            Vec::new()
+        let (extra_prereqs, extra_prereqs_target_specific) = if self.skip_extra_prereqs {
+            (Vec::new(), false)
         } else {
             self.get_extra_prereqs(target)
         };
-        // Build extra prereqs with skip_extra_prereqs=true so they don't recursively
-        // apply their own .EXTRA_PREREQS (prevents circular deps and wrong ordering).
-        let prev_skip = self.skip_extra_prereqs;
-        self.skip_extra_prereqs = true;
-        for prereq in &extra_prereqs {
-            match self.build_target(prereq) {
-                Ok(rebuilt) => {
-                    if rebuilt { any_prereq_rebuilt = true; }
-                }
-                Err(e) => {
-                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
-                    let propagated = if is_new {
-                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                        format!("{}, needed by '{}'.  Stop.", base, target)
-                    } else {
-                        e
-                    };
-                    if self.keep_going {
-                        if is_new { self.print_error_keep_going(&propagated); }
-                        prereq_errors.push(propagated);
-                    } else {
-                        self.skip_extra_prereqs = prev_skip;
-                        self.inherited_vars_stack.pop();
-                        return Err(propagated);
+
+        // Build a helper closure for building extra prereqs with skip=true.
+        // We do this inline since Rust closures can't borrow self mutably more than once.
+
+        // Step 0: build GLOBAL .EXTRA_PREREQS (before regular prereqs).
+        if !extra_prereqs_target_specific {
+            let prev_skip = self.skip_extra_prereqs;
+            self.skip_extra_prereqs = true;
+            for prereq in &extra_prereqs {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_prereq_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            if is_new { self.print_error_keep_going(&propagated); }
+                            prereq_errors.push(propagated);
+                        } else {
+                            self.skip_extra_prereqs = prev_skip;
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
                     }
                 }
             }
+            self.skip_extra_prereqs = prev_skip;
         }
-        self.skip_extra_prereqs = prev_skip;
 
         // Step 1: build non-SE normal prereqs
         for prereq in all_prereqs.clone() {
@@ -1151,6 +1182,37 @@ impl<'a> Executor<'a> {
         all_order_only.extend(se_expanded_order_only);
         all_prereqs.retain(|p| p != ".WAIT");
         all_order_only.retain(|p| p != ".WAIT");
+
+        // Step 5: build TARGET-SPECIFIC .EXTRA_PREREQS (after all regular prereqs).
+        if extra_prereqs_target_specific {
+            let prev_skip = self.skip_extra_prereqs;
+            self.skip_extra_prereqs = true;
+            for prereq in &extra_prereqs {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_prereq_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            if is_new { self.print_error_keep_going(&propagated); }
+                            prereq_errors.push(propagated);
+                        } else {
+                            self.skip_extra_prereqs = prev_skip;
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
+                    }
+                }
+            }
+            self.skip_extra_prereqs = prev_skip;
+        }
 
         self.inherited_vars_stack.pop();
 
@@ -1784,6 +1846,11 @@ impl<'a> Executor<'a> {
         let target_initially_missing = initial_target_mtime.is_none();
 
         let mut any_rebuilt = false;
+        // For collect_plans_mode: track virtual node keys for serializing rules.
+        // rule_idx counts ALL rules; virtual_idx counts rules that actually need rebuilding.
+        let mut rule_idx: usize = 0;
+        // Name of the last virtual node added (so subsequent rules can depend on it).
+        let mut last_virtual_key: Option<String> = None;
 
         for rule in rules {
             let rule = rule.clone();
@@ -1902,10 +1969,65 @@ impl<'a> Executor<'a> {
 
             self.target_extra_exports = self.compute_target_exports(target);
             self.target_extra_unexports = self.compute_target_unexports(target);
+
+            // In collect_plans_mode (parallel build graph resolution), multiple
+            // double-colon rules for the same target would overwrite each other's plan
+            // if we called execute_recipe naively (plans are keyed by target name).
+            //
+            // Strategy: create a synthetic virtual node per rule ("target::0", "target::1",
+            // etc.) and make the real "target" a zero-recipe completion marker that depends
+            // on the last virtual node. Each virtual node depends on its rule's prerequisites
+            // PLUS the previous virtual node (enforcing serial execution within the family).
+            // This allows rule 0 (no prereqs) to start immediately while rule 1 waits for
+            // both its prerequisites and rule 0 to finish — matching GNU Make semantics.
             if self.collect_plans_mode {
-                self.pending_plan_prereqs = prereqs.clone();
-                self.pending_plan_order_only = order_only.clone();
+                let virtual_key = format!("{}::{}", target, rule_idx);
+                rule_idx += 1;
+                let rule_source = rule.source_file.clone();
+                let expanded_lines: Vec<(usize, String)> = rule.recipe.iter().map(|(lineno, line)| {
+                    *self.state.current_file.borrow_mut() = rule_source.clone();
+                    *self.state.current_line.borrow_mut() = *lineno;
+                    let preprocessed = preprocess_recipe_bsnl(line);
+                    let expanded = self.state.expand_with_auto_vars(&preprocessed, &auto_vars);
+                    let sub_lines = split_recipe_sub_lines(&expanded);
+                    let rejoined = sub_lines.join("\n");
+                    (*lineno, rejoined)
+                }).collect();
+                let extra_exports = self.target_extra_exports.clone();
+                let extra_unexports: Vec<String> = self.target_extra_unexports.iter().cloned().collect();
+                // Build the virtual node's prerequisites: rule's own prereqs + previous virtual node.
+                let mut virtual_prereqs = prereqs.clone();
+                if let Some(ref prev) = last_virtual_key {
+                    if !virtual_prereqs.contains(prev) {
+                        virtual_prereqs.push(prev.clone());
+                    }
+                }
+                let virtual_plan = parallel::TargetPlan {
+                    target: virtual_key.clone(),
+                    prerequisites: virtual_prereqs,
+                    order_only: order_only.clone(),
+                    recipe: expanded_lines,
+                    source_file: rule.source_file.clone(),
+                    auto_vars: auto_vars.clone(),
+                    is_phony,
+                    needs_rebuild: true,
+                    grouped_primary: None,
+                    grouped_siblings: Vec::new(),
+                    extra_exports,
+                    extra_unexports,
+                    is_intermediate: self.db.is_intermediate(target),
+                };
+                if let Some(ref mut plans) = self.pending_plans {
+                    plans.insert(virtual_key.clone(), virtual_plan);
+                }
+                last_virtual_key = Some(virtual_key);
+                self.any_recipe_ran = true;
+                any_rebuilt = true;
+                self.target_extra_exports.clear();
+                self.target_extra_unexports.clear();
+                continue;
             }
+
             match self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony) {
                 Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
                 Err(e) => {
@@ -1920,6 +2042,53 @@ impl<'a> Executor<'a> {
             }
             self.target_extra_exports.clear();
             self.target_extra_unexports.clear();
+        }
+
+        // In collect_plans_mode, ensure this target has a plan entry in the plans map.
+        // Without one, the parallel scheduler won't know about this target and
+        // dependents will never be unblocked.
+        if self.collect_plans_mode {
+            if let Some(ref mut plans) = self.pending_plans {
+                if let Some(last_key) = last_virtual_key {
+                    // We created at least one virtual node. Create a completion-marker
+                    // plan for the real target name that depends on the last virtual node.
+                    // It has an empty recipe so the scheduler completes it instantly once
+                    // its only prerequisite (the last virtual node) is done.
+                    plans.insert(target.to_string(), parallel::TargetPlan {
+                        target: target.to_string(),
+                        prerequisites: vec![last_key],
+                        order_only: Vec::new(),
+                        recipe: Vec::new(),
+                        source_file: String::new(),
+                        auto_vars: HashMap::new(),
+                        is_phony,
+                        needs_rebuild: true,  // run through the scheduler (waits for prereqs)
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: HashMap::new(),
+                        extra_unexports: Vec::new(),
+                        is_intermediate: self.db.is_intermediate(target),
+                    });
+                } else if !plans.contains_key(target) {
+                    // No rules needed rebuilding. Record a no-op plan so the
+                    // scheduler can mark this target Done and unblock dependents.
+                    plans.insert(target.to_string(), parallel::TargetPlan {
+                        target: target.to_string(),
+                        prerequisites: Vec::new(),
+                        order_only: Vec::new(),
+                        recipe: Vec::new(),
+                        source_file: String::new(),
+                        auto_vars: HashMap::new(),
+                        is_phony,
+                        needs_rebuild: false,
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: HashMap::new(),
+                        extra_unexports: Vec::new(),
+                        is_intermediate: self.db.is_intermediate(target),
+                    });
+                }
+            }
         }
 
         Ok(any_rebuilt)
@@ -2027,38 +2196,44 @@ impl<'a> Executor<'a> {
 
         let mut any_rebuilt = false;
 
-        // Step 0: build .EXTRA_PREREQS first.
+        // Resolve .EXTRA_PREREQS.
+        // Global extra prereqs are built BEFORE regular prereqs.
+        // Target-specific extra prereqs are built AFTER regular prereqs.
         // Skip when this target is itself an extra prereq (prevents circular application).
-        let extra_prereqs = if self.skip_extra_prereqs {
-            Vec::new()
+        let (extra_prereqs, extra_prereqs_target_specific) = if self.skip_extra_prereqs {
+            (Vec::new(), false)
         } else {
             self.get_extra_prereqs(target)
         };
-        let prev_skip = self.skip_extra_prereqs;
-        self.skip_extra_prereqs = true;
-        for prereq in &extra_prereqs {
-            match self.build_target(prereq) {
-                Ok(rebuilt) => {
-                    if rebuilt { any_rebuilt = true; }
-                }
-                Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
-                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                        format!("{}, needed by '{}'.  Stop.", base, target)
-                    } else {
-                        e
-                    };
-                    if self.keep_going {
-                        // keep going: ignore error and continue
-                    } else {
-                        self.skip_extra_prereqs = prev_skip;
-                        self.inherited_vars_stack.pop();
-                        return Err(propagated);
+
+        // Step 0: build GLOBAL .EXTRA_PREREQS (before regular prereqs).
+        if !extra_prereqs_target_specific {
+            let prev_skip = self.skip_extra_prereqs;
+            self.skip_extra_prereqs = true;
+            for prereq in &extra_prereqs {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            // keep going: ignore error and continue
+                        } else {
+                            self.skip_extra_prereqs = prev_skip;
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
                     }
                 }
             }
+            self.skip_extra_prereqs = prev_skip;
         }
-        self.skip_extra_prereqs = prev_skip;
 
         for prereq in prereqs.clone() {
             match self.build_target(&prereq) {
@@ -2092,6 +2267,59 @@ impl<'a> Executor<'a> {
 
         for prereq in order_only.clone() {
             let _ = self.build_target(&prereq);
+        }
+
+        // For also-make siblings (multi-target pattern rules, e.g. `%.t1 %.t2: ...`):
+        // if a sibling target has explicit prerequisites from a separate rule in the
+        // database, those prerequisites must be built before the shared recipe runs.
+        // Example: `x.t2: dep` combined with `%.t1 %.t2:` — when building x.t1 via
+        // the pattern rule, `dep` must be built as a prereq of the also-make sibling x.t2.
+        for sib in &also_make_siblings {
+            if let Some(sib_rules) = self.db.rules.get(sib).cloned() {
+                for sib_rule in &sib_rules {
+                    for sib_prereq in &sib_rule.prerequisites {
+                        if sib_prereq == ".WAIT" { continue; }
+                        match self.build_target(sib_prereq) {
+                            Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+                            Err(e) => {
+                                if !e.starts_with("No rule to make target '") || e.contains(", needed by '") {
+                                    self.inherited_vars_stack.pop();
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step (after order-only): build TARGET-SPECIFIC .EXTRA_PREREQS (after regular prereqs).
+        if extra_prereqs_target_specific {
+            let prev_skip = self.skip_extra_prereqs;
+            self.skip_extra_prereqs = true;
+            for prereq in &extra_prereqs {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => {
+                        if rebuilt { any_rebuilt = true; }
+                    }
+                    Err(e) => {
+                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else {
+                            e
+                        };
+                        if self.keep_going {
+                            // keep going: ignore error and continue
+                        } else {
+                            self.skip_extra_prereqs = prev_skip;
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
+                    }
+                }
+            }
+            self.skip_extra_prereqs = prev_skip;
         }
 
         self.inherited_vars_stack.pop();
@@ -2497,6 +2725,81 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+        }
+
+        None
+    }
+
+    /// Search for a library named `name` (from a `-lname` prerequisite).
+    /// GNU Make searches for `libname.a` and `libname.so` in:
+    ///   1. Each directory in vpath patterns that match `libname.a` or `libname.so`
+    ///   2. The vpath_general directories
+    ///   3. The VPATH variable directories
+    ///   4. The current directory (last resort)
+    /// Prefers `.a` over `.so` (static linking preferred, matching GNU Make behavior).
+    /// Returns the path to the found library if found.
+    fn find_library(&self, name: &str) -> Option<String> {
+        let lib_a = format!("lib{}.a", name);
+        let lib_so = format!("lib{}.so", name);
+
+        // Collect all VPATH directories to search.
+        // We search for .a first, then .so in each directory.
+        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+        // From named vpath patterns that match .a files
+        for (pattern, dirs) in &self.db.vpath {
+            if vpath_pattern_matches(pattern, &lib_a) || vpath_pattern_matches(pattern, &lib_so)
+                || pattern == "%" || pattern == "*"
+            {
+                for dir in dirs {
+                    if !search_dirs.contains(dir) {
+                        search_dirs.push(dir.clone());
+                    }
+                }
+            }
+        }
+
+        // From vpath_general (directories from bare `vpath % dir` or `vpath * dir`)
+        for dir in &self.db.vpath_general {
+            if !search_dirs.contains(dir) {
+                search_dirs.push(dir.clone());
+            }
+        }
+
+        // From VPATH variable
+        if let Some(var) = self.db.variables.get("VPATH") {
+            let vpath_expanded = self.state.expand(&var.value);
+            for dir in vpath_expanded.split(':') {
+                let dir = dir.trim();
+                if !dir.is_empty() {
+                    let pb = std::path::PathBuf::from(dir);
+                    if !search_dirs.contains(&pb) {
+                        search_dirs.push(pb);
+                    }
+                }
+            }
+        }
+
+        // Search each directory: prefer .a over .so
+        for dir in &search_dirs {
+            let candidate_a = dir.join(&lib_a);
+            if candidate_a.exists() {
+                return Some(candidate_a.to_string_lossy().to_string());
+            }
+        }
+        for dir in &search_dirs {
+            let candidate_so = dir.join(&lib_so);
+            if candidate_so.exists() {
+                return Some(candidate_so.to_string_lossy().to_string());
+            }
+        }
+
+        // Check current directory
+        if Path::new(&lib_a).exists() {
+            return Some(lib_a);
+        }
+        if Path::new(&lib_so).exists() {
+            return Some(lib_so);
         }
 
         None
@@ -3016,30 +3319,34 @@ impl<'a> Executor<'a> {
     /// Resolve `.EXTRA_PREREQS` for a given target.
     /// Target-specific `.EXTRA_PREREQS` takes priority over the global value.
     /// The value is variable-expanded and wildcard-expanded.
-    /// Returns a deduplicated list of extra prerequisite names.
-    fn get_extra_prereqs(&self, target: &str) -> Vec<String> {
+    /// Returns `(prereqs, is_target_specific)` where `is_target_specific` is true
+    /// when the value comes from a target-specific variable (not the global default).
+    /// GNU Make builds target-specific extra prereqs AFTER regular prereqs, but
+    /// global extra prereqs BEFORE regular prereqs.
+    fn get_extra_prereqs(&self, target: &str) -> (Vec<String>, bool) {
         // Use collect_target_vars to get the fully-expanded target-specific vars
         // (which also handles inheritance, pattern-specific vars, etc.).
         let collected = self.collect_target_vars(target);
         // The value from collect_target_vars is already fully expanded.
-        let expanded = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
-            val.clone()
+        let (expanded, is_target_specific) = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
+            (val.clone(), true)
         } else {
             // Fall back to global .EXTRA_PREREQS.
             match self.db.variables.get(".EXTRA_PREREQS") {
                 Some(v) => {
-                    if v.flavor == VarFlavor::Simple {
+                    let val = if v.flavor == VarFlavor::Simple {
                         v.value.clone()
                     } else {
                         self.state.expand(&v.value)
-                    }
+                    };
+                    (val, false)
                 }
-                None => return Vec::new(),
+                None => return (Vec::new(), false),
             }
         };
 
         if expanded.trim().is_empty() {
-            return Vec::new();
+            return (Vec::new(), is_target_specific);
         }
 
         // Split into tokens and apply wildcard expansion.
@@ -3073,7 +3380,7 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        result
+        (result, is_target_specific)
     }
 
     fn make_auto_vars(&self, target: &str, prereqs: &[String], order_only: &[&str], stem: &str) -> HashMap<String, String> {
@@ -3082,45 +3389,38 @@ impl<'a> Executor<'a> {
         // $@ - target
         vars.insert("@".to_string(), target.to_string());
 
-        // $< - first prerequisite
-        let first_prereq = prereqs.first().cloned().unwrap_or_default();
-        // Check VPATH for first prereq
-        let first_prereq_resolved = if Path::new(&first_prereq).exists() {
-            first_prereq.clone()
-        } else if let Some(found) = self.find_in_vpath(&first_prereq) {
-            found
-        } else {
-            first_prereq.clone()
+        // Helper: resolve a prerequisite to its actual path, checking:
+        //   1. lib_search_results for -lname prerequisites
+        //   2. Direct existence
+        //   3. VPATH lookup
+        let resolve_prereq = |p: &str| -> String {
+            if let Some(resolved) = self.lib_search_results.get(p) {
+                return resolved.clone();
+            }
+            if Path::new(p).exists() {
+                p.to_string()
+            } else if let Some(found) = self.find_in_vpath(p) {
+                found
+            } else {
+                p.to_string()
+            }
         };
-        vars.insert("<".to_string(), first_prereq_resolved);
+
+        // $< - first prerequisite
+        let first_prereq = prereqs.first().map(|s| s.as_str()).unwrap_or_default();
+        vars.insert("<".to_string(), resolve_prereq(first_prereq));
 
         // $^ - all prerequisites (no duplicates)
         let mut seen = HashSet::new();
         let unique_prereqs: Vec<String> = prereqs.iter()
             .filter(|p| seen.insert(p.to_string()))
-            .map(|p| {
-                if Path::new(p).exists() {
-                    p.clone()
-                } else if let Some(found) = self.find_in_vpath(p) {
-                    found
-                } else {
-                    p.clone()
-                }
-            })
+            .map(|p| resolve_prereq(p))
             .collect();
         vars.insert("^".to_string(), unique_prereqs.join(" "));
 
         // $+ - all prerequisites (with duplicates)
         let all_prereqs: Vec<String> = prereqs.iter()
-            .map(|p| {
-                if Path::new(p).exists() {
-                    p.clone()
-                } else if let Some(found) = self.find_in_vpath(p) {
-                    found
-                } else {
-                    p.clone()
-                }
-            })
+            .map(|p| resolve_prereq(p))
             .collect();
         vars.insert("+".to_string(), all_prereqs.join(" "));
 
@@ -3132,7 +3432,8 @@ impl<'a> Executor<'a> {
         let target_time = get_mtime(target);
         let newer: Vec<String> = prereqs.iter()
             .filter(|p| {
-                let prereq_mtime = get_mtime(p).or_else(|| {
+                let resolved = resolve_prereq(p);
+                let prereq_mtime = get_mtime(&resolved).or_else(|| {
                     self.find_in_vpath(p).and_then(|found| get_mtime(&found))
                 });
                 match (target_time, prereq_mtime) {
@@ -3146,7 +3447,7 @@ impl<'a> Executor<'a> {
                     _ => false,
                 }
             })
-            .cloned()
+            .map(|p| resolve_prereq(p))
             .collect();
         vars.insert("?".to_string(), newer.join(" "));
 
