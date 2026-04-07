@@ -1513,10 +1513,19 @@ impl<'a> Executor<'a> {
                     .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                     .cloned()
                     .unwrap_or_else(|| "%".to_string());
-                let mut prereqs: Vec<String> = pat_rule.prerequisites.iter()
-                    .filter(|p| p.as_str() != ".WAIT")
-                    .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
-                    .collect();
+                // Collect prereqs with literals (no %) first, then pattern prereqs.
+                // GNU Make builds literal prereqs before pattern prereqs (sv 60435 test 22).
+                let mut prereqs: Vec<String> = {
+                    let mut lit: Vec<String> = Vec::new();
+                    let mut pat: Vec<String> = Vec::new();
+                    for p_str in pat_rule.prerequisites.iter() {
+                        if p_str.as_str() == ".WAIT" { continue; }
+                        let expanded = subst_stem_in_prereq_dir(p_str, &stem, &matched_pt);
+                        if p_str.contains('%') { pat.push(expanded); } else { lit.push(expanded); }
+                    }
+                    lit.extend(pat);
+                    lit
+                };
                 // For SE pattern rules, also compute the SE expansion now (using current
                 // all_prereqs for auto vars) so we can build those prereqs first.
                 if pat_rule.second_expansion_prereqs.is_some() || pat_rule.second_expansion_order_only.is_some() {
@@ -3449,21 +3458,26 @@ impl<'a> Executor<'a> {
             };
             is_target_intermediate = primary_is_intermediate_explicit || primary_is_intermediate_implicit;
 
-            // Handle also_make siblings FIRST (before adding primary to intermediate_built).
-            // This ensures siblings appear before the primary in intermediate_built so they
-            // are deleted first (GNU Make behavior).
-            // Step 1: mark all siblings as built/covered (order doesn't matter for these).
+            // Mark all siblings as built/covered (order doesn't matter for these).
             for sib in &also_make_siblings {
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), true);
             }
-            // Step 2: push siblings to intermediate_built in REVERSE declaration order.
-            // GNU Make builds the also_make chain and iterates it such that siblings are
-            // removed in reverse order relative to their declaration in the pattern rule.
-            // For rule `%.1 %.15 %.3:` with primary `a.3`, siblings are [a.1, a.15] in
-            // declaration order, so we push them reversed: a.15 then a.1, giving deletion
-            // order a.15, a.1 (i.e., `rm a.15 a.1`).
-            for sib in also_make_siblings.iter().rev() {
+            // Push PRIMARY to intermediate_built BEFORE siblings.
+            // Deletion iterates intermediate_built in REVERSE (.rev()), so to get
+            // GNU Make's deletion order (siblings before primary), we push primary
+            // first and siblings (forward declaration order) after.
+            // Example: `%.1 %.15:`, primary a.1, siblings [a.15].
+            //   Push a.1 → intermediate_built = [..., a.1]
+            //   Push a.15 → intermediate_built = [..., a.1, a.15]
+            //   Deletion .rev() → [a.15, a.1] → `rm a.15 a.1` ✓
+            if is_target_intermediate {
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
+                }
+            }
+            // Now push siblings to intermediate_built in FORWARD declaration order.
+            for sib in also_make_siblings.iter() {
                 // Track intermediate status for also_make siblings.
                 // A sibling is intermediate if:
                 //   1. It is explicitly marked .INTERMEDIATE, OR
@@ -3494,13 +3508,6 @@ impl<'a> Executor<'a> {
                             self.intermediate_built.push(sib.clone());
                         }
                     }
-                }
-            }
-            // Now add the primary target to intermediate_built (AFTER siblings so that
-            // the deletion order matches GNU Make: siblings are removed first).
-            if is_target_intermediate {
-                if !self.intermediate_built.contains(&target.to_string()) {
-                    self.intermediate_built.push(target.to_string());
                 }
             }
             // In collect_plans_mode, update the plan's is_intermediate flag now that we
