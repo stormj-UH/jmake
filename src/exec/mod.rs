@@ -3500,9 +3500,21 @@ impl<'a> Executor<'a> {
                     // pattern rule make the entire rule invocation "explicit").
                     let any_literal_prereq_explicit = literal_rule_prereqs.iter()
                         .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
+                    // Also: if any EXPANDED (stem-substituted) prereq is explicitly mentioned
+                    // AND is NOT an explicit rule TARGET (only in explicitly_mentioned, not in
+                    // db.rules), the invocation is also "explicit". This handles:
+                    //   `%.z %.q: %.x; ...` with `unrelated: hello.x`
+                    // → hello.x is explicitly mentioned (not a rule target) → hello.q not intermediate.
+                    // Note: we exclude targets in db.rules to avoid falsely protecting intermediates
+                    // when the prereq has its own explicit recipe (e.g. `foo.in: ; touch $@`).
+                    let any_expanded_prereq_explicit_no_rule = prereqs.iter()
+                        .any(|p| self.db.explicitly_mentioned.contains(p.as_str())
+                            && !self.db.rules.contains_key(p.as_str())
+                            && !self.db.is_intermediate(p));
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib)
-                        || any_literal_prereq_explicit;
+                        || any_literal_prereq_explicit
+                        || any_expanded_prereq_explicit_no_rule;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
