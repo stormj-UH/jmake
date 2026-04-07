@@ -698,7 +698,27 @@ impl MakeState {
         }
 
         for mf in &makefiles {
-            self.read_makefile(mf)?;
+            if let Err(e) = self.read_makefile(mf) {
+                let mf_str = mf.to_string_lossy();
+                let is_stdin = mf_str == "-" || mf_str == "/dev/stdin";
+                // For non-stdin -f files that can't be read (e.g. don't exist),
+                // GNU Make prints a warning without "***" and continues processing
+                // remaining makefiles. The missing file is then treated as a rebuild
+                // target; if no rule exists it will fail as "No rule to make target".
+                if !is_stdin && (e.contains("No such file or directory") || e.contains("Is a directory") || e.contains("Permission denied")) {
+                    let progname = crate::eval::make_progname();
+                    eprintln!("{}: {}", progname, e);
+                    // Defer: add to pending so try_update_makefiles can attempt a rebuild
+                    self.pending_includes.push(PendingInclude {
+                        file: mf_str.to_string(),
+                        parent: String::new(),
+                        lineno: 0,
+                        ignore_missing: false,
+                    });
+                } else {
+                    return Err(e);
+                }
+            }
         }
 
         // Set MAKEFILE_LIST
@@ -2862,6 +2882,39 @@ impl MakeState {
                 continue;
             }
 
+            // Determine if the makefile is out of date BEFORE trying to build prereqs.
+            // A prerequisite that doesn't exist means the rule cannot fire (skip).
+            // Only if all prereqs exist and at least one is newer do we proceed.
+            // This mirrors GNU Make's behavior: if the implicit rule's prereq doesn't
+            // exist, the rule is simply skipped (not an error).
+            let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+            let needs_rebuild = if target_mtime.is_none() {
+                // File doesn't exist → needs rebuild
+                true
+            } else {
+                let target_time = target_mtime.unwrap();
+                // Check if any prerequisite makes the target out of date.
+                // A prereq makes the target out of date ONLY if it exists AND is newer.
+                // If a prereq doesn't exist, the rule can't fire → skip (not outdated).
+                let any_prereq_newer = rule_info.prerequisites.iter().any(|prereq| {
+                    match std::fs::metadata(prereq) {
+                        Ok(m) => {
+                            // File exists: check if newer than target
+                            m.modified().ok().map_or(false, |pt| pt > target_time)
+                        }
+                        Err(_) => {
+                            // Prereq doesn't exist → rule cannot fire → not outdated
+                            false
+                        }
+                    }
+                });
+                any_prereq_newer
+            };
+
+            if !needs_rebuild {
+                continue;
+            }
+
             // Build prerequisites first (they may themselves be out of date,
             // which would make the makefile out of date after they're rebuilt).
             let prereqs = rule_info.prerequisites.clone();
@@ -2873,40 +2926,6 @@ impl MakeState {
 
             if let Err(e) = prereq_result {
                 return Err(e);
-            }
-
-            // Determine if the makefile is out of date (check AFTER building prereqs,
-            // since prereq building may have updated them making this target stale).
-            let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
-            let needs_rebuild = if target_mtime.is_none() {
-                // File doesn't exist → needs rebuild
-                true
-            } else {
-                let target_time = target_mtime.unwrap();
-                // Check if any prerequisite makes the target out of date.
-                // A prereq makes the target out of date if:
-                // 1. The prereq file doesn't exist (missing file → always out of date), OR
-                // 2. The prereq file exists and is newer than the target.
-                // Exception: if the prereq doesn't exist but HAS a rule (like `force:`),
-                // it's a phony/force target that always triggers a rebuild.
-                let any_prereq_outdated = rule_info.prerequisites.iter().any(|prereq| {
-                    match std::fs::metadata(prereq) {
-                        Ok(m) => {
-                            // File exists: check if newer than target
-                            m.modified().ok().map_or(false, |pt| pt > target_time)
-                        }
-                        Err(_) => {
-                            // File doesn't exist: always out of date
-                            // (whether or not there's a rule - if it doesn't exist, target is stale)
-                            true
-                        }
-                    }
-                });
-                any_prereq_outdated
-            };
-
-            if !needs_rebuild {
-                continue;
             }
 
             if rule_info.recipe.is_empty() {
