@@ -1659,7 +1659,12 @@ impl MakeState {
                 }
             }
             self.args.variables = new_vars;
-            let new_mf = self.build_makeflags_from_args(&self.args.variables.clone());
+            let mut new_mf = self.build_makeflags_from_args(&self.args.variables.clone());
+            // When MAKEOVERRIDES is explicitly set to empty, MAKEFLAGS keeps "-- "
+            // to indicate the variable section was present but cleared.
+            if overrides_val.is_empty() && !new_mf.contains("--") {
+                new_mf.push_str(" -- ");
+            }
             if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
                 var.value = new_mf.clone();
             }
