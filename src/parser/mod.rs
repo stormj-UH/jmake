@@ -1441,15 +1441,14 @@ pub fn split_words(s: &str) -> Vec<String> {
 /// converting escape sequences to their literal equivalents:
 ///   `\:` → `:`   `\#` → `#`   `\ ` → ` ` (within a word)
 ///
-/// Note: `\\` (two backslashes) is NOT collapsed — GNU Make preserves double
-/// backslashes in file names.  Only `\ ` (backslash-space) is processed as an
-/// escape sequence for whitespace.  `\%` is also kept verbatim here so that
-/// callers can distinguish a literal `%` in a file name from the `%` pattern
-/// wildcard; callers that need a canonical name should call
-/// `unescape_percent_in_target` afterwards.
+/// Note: `\\` (double backslash) is NOT collapsed to a single backslash — GNU
+/// Make keeps `\\` verbatim in file names. Only `\:` and `\#` have their
+/// backslash stripped. `\%` is also kept verbatim so that callers can treat it
+/// as a literal `%` escape in static pattern rules; callers that need a
+/// canonical file name should follow up with `unescape_percent_in_target`.
 ///
-/// This mirrors GNU Make's `PARSE_FILE_SEQ` behaviour for target and
-/// prerequisite lists.
+/// This mirrors GNU Make's `parse_file_seq` / `find_map_unquote` behaviour for
+/// target and prerequisite lists.
 pub fn split_filenames(s: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -1476,7 +1475,8 @@ pub fn split_filenames(s: &str) -> Vec<String> {
                 _ => {
                     // All other backslash sequences (including `\\` and `\%`):
                     // keep both characters verbatim.  GNU Make does NOT collapse
-                    // `\\` to `\` in file-name lists.
+                    // `\\` to `\` in file-name lists — only `\ ` (escaped space)
+                    // is processed.
                     current.push('\\');
                     current.push(next as char);
                     i += 2;

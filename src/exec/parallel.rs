@@ -470,14 +470,21 @@ impl ParallelScheduler {
         // Collect all targets that appear as "unguarded" prerequisites (first group or
         // plans with no wait_groups).  These targets can be dispatched before any barrier.
         let mut globally_unguarded: HashSet<String> = HashSet::new();
+        // Also collect targets that appear as DIRECT (no-wait-groups) prereqs in any plan.
+        // This set is used for transitive barrier propagation: we only skip transitive
+        // propagation if the target is truly accessible from a no-barrier parent.
+        let mut directly_unguarded: HashSet<String> = HashSet::new();
         for (_name, plan) in &plans {
             if plan.wait_groups.is_empty() {
                 for p in &plan.prerequisites {
                     globally_unguarded.insert(p.clone());
+                    directly_unguarded.insert(p.clone());
                 }
             } else if let Some(first_group) = plan.wait_groups.first() {
                 for p in first_group {
                     globally_unguarded.insert(p.clone());
+                    // Note: first-group prereqs are NOT added to directly_unguarded,
+                    // because they are only unguarded within their parent's wait-group context.
                 }
             }
         }
@@ -545,7 +552,9 @@ impl ParallelScheduler {
                                 after_plan.prerequisites.clone()
                             };
                             for first_prereq in &first_prereqs {
-                                if globally_unguarded.contains(first_prereq.as_str()) {
+                                // Only skip if the target is directly accessible from a
+                                // no-barrier parent (truly globally unguarded).
+                                if directly_unguarded.contains(first_prereq.as_str()) {
                                     continue;
                                 }
                                 if plans.contains_key(first_prereq.as_str()) {
