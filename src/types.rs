@@ -20,6 +20,11 @@ pub enum VarOrigin {
 pub enum VarFlavor {
     Recursive,
     Simple,
+    /// POSIX immediate assignment (:::=).
+    /// Like Simple, the value is immediately expanded at assignment time.
+    /// Unlike Simple, when `+=` is applied, the appended text is NOT immediately
+    /// expanded -- it is stored as raw text and evaluated lazily (recursively).
+    PosixSimple,
     Append,
     Conditional, // ?=
     Shell,       // !=

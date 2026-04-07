@@ -227,7 +227,7 @@ impl MakeState {
                     self.expand_with_auto_vars(&var.value, auto_vars)
                 }
             }
-            VarFlavor::Simple => var.value.clone(),
+            VarFlavor::Simple | VarFlavor::PosixSimple => var.value.clone(),
             _ => self.expand_with_auto_vars(&var.value, auto_vars),
         }
     }

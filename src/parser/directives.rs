@@ -277,7 +277,8 @@ pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
             let var_value = rest[pos + op.len()..].trim_start().to_string();
             let flavor = match *op {
                 "=" => VarFlavor::Recursive,
-                ":=" | "::=" | ":::=" => VarFlavor::Simple,
+                ":=" | "::=" => VarFlavor::Simple,
+                ":::=" => VarFlavor::PosixSimple,
                 "+=" => VarFlavor::Append,
                 "?=" => VarFlavor::Conditional,
                 "!=" => VarFlavor::Shell,
@@ -404,7 +405,8 @@ pub fn parse_define_start(line: &str) -> ParsedLine {
 fn op_to_flavor(op: &str) -> VarFlavor {
     match op {
         "=" => VarFlavor::Recursive,
-        ":=" | "::=" | ":::=" => VarFlavor::Simple,
+        ":=" | "::=" => VarFlavor::Simple,
+        ":::=" => VarFlavor::PosixSimple,
         "+=" => VarFlavor::Append,
         "?=" => VarFlavor::Conditional,
         "!=" => VarFlavor::Shell,

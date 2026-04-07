@@ -838,11 +838,11 @@ impl MakeState {
                     }
                     parser.in_define = false;
                     let raw_value = parser.define_lines.join("\n");
-                    // For simple (:= / ::=) assignments, expand value immediately.
+                    // For simple (:= / ::= / :::=) assignments, expand value immediately.
                     // For shell (!=), run the shell command and store result.
                     // For recursive/append/conditional, store value verbatim.
                     let value = match parser.define_flavor {
-                        VarFlavor::Simple => self.expand(&raw_value),
+                        VarFlavor::Simple | VarFlavor::PosixSimple => self.expand(&raw_value),
                         VarFlavor::Shell => {
                             let expanded_cmd = self.expand(&raw_value);
                             let (result, status) = self.shell_exec_with_env(&expanded_cmd);
@@ -851,9 +851,16 @@ impl MakeState {
                         }
                         _ => raw_value.clone(),
                     };
+                    // For PosixSimple (:::=), escape dollar signs in the expanded value
+                    // and store as Recursive so subsequent += appends raw (unexpanded) text.
+                    let (stored_value, stored_flavor) = if parser.define_flavor == VarFlavor::PosixSimple {
+                        (value.replace('$', "$$"), VarFlavor::Recursive)
+                    } else {
+                        (value.clone(), parser.define_flavor.clone())
+                    };
                     let var = Variable::new(
-                        value.clone(),
-                        parser.define_flavor.clone(),
+                        stored_value,
+                        stored_flavor,
                         VarOrigin::File,
                     );
                     if parser.define_override {
@@ -995,10 +1002,9 @@ impl MakeState {
                 } else if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
                     if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: raw_is_unexport, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
-                            VarFlavor::Simple => {
-                                // For :=, expand and set directly. Strip comments from the value
-                                // first (handles `#` after closing `)` as a comment, `\#` → `#`
-                                // at top level, while preserving `#` inside `$(...)` args).
+                            VarFlavor::Simple | VarFlavor::PosixSimple => {
+                                // For := / ::= (Simple) and :::= (PosixSimple), expand value
+                                // immediately. Strip comments from the value first.
                                 let comment_stripped = parser::strip_comment(trimmed);
                                 let stripped_parsed = parser::try_parse_variable_assignment(&comment_stripped);
                                 let (stripped_name, stripped_value) = if let Some(ParsedLine::VariableAssignment { name: sn, value: sv, .. }) = stripped_parsed {
@@ -1009,7 +1015,7 @@ impl MakeState {
                                 let expanded_name = self.expand(&stripped_name);
                                 let expanded_value = self.expand(&stripped_value);
                                 if raw_target.is_none() {
-                                    self.set_variable(&expanded_name, &expanded_value, &VarFlavor::Simple, raw_is_override, raw_is_export);
+                                    self.set_variable(&expanded_name, &expanded_value, &raw_flavor, raw_is_override, raw_is_export);
                                     // Handle unexport and private flags (not passed through set_variable).
                                     if raw_is_unexport {
                                         if let Some(var) = self.db.variables.get_mut(&expanded_name) {
@@ -2008,6 +2014,28 @@ impl MakeState {
                 // when the variable is later used.
                 self.db.variables.insert(name.to_string(),
                     make_var(result, VarFlavor::Recursive, origin));
+            }
+            VarFlavor::PosixSimple => {
+                // PosixSimple (:::=): the value is already immediately expanded at the
+                // call site (in the pre-expansion loop). We store the result with dollar
+                // signs escaped ($ → $$) so that subsequent += operations can append raw
+                // (unexpanded) text and the combined value can be expanded recursively at
+                // use time. The flavor is stored as Recursive to enable this lazy behavior.
+                let existing = self.db.variables.get(name);
+                if !is_override {
+                    if let Some(existing) = existing {
+                        if is_protected(&existing.origin) {
+                            return;
+                        }
+                    }
+                }
+                if makeflags_protected {
+                    return;
+                }
+                // Escape dollar signs in the already-expanded value
+                let escaped = value.replace('$', "$$");
+                self.db.variables.insert(name.to_string(),
+                    make_var(escaped, VarFlavor::Recursive, origin));
             }
             _ => {
                 let existing = self.db.variables.get(name);
@@ -3081,6 +3109,17 @@ fn try_expand_define_name(trimmed: &str, state: &MakeState) -> Option<String> {
     let after_name = &rest_after_define[var_name_end..]; // " = VALUE" or "= VALUE" etc.
 
     let expanded_name = state.expand(var_name_raw);
+
+    // If the original variable name token was non-empty (e.g. `$(VAR)`) but expanded to
+    // empty, reconstruct as `"define "` (without the operator) so that parse_line will
+    // correctly recognize this as a define directive with an empty name.  If we kept the
+    // operator (e.g. returning `"define  ="`) parse_line would trim the rest and see `"="`
+    // directly after `"define"`, mistakenly treating it as a variable assignment to a
+    // variable named `"define"`.  By omitting the operator, parse_define_start is called
+    // and the empty-name check in the eval handler fires with the correct error message.
+    if !var_name_raw.is_empty() && expanded_name.is_empty() {
+        return Some(format!("{}define ", prefix));
+    }
 
     // Reconstruct: "define EXPANDED_NAME<rest>" (plus prefix if any)
     Some(format!("{}define {}{}", prefix, expanded_name, after_name))

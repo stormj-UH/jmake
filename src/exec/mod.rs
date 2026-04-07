@@ -1771,7 +1771,7 @@ impl<'a> Executor<'a> {
                     staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Shell));
                     staging_idx.insert(psv.var_name.clone(), idx);
                 }
-                VarFlavor::Recursive => {
+                VarFlavor::Recursive | VarFlavor::PosixSimple => {
                     // Store raw value for second-pass expansion
                     let raw = psv.var.value.clone();
                     let idx = staging.len();
@@ -1915,7 +1915,7 @@ impl<'a> Executor<'a> {
                                 staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
-                        VarFlavor::Recursive => {
+                        VarFlavor::Recursive | VarFlavor::PosixSimple => {
                             let raw = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
                                 staging[i] = (var_name.to_string(), raw, false, is_override, VarFlavor::Recursive);

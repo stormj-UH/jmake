@@ -547,7 +547,8 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
             let value = work[pos + op.len()..].trim_start().to_string();
             let flavor = match *op {
                 "=" => VarFlavor::Recursive,
-                ":=" | "::=" | ":::=" => VarFlavor::Simple,
+                ":=" | "::=" => VarFlavor::Simple,
+                ":::=" => VarFlavor::PosixSimple,
                 "+=" => VarFlavor::Append,
                 "?=" => VarFlavor::Conditional,
                 "!=" => VarFlavor::Shell,

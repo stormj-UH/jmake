@@ -479,7 +479,17 @@ pub fn fn_shell_exec_with_status_env(
                     eprintln!("{}: {}", progname, msg);
                 }
             }
-            let exit_code = out.status.code().unwrap_or(-1);
+            let exit_code = out.status.code().unwrap_or_else(|| {
+                // Process was terminated by a signal; return 128 + signal number
+                // to match the conventional shell behavior.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    out.status.signal().map(|s| 128 + s).unwrap_or(-1)
+                }
+                #[cfg(not(unix))]
+                { -1 }
+            });
             let raw = String::from_utf8_lossy(&out.stdout).to_string();
             let result = process_shell_output(&raw);
             (result, exit_code)
