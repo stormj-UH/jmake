@@ -298,6 +298,11 @@ impl<'a> Executor<'a> {
 
         scheduler.find_initial_ready(targets);
 
+        // DEBUG: show initial state
+        eprintln!("[DEBUG] plans count: {}, ready_queue: {:?}",
+            self.parallel_plans.as_ref().map(|p| p.len()).unwrap_or(0),
+            scheduler.ready_queue);
+
         // ------------------------------------------------------------------
         // Phase 3: Scheduler main loop
         // ------------------------------------------------------------------
@@ -308,6 +313,7 @@ impl<'a> Executor<'a> {
                     Some(t) => t,
                     None => break,
                 };
+                eprintln!("[DEBUG] dispatching target: {}", target);
 
                 let job = self.build_job_from_plan(
                     &target,
@@ -1172,6 +1178,32 @@ impl<'a> Executor<'a> {
             self.needs_rebuild(target, &all_prereqs_for_rebuild, any_prereq_rebuilt)
         };
 
+        // In plan collection mode, record a plan for this target regardless of needs_rebuild.
+        // This ensures ALL targets (including those with no recipe or no rebuild) are in
+        // the dependency graph so the parallel scheduler can track completion ordering.
+        if self.collect_plans_mode {
+            let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
+            let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
+            let plan = parallel::TargetPlan {
+                target: target.to_string(),
+                prerequisites: all_prereqs.clone(),
+                order_only: all_order_only.clone(),
+                recipe: Vec::new(), // recipe stored by execute_recipe; empty if not needed
+                source_file: recipe_source_file.clone(),
+                auto_vars: auto_vars_for_plan,
+                is_phony,
+                needs_rebuild,
+                grouped_primary: None,
+                grouped_siblings: Vec::new(),
+                extra_exports: self.compute_target_exports(target),
+                extra_unexports: self.compute_target_unexports(target).into_iter().collect(),
+                is_intermediate: self.db.is_intermediate(target),
+            };
+            if let Some(ref mut plans) = self.pending_plans {
+                plans.insert(target.to_string(), plan);
+            }
+        }
+
         if !needs_rebuild {
             return Ok(false);
         }
@@ -1198,7 +1230,9 @@ impl<'a> Executor<'a> {
 
         self.target_extra_exports = self.compute_target_exports(target);
         self.target_extra_unexports = self.compute_target_unexports(target);
-        // In plan collection mode, record the prerequisites so execute_recipe can store them.
+        // In plan collection mode, set prereqs so execute_recipe can update the plan
+        // with the expanded recipe (the plan was already recorded above, but execute_recipe
+        // will update it with the actual recipe lines).
         if self.collect_plans_mode {
             self.pending_plan_prereqs = all_prereqs.clone();
             self.pending_plan_order_only = all_order_only.clone();
@@ -3011,28 +3045,39 @@ impl<'a> Executor<'a> {
                 (*lineno, rejoined)
             }).collect();
 
-            // Capture prereqs (set by the caller via pending_plan_prereqs).
-            let prerequisites = std::mem::take(&mut self.pending_plan_prereqs);
-            let order_only = std::mem::take(&mut self.pending_plan_order_only);
+            // Clear the pending prereqs (they were used by build_with_rules to pre-record
+            // the plan; here we update the plan's recipe field).
+            let _ = std::mem::take(&mut self.pending_plan_prereqs);
+            let _ = std::mem::take(&mut self.pending_plan_order_only);
 
-            let plan = parallel::TargetPlan {
-                target: target.to_string(),
-                prerequisites,
-                order_only,
-                recipe: expanded_recipe,
-                source_file: source_file.to_string(),
-                auto_vars: auto_vars.clone(),
-                is_phony: self.db.is_phony(target),
-                needs_rebuild: true, // was determined to need rebuild (we're here)
-                grouped_primary: None,
-                grouped_siblings: Vec::new(),
-                extra_exports: self.target_extra_exports.clone(),
-                extra_unexports: self.target_extra_unexports.iter().cloned().collect(),
-                is_intermediate: self.db.is_intermediate(target),
-            };
-
+            // Update the existing plan (created in build_with_rules) with the expanded recipe.
+            // If no plan exists yet (e.g., called from .DEFAULT or pattern rules), create one.
             if let Some(ref mut plans) = self.pending_plans {
-                plans.insert(target.to_string(), plan);
+                if let Some(plan) = plans.get_mut(target) {
+                    plan.recipe = expanded_recipe;
+                    plan.needs_rebuild = true;
+                    plan.auto_vars = auto_vars.clone();
+                    plan.extra_exports = self.target_extra_exports.clone();
+                    plan.extra_unexports = self.target_extra_unexports.iter().cloned().collect();
+                } else {
+                    // Plan not pre-created (e.g. pattern rule or .DEFAULT); create it now.
+                    let plan = parallel::TargetPlan {
+                        target: target.to_string(),
+                        prerequisites: std::mem::take(&mut self.pending_plan_prereqs),
+                        order_only: std::mem::take(&mut self.pending_plan_order_only),
+                        recipe: expanded_recipe,
+                        source_file: source_file.to_string(),
+                        auto_vars: auto_vars.clone(),
+                        is_phony: self.db.is_phony(target),
+                        needs_rebuild: true,
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: self.target_extra_exports.clone(),
+                        extra_unexports: self.target_extra_unexports.iter().cloned().collect(),
+                        is_intermediate: self.db.is_intermediate(target),
+                    };
+                    plans.insert(target.to_string(), plan);
+                }
             }
 
             // Mark as ran so the build graph continues correctly.
