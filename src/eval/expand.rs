@@ -405,8 +405,22 @@ impl MakeState {
                             false
                         });
                         if looks_like_rule {
-                            let progname = crate::eval::make_progname();
-                            eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
+                            // Use the outermost caller context when available (matches GNU Make behavior:
+                            // reports the file:line where the recipe's $(eval ...) appears).
+                            let (file_str, line_num) = {
+                                let stack = self.expansion_caller_stack.borrow();
+                                if let Some((f, l)) = stack.first() {
+                                    (f.clone(), *l)
+                                } else {
+                                    (self.current_file.borrow().clone(), *self.current_line.borrow())
+                                }
+                            };
+                            if file_str.is_empty() {
+                                let progname = crate::eval::make_progname();
+                                eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
+                            } else {
+                                eprintln!("{}:{}: *** prerequisites cannot be defined in recipes.  Stop.", file_str, line_num);
+                            }
                             std::process::exit(2);
                         }
                     }

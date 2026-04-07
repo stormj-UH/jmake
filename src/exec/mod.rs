@@ -2847,9 +2847,27 @@ impl<'a> Executor<'a> {
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib);
                     if !is_explicit {
-                        if !self.intermediate_built.contains(sib) {
-                            self.intermediate_built.push(sib.clone());
-                        }
+                        // Only mark as intermediate if the sibling was NOT already present
+                        // on disk before this recipe ran. GNU Make only deletes intermediates
+                        // that were created during this build — pre-existing files are left alone.
+                        // Check by looking at whether it was already in built-before-this-run
+                        // state: if it existed before and is now still there, skip marking it.
+                        // Heuristic: if the file currently exists AND is NOT the primary target
+                        // being built (meaning it was pre-existing), skip intermediate marking.
+                        // For the non-primary sibling case: if the file exists after the recipe,
+                        // we can't easily tell if it was pre-existing. Use the 'prereq_existed'
+                        // hint: a sibling that existed before the recipe ran should not be
+                        // treated as intermediate.
+                        // Simple heuristic: if the sib file exists but was not in our
+                        // intermediate_built list before, skip it (it was probably pre-existing).
+                        // Actually the cleanest fix: DON'T auto-mark non-grouped pattern rule
+                        // siblings as intermediate. Only truly grouped (&:) rules should have
+                        // automatic sibling cleanup. For regular multi-target pattern rules,
+                        // siblings are only intermediate if explicitly marked .INTERMEDIATE.
+                        // GNU Make behavior: for `%.z %.q: %.x`, the peer `%.q` is NOT automatically
+                        // intermediate — only targets built as side-effects of grouped (&:) rules are.
+                        // Skip adding here; rely on explicit .INTERMEDIATE only.
+                        let _ = (); // No-op: don't auto-mark pattern rule siblings as intermediate
                     }
                 }
             }

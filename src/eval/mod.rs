@@ -1214,7 +1214,9 @@ impl MakeState {
             } else {
                 // Check if this is a variable assignment by parsing the raw line.
                 // If so, handle value expansion based on flavor.
-                let trimmed = line.trim();
+                // Use trim_start() (not trim()) so that trailing whitespace in values
+                // like `$(eval res:=word )` is preserved (GNU Make behavior).
+                let trimmed = line.trim_start();
 
                 // Comment lines (starting with #) are handled by parse_line; don't
                 // run try_parse_variable_assignment on them as it may falsely detect
