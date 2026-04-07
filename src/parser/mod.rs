@@ -830,6 +830,7 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
     // If there was an inline recipe after the `;`, add it as the first recipe line.
     // Line number will be stamped by the caller (process_parsed_lines) which has the lineno.
     if let Some(recipe_line) = inline_recipe {
+        rule.has_inline_recipe_marker = true;
         rule.recipe.push((0, recipe_line));
     }
 
