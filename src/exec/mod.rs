@@ -2043,16 +2043,16 @@ impl<'a> Executor<'a> {
         // With --trace, print "file:line: update target 'X' due to: reason" before executing.
         if self.trace && !recipe.is_empty() {
             let (lineno, _) = &recipe[0];
+            // make_location already appends ": ", so use it directly without adding another ":"
             let loc = make_location(source_file, *lineno);
-            // We don't have the reason computed here; callers pass it via
-            // execute_recipe_with_trace. This path is the legacy call site.
-            // For backward compat, compute a basic reason: if target doesn't exist, say so.
-            let reason = if !Path::new(target).exists() {
-                "target does not exist".to_string()
+            let reason = if self.db.is_phony(target) {
+                "target is .PHONY"
+            } else if !Path::new(target).exists() {
+                "target does not exist"
             } else {
-                "target is out of date".to_string()
+                "target is out of date"
             };
-            eprintln!("{}: update target '{}' due to: {}", loc, target, reason);
+            eprintln!("{}update target '{}' due to: {}", loc, target, reason);
         }
         if self.touch {
             // Just touch the target
@@ -2181,7 +2181,9 @@ impl<'a> Executor<'a> {
                 // all sub-lines.  This handles `@$(MULTI)` where MULTI has multiple lines.
                 let force = force_sub || outer_force;
 
-                let effective_silent = line_silent || outer_silent || self.silent || is_silent_target;
+                // With --trace, the @ prefix does NOT suppress echoing (trace overrides @).
+                let at_silent = if self.trace { false } else { line_silent || outer_silent };
+                let effective_silent = at_silent || self.silent || is_silent_target;
                 let effective_ignore = ignore_error || outer_ignore || self.ignore_errors;
 
                 // Get the actual command (strip @, -, + prefixes - none of them go to the shell)

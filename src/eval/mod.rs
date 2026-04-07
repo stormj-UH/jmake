@@ -69,6 +69,8 @@ pub struct MakeState {
     /// attempted (ran or was considered ran via grouped pattern rules).
     /// Used to avoid running the same recipe twice for grouped pattern rules.
     pub include_recipe_ran: HashSet<String>,
+    /// True once "Entering directory" has been printed, to avoid printing it twice.
+    pub entering_directory_printed: bool,
 }
 
 /// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
@@ -110,6 +112,7 @@ impl MakeState {
             in_second_expansion: RefCell::new(false),
             pending_includes: Vec::new(),
             include_recipe_ran: HashSet::new(),
+            entering_directory_printed: false,
         };
 
         // Change directory if requested
@@ -123,6 +126,7 @@ impl MakeState {
             if should_print_directory(&state.args) {
                 let cwd = env::current_dir().unwrap_or_default();
                 eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+                state.entering_directory_printed = true;
             }
         }
 
@@ -146,10 +150,11 @@ impl MakeState {
         // Must be BEFORE read_makefiles so $(info ...) at parse time appears after the header.
         let progname = make_progname();
         let print_dir = should_print_directory(&self.args);
-        if print_dir && self.args.directory.is_none() {
+        if print_dir && !self.entering_directory_printed {
             // Already printed at startup for -C; print here for -w without -C
             let cwd = env::current_dir().unwrap_or_default();
             eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+            self.entering_directory_printed = true;
         }
 
         // Process any --eval (-E) strings BEFORE reading makefiles.
@@ -1577,6 +1582,9 @@ impl MakeState {
             None => return,
         };
 
+        // Save current print_directory state to detect transition.
+        let was_printing_dir = should_print_directory(&self.args);
+
         // Start from the original command-line args as a baseline.
         // This preserves cmdline flags (e.g. -i from `-i` on cmdline) even when
         // the makefile does a direct assignment like `MAKEFLAGS = B`.
@@ -1585,6 +1593,39 @@ impl MakeState {
         // Layer the MAKEFLAGS variable value on top of the cmdline baseline.
         // parse_makeflags ORs flags into the args (boolean flags get set, lists get appended).
         crate::cli::parse_makeflags(&makeflags, &mut self.args);
+
+        // Restore toggle-pair flags that were explicitly set by env or command line.
+        // Priority: cmdline/env > makefile.  If the original cmdline_args had an explicit
+        // setting for a toggle pair, the makefile MAKEFLAGS value must not override it.
+        let ca = &self.cmdline_args;
+        if ca.print_directory_explicit || ca.no_print_directory_explicit {
+            self.args.print_directory = ca.print_directory;
+            self.args.no_print_directory = ca.no_print_directory;
+            self.args.print_directory_explicit = ca.print_directory_explicit;
+            self.args.no_print_directory_explicit = ca.no_print_directory_explicit;
+        }
+        if ca.silent_explicit || ca.no_silent_explicit {
+            self.args.silent = ca.silent;
+            self.args.no_silent = ca.no_silent;
+            self.args.silent_explicit = ca.silent_explicit;
+            self.args.no_silent_explicit = ca.no_silent_explicit;
+        }
+        if ca.keep_going_explicit || ca.no_keep_going_explicit {
+            self.args.keep_going = ca.keep_going;
+            self.args.keep_going_explicit = ca.keep_going_explicit;
+            self.args.no_keep_going_explicit = ca.no_keep_going_explicit;
+        }
+
+        // If print_directory was just enabled by the makefile (transition false→true),
+        // print the "Entering directory" message now so it appears before subsequent
+        // $(info) or recipe output in the makefile.
+        let now_printing_dir = should_print_directory(&self.args);
+        if now_printing_dir && !was_printing_dir && !self.entering_directory_printed {
+            let progname = make_progname();
+            let cwd = env::current_dir().unwrap_or_default();
+            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+            self.entering_directory_printed = true;
+        }
 
         // Deduplicate include_dirs (cmdline dirs might now appear twice if also in MAKEFLAGS).
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();

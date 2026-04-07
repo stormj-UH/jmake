@@ -96,6 +96,12 @@ impl Default for MakeArgs {
             no_silent: false,
             clear_include_dirs: false,
             cmdline_vars_start: 0,
+            print_directory_explicit: false,
+            no_print_directory_explicit: false,
+            silent_explicit: false,
+            no_silent_explicit: false,
+            keep_going_explicit: false,
+            no_keep_going_explicit: false,
         }
     }
 }
@@ -172,15 +178,15 @@ pub fn parse_args() -> MakeArgs {
                         result.jobs = args[i].parse().unwrap_or(1);
                     }
                 }
-                "--keep-going" => result.keep_going = true,
+                "--keep-going" => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
                 "--no-builtin-rules" => result.no_builtin_rules = true,
                 "--no-builtin-variables" => result.no_builtin_variables = true,
-                "--no-print-directory" => { result.no_print_directory = true; result.print_directory = false; }
-                "--print-directory" => { result.print_directory = true; result.no_print_directory = false; }
+                "--no-print-directory" => { result.no_print_directory = true; result.print_directory = false; result.no_print_directory_explicit = true; result.print_directory_explicit = false; }
+                "--print-directory" => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; result.no_print_directory_explicit = false; }
                 "--print-data-base" => result.print_data_base = true,
                 "--question" => result.question = true,
-                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; }
-                "--no-silent" => { result.silent = false; result.no_silent = true; }
+                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
+                "--no-silent" => { result.silent = false; result.no_silent = true; result.no_silent_explicit = true; result.silent_explicit = false; }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -351,7 +357,7 @@ pub fn parse_args() -> MakeArgs {
                             }
                         }
                     }
-                    'k' => result.keep_going = true,
+                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
                     'L' => {
                         // -L = --check-symlink-times (no argument)
                         result.check_symlink_times = true;
@@ -403,11 +409,11 @@ pub fn parse_args() -> MakeArgs {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; }
-                    'S' => result.keep_going = false, // --no-keep-going
+                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
+                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; } // --no-keep-going
                     't' => result.touch = true,
                     'v' => result.version = true,
-                    'w' => { result.print_directory = true; result.no_print_directory = false; }
+                    'w' => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; result.no_print_directory_explicit = false; }
                     'W' => {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
@@ -492,8 +498,8 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                 "--always-make" => result.always_make = true,
                 "--environment-overrides" => result.environment_overrides = true,
                 "--ignore-errors" => result.ignore_errors = true,
-                "--keep-going" => result.keep_going = true,
-                "--no-keep-going" | "--stop" => result.keep_going = false,
+                "--keep-going" => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
+                "--no-keep-going" | "--stop" => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
                 "--dry-run" | "--just-print" | "--recon" => {
                     result.dry_run = true;
                     result.just_print = true;
@@ -503,13 +509,17 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                 "--no-print-directory" => {
                     result.no_print_directory = true;
                     result.print_directory = false;
+                    result.no_print_directory_explicit = true;
+                    result.print_directory_explicit = false;
                 }
                 "--print-directory" => {
                     result.print_directory = true;
                     result.no_print_directory = false;
+                    result.print_directory_explicit = true;
+                    result.no_print_directory_explicit = false;
                 }
-                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; }
-                "--no-silent" => { result.silent = false; result.no_silent = true; }
+                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
+                "--no-silent" => { result.silent = false; result.no_silent = true; result.no_silent_explicit = true; result.silent_explicit = false; }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -561,7 +571,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         j = chars.len();
                         continue;
                     }
-                    'k' => result.keep_going = true,
+                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
                     'L' => {
                         // -L = --check-symlink-times (no argument)
                         result.check_symlink_times = true;
@@ -595,12 +605,14 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; }
-                    'S' => result.keep_going = false,
+                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
+                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
                     't' => result.touch = true,
                     'w' => {
                         result.print_directory = true;
                         result.no_print_directory = false;
+                        result.print_directory_explicit = true;
+                        result.no_print_directory_explicit = false;
                     }
                     'd' => {
                         result.debug_short = true;
@@ -634,7 +646,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'B' => result.always_make = true,
                     'e' => result.environment_overrides = true,
                     'i' => result.ignore_errors = true,
-                    'k' => result.keep_going = true,
+                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
                     'n' => {
                         result.dry_run = true;
                         result.just_print = true;
@@ -642,12 +654,14 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; }
-                    'S' => result.keep_going = false,
+                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
+                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
                     't' => result.touch = true,
                     'w' => {
                         result.print_directory = true;
                         result.no_print_directory = false;
+                        result.print_directory_explicit = true;
+                        result.no_print_directory_explicit = false;
                     }
                     'L' => result.check_symlink_times = true,
                     'd' => {
