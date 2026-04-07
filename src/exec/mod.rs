@@ -633,7 +633,9 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        let to_delete: Vec<String> = self.intermediate_built.iter()
+        // Collect in reverse build order: intermediates closer to the top-level target
+        // (built last) should appear first in the rm command, matching GNU Make's output.
+        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -644,12 +646,19 @@ impl<'a> Executor<'a> {
             .cloned()
             .collect();
         // Collect files that actually exist and need to be deleted.
-        // GNU Make deletes intermediates in prerequisite/build order (first encountered first).
+        // Exclude files that also exist in VPATH: these were "promoted" from VPATH to a
+        // local copy (VPATH+ rename behavior) and should not be deleted.
         let existing: Vec<String> = to_delete.iter()
-            .filter(|t| Path::new(t.as_str()).exists())
+            .filter(|t| {
+                if !Path::new(t.as_str()).exists() { return false; }
+                // Skip deletion if this target also exists under a VPATH directory:
+                // the local copy is the updated authoritative version.
+                if self.find_in_vpath(t).is_some() { return false; }
+                true
+            })
             .cloned()
             .collect();
-        // GNU Make prints ONE rm command with all files, in prerequisite order.
+        // GNU Make prints ONE rm command with all files.
         if !existing.is_empty() && !self.silent {
             println!("rm {}", existing.join(" "));
         }
@@ -2764,7 +2773,10 @@ impl<'a> Executor<'a> {
                         // Intermediate file: use effective mtime of its sources.
                         return match self.effective_mtime(p, 0) {
                             Some(pt) => pt > target_time,
-                            None => false, // no sources found: skip (nothing to build)
+                            // No sources found: rebuild only if the intermediate has a
+                            // buildable recipe (distinguishes empty-recipe sv 60188 files
+                            // from normal intermediates like `foo.a: ; touch $@`).
+                            None => self.intermediate_has_buildable_recipe(p),
                         };
                     }
                     // File exists: compare actual mtime (or effective mtime if file exists
@@ -2947,39 +2959,61 @@ impl<'a> Executor<'a> {
             if let Some(ref text) = rule.second_expansion_prereqs.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                // Mark SE prereqs as explicitly mentioned on a per-word basis:
-                // words without '%' are not stem-derived and produce explicitly-mentioned files.
+                // Mark SE prereqs as explicitly mentioned on a per-word basis.
+                // Words without '%' produce explicitly-mentioned (non-intermediate) files.
                 // Words with '%' produce stem-derived (intermediate) files.
-                // If ALL words have '%', nothing is explicitly mentioned.
-                // If ANY word lacks '%', expand just those words to find explicitly-mentioned prereqs.
-                if se_text_has_non_pattern_word(text) {
-                    // Expand only the non-pattern words to get explicitly-mentioned prereqs.
-                    let non_pat_text = se_non_pattern_words(text).join(" ");
-                    if !non_pat_text.is_empty() {
-                        let non_pat_subst = subst_stem_in_se_text_dir(&non_pat_text, stem, matched_pattern_target);
-                        let (np_normal, _np_oo) = self.second_expand_prereqs(&non_pat_subst, &base_auto_vars, target);
-                        for p in &np_normal {
+                //
+                // Three cases:
+                // 1. Text has only '%'-words (all stem-derived): nothing explicitly mentioned.
+                // 2. Text has BOTH '%'-words and non-'%'-words (mixed): re-expand only the
+                //    non-pattern words to find which prereqs are explicitly mentioned.
+                //    (Non-pattern words are simple variable refs, safe to expand again.)
+                // 3. Text has only non-'%'-words: all prereqs are explicitly mentioned;
+                //    mark them directly from `normal` (no re-expansion to avoid $(info ...)
+                //    running twice when the text has side-effectful functions).
+                if se_text_has_percent(text) && se_text_has_non_pattern_word(text) {
+                    // Case 3 (mixed): expand only '%'-words with stem sub to find stem-derived set.
+                    // Anything in `normal` NOT in that set is explicitly mentioned.
+                    // This avoids re-running side-effect functions like $(info ...) in non-'%' words.
+                    let pat_words = se_pattern_words(text);
+                    let stem_derived: std::collections::HashSet<String> = if pat_words.is_empty() {
+                        std::collections::HashSet::new()
+                    } else {
+                        let pat_text = pat_words.join(" ");
+                        let pat_subst = subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
+                        let (pd_normal, _) = self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
+                        pd_normal.into_iter().collect()
+                    };
+                    for p in &normal {
+                        if !stem_derived.contains(p) {
                             self.se_explicitly_mentioned.insert(p.clone());
                         }
                     }
                 } else if !se_text_has_percent(text) {
-                    // No '%' at all: every prereq is explicitly mentioned.
+                    // Case 2: no '%' at all — every prereq is explicitly mentioned.
                     for p in &normal {
                         self.se_explicitly_mentioned.insert(p.clone());
                     }
                 }
+                // Case 1: all '%'-words — nothing is explicitly mentioned.
                 se_added_prereqs.extend(normal);
                 se_added_oo.extend(oo);
             }
             if let Some(ref text) = rule.second_expansion_order_only.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                if se_text_has_non_pattern_word(text) {
-                    let non_pat_text = se_non_pattern_words(text).join(" ");
-                    if !non_pat_text.is_empty() {
-                        let non_pat_subst = subst_stem_in_se_text_dir(&non_pat_text, stem, matched_pattern_target);
-                        let (np_normal, _np_oo) = self.second_expand_prereqs(&non_pat_subst, &base_auto_vars, target);
-                        for p in &np_normal {
+                if se_text_has_percent(text) && se_text_has_non_pattern_word(text) {
+                    let pat_words = se_pattern_words(text);
+                    let stem_derived: std::collections::HashSet<String> = if pat_words.is_empty() {
+                        std::collections::HashSet::new()
+                    } else {
+                        let pat_text = pat_words.join(" ");
+                        let pat_subst = subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
+                        let (pd_normal, _) = self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
+                        pd_normal.into_iter().collect()
+                    };
+                    for p in &normal {
+                        if !stem_derived.contains(p) {
                             self.se_explicitly_mentioned.insert(p.clone());
                         }
                     }
@@ -4115,6 +4149,26 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Check if an intermediate file has a buildable (non-empty) recipe.
+    /// Used to distinguish between:
+    ///   - `%.x: ;`  (empty recipe) — don't rebuild, sv 60188 behavior
+    ///   - `foo.a: ; touch $@` (non-empty recipe) — rebuild needed
+    fn intermediate_has_buildable_recipe(&self, target: &str) -> bool {
+        // Check explicit rules first
+        if let Some(rules) = self.db.rules.get(target) {
+            if rules.iter().any(|r| !r.recipe.is_empty()) {
+                return true;
+            }
+        }
+        // Check pattern rules
+        if let Some((rule, _)) = self.find_pattern_rule(target) {
+            if !rule.recipe.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Compute the "effective mtime" of a target for the purpose of checking if a parent needs rebuild.
     /// For a target that doesn't exist but is intermediate/deletable, this computes the maximum
     /// mtime of the target's sources, representing "when would this have been built".
@@ -4405,8 +4459,8 @@ impl<'a> Executor<'a> {
         // Helper: resolve a prerequisite to its actual path, checking:
         //   1. lib_search_results for -lname prerequisites
         //   2. Direct existence
-        //   3. Whether the prereq was built this run (in which case use its local name,
-        //      not the VPATH copy — the build may have created it locally or attempted to)
+        //   3. Whether the prereq's recipe actually ran this run (in which case use its
+        //      local name, not any VPATH copy — the recipe targeted the local file)
         //   4. VPATH lookup
         let resolve_prereq = |p: &str| -> String {
             if let Some(resolved) = self.lib_search_results.get(p) {
@@ -4415,9 +4469,9 @@ impl<'a> Executor<'a> {
             if Path::new(p).exists() {
                 return p.to_string();
             }
-            // If the prereq was visited/built this run, use its original name rather than
-            // resolving to a VPATH copy (the build targeted the local name).
-            if self.built.contains_key(p) {
+            // If the prereq's recipe actually ran this run (built == true), use its local
+            // name even if the file doesn't exist (recipe ran but didn't create the file).
+            if self.built.get(p) == Some(&true) {
                 return p.to_string();
             }
             if let Some(found) = self.find_in_vpath(p) {
@@ -5579,6 +5633,66 @@ fn se_non_pattern_words(text: &str) -> Vec<String> {
     }
     if in_word {
         flush_word(word_start, n, word_has_percent, &mut result);
+    }
+    result
+}
+
+/// Collects all top-level words from the SE text that contain `%`.
+/// These are words that ARE stem-derived.  Complement of `se_non_pattern_words`.
+///
+/// Used in the mixed-word case to compute the stem-derived prereq set without
+/// re-running side-effect functions ($(info ...) etc.) in non-`%` words.
+fn se_pattern_words(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut word_start = 0;
+    let mut in_word = false;
+    let mut word_has_percent = false;
+
+    while i < n {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' => {
+                if in_word && word_has_percent {
+                    result.push(text[word_start..i].to_string());
+                }
+                in_word = false;
+                word_has_percent = false;
+                i += 1;
+            }
+            b'$' => {
+                if !in_word { word_start = i; in_word = true; }
+                if i + 1 < n {
+                    match bytes[i + 1] {
+                        b'(' | b'{' => {
+                            let open = bytes[i + 1];
+                            let close = if open == b'(' { b')' } else { b'}' };
+                            let mut depth = 1;
+                            i += 2;
+                            while i < n && depth > 0 {
+                                if bytes[i] == open { depth += 1; }
+                                else if bytes[i] == close { depth -= 1; }
+                                i += 1;
+                            }
+                        }
+                        _ => { i += 2; }
+                    }
+                } else { i += 1; }
+            }
+            b'%' => {
+                if !in_word { word_start = i; in_word = true; }
+                word_has_percent = true;
+                i += 1;
+            }
+            _ => {
+                if !in_word { word_start = i; in_word = true; }
+                i += 1;
+            }
+        }
+    }
+    if in_word && word_has_percent {
+        result.push(text[word_start..n].to_string());
     }
     result
 }
