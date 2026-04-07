@@ -175,7 +175,10 @@ impl Parser {
         // backslash and append a single space (matching GNU Make's
         // collapse_continuations behaviour where backslash-newline at EOF
         // still triggers the join, just with an empty continuation).
-        if line.ends_with('\\') && !line.starts_with('\t') && !line_has_inline_recipe(&line) {
+        let is_recipe_at_eof = line.starts_with('\t') || self.recipe_prefix
+            .map(|p| p != '\t' && line.starts_with(p))
+            .unwrap_or(false);
+        if line.ends_with('\\') && !is_recipe_at_eof && !line_has_inline_recipe(&line) {
             line.pop(); // remove the trailing backslash
             if !self.posix_mode {
                 let trimmed_len = line.trim_end_matches(|c: char| c == ' ' || c == '\t').len();

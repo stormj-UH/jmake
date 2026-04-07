@@ -1519,6 +1519,15 @@ impl MakeState {
                 }
                 _ => {}
             }
+
+            // Keep parser.recipe_prefix in sync with .RECIPEPREFIX so that
+            // next_logical_line can handle backslash-newline continuation
+            // in custom-prefix recipe lines correctly.
+            {
+                let pfx = self.db.variables.get(".RECIPEPREFIX")
+                    .and_then(|v| v.value.chars().next());
+                parser.recipe_prefix = if pfx == Some('\t') { None } else { pfx };
+            }
         }
 
         // Check for unterminated define block (missing endef)
