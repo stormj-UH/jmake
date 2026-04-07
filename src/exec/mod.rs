@@ -2733,8 +2733,8 @@ impl<'a> Executor<'a> {
         // (we cannot determine up-to-date status until SE is done and those files
         // are recognized as explicitly mentioned — sv 60188 subtest 2).
         if !is_phony && !self.always_make && !self.collect_plans_mode
-            && rule.second_expansion_prereqs.is_none()
-            && rule.second_expansion_order_only.is_none()
+            && !rule.second_expansion_prereqs.as_deref().map_or(false, se_text_has_non_pattern_word)
+            && !rule.second_expansion_order_only.as_deref().map_or(false, se_text_has_non_pattern_word)
         {
             if let Some(target_time) = self.file_mtime(target).or_else(|| {
                 self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
@@ -5362,6 +5362,75 @@ fn replace_first_percent(word: &str, stem: &str) -> String {
 /// prerequisites are "stem-derived" (intermediate) or not (explicitly mentioned).
 fn se_text_has_percent(text: &str) -> bool {
     text.contains('%')
+}
+
+/// Returns true if the SE text contains ANY word (top-level space-separated
+/// token, respecting `$(...)` groups) that does NOT contain `%`.
+/// Such words expand to files that are NOT stem-derived, i.e. "explicitly
+/// mentioned" files that must not be treated as intermediate.
+///
+/// This is used to decide whether to skip the up-to-date precheck:
+/// if ALL words have `%`, SE can only produce stem-derived (intermediate)
+/// prereqs, and the precheck can still run safely.  If any word lacks `%`,
+/// the SE might produce explicitly-mentioned files, and the precheck must
+/// be skipped to allow those files to trigger a rebuild.
+fn se_text_has_non_pattern_word(text: &str) -> bool {
+    // Walk through top-level words, skipping $()/\${} groups.
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    let mut in_word = false;
+    let mut word_has_percent = false;
+
+    while i < n {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' => {
+                // End of word
+                if in_word && !word_has_percent {
+                    return true; // Found a word without %
+                }
+                in_word = false;
+                word_has_percent = false;
+                i += 1;
+            }
+            b'$' => {
+                in_word = true;
+                if i + 1 < n {
+                    match bytes[i + 1] {
+                        b'(' | b'{' => {
+                            // Skip past the entire $()/\${} group
+                            let open = bytes[i + 1];
+                            let close = if open == b'(' { b')' } else { b'}' };
+                            let mut depth = 1;
+                            i += 2;
+                            while i < n && depth > 0 {
+                                if bytes[i] == open { depth += 1; }
+                                else if bytes[i] == close { depth -= 1; }
+                                i += 1;
+                            }
+                        }
+                        _ => { i += 2; } // $x single-char variable
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b'%' => {
+                in_word = true;
+                word_has_percent = true;
+                i += 1;
+            }
+            _ => {
+                in_word = true;
+                i += 1;
+            }
+        }
+    }
+    // Check last word
+    if in_word && !word_has_percent {
+        return true;
+    }
+    false
 }
 
 /// Apply `%` → stem substitution to a prerequisite string, word by word.
