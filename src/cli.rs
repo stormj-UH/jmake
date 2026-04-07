@@ -40,6 +40,21 @@ pub struct MakeArgs {
     pub what_if: Vec<String>,
     pub no_silent: bool,  // explicitly set with --no-silent (for MAKEFLAGS output)
     pub clear_include_dirs: bool,  // -I- was passed (clear default include dirs)
+    /// Index in `variables` where command-line variables start.
+    /// Variables before this index came from the MAKEFLAGS environment variable.
+    /// Variables at or after this index came from the command line.
+    pub cmdline_vars_start: usize,
+
+    // Toggle-flag explicit-set tracking.
+    // True if the flag was explicitly set from any external source (env MAKEFLAGS or
+    // command line).  Used by apply_makeflags_from_makefile to protect env/cmdline
+    // settings from being overridden by a makefile MAKEFLAGS assignment.
+    pub print_directory_explicit: bool,
+    pub no_print_directory_explicit: bool,
+    pub silent_explicit: bool,
+    pub no_silent_explicit: bool,
+    pub keep_going_explicit: bool,
+    pub no_keep_going_explicit: bool,
 }
 
 impl Default for MakeArgs {
@@ -80,6 +95,7 @@ impl Default for MakeArgs {
             what_if: Vec::new(),
             no_silent: false,
             clear_include_dirs: false,
+            cmdline_vars_start: 0,
         }
     }
 }
@@ -103,6 +119,8 @@ pub fn parse_args() -> MakeArgs {
     if let Ok(makeflags) = env::var("MAKEFLAGS") {
         parse_makeflags(&makeflags, &mut result);
     }
+    // Record where command-line variables start (after env MAKEFLAGS vars).
+    result.cmdline_vars_start = result.variables.len();
 
     while i < args.len() {
         let arg = &args[i];

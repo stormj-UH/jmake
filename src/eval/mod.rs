@@ -405,20 +405,34 @@ impl MakeState {
         }
 
         // Append command-line variable assignments after "-- " separator.
-        // GNU Make outputs variables in insertion order (cmdline vars appear before env vars).
-        // args.variables has cmdline entries first (baseline), then env-parsed entries appended.
-        // Iterate forward and keep the first occurrence (cmdline value wins on duplicates).
+        // GNU Make outputs variables with command-line vars in REVERSE order of how they
+        // appeared on the command line (last-specified comes first), followed by env
+        // MAKEFLAGS vars in their original order.
+        // args.variables layout: [env_makeflags_vars..., cmdline_vars...]
+        // where cmdline_vars_start marks the boundary.
         if has_vars {
+            let cmdline_start = self.args.cmdline_vars_start;
+            let env_vars = &variables[..cmdline_start.min(variables.len())];
+            let cmdline_vars = &variables[cmdline_start.min(variables.len())..];
+
             let mut seen_names: HashSet<String> = HashSet::new();
             let mut var_parts: Vec<String> = Vec::new();
-            for (name, value) in variables.iter() {
-                // Strip trailing ':' (and '?' '+') from name for dedup key
-                // (handles 'hello:' from 'hello:=world')
-                let key = name.trim_end_matches(|c| c == ':' || c == '?' || c == '+');
+
+            // Cmdline vars in reverse order (last-specified on CLI comes first).
+            for (name, value) in cmdline_vars.iter().rev() {
+                let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
                 if seen_names.insert(key.to_string()) {
                     var_parts.push(format!("{}={}", name, value));
                 }
             }
+            // Env MAKEFLAGS vars in original order, skipping duplicates of cmdline vars.
+            for (name, value) in env_vars.iter() {
+                let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
+                if seen_names.insert(key.to_string()) {
+                    var_parts.push(format!("{}={}", name, value));
+                }
+            }
+
             if !var_parts.is_empty() {
                 result.push_str(" -- ");
                 result.push_str(&var_parts.join(" "));
@@ -1157,6 +1171,15 @@ impl MakeState {
                     // GNU Make allows blank lines between recipe lines; only a
                     // non-empty, non-recipe line (rule, assignment, directive)
                     // should clear in_recipe / current_rule.
+                }
+                ParsedLine::MissingSeparator(hint) => {
+                    let fname = parser.filename.to_string_lossy();
+                    if hint.is_empty() {
+                        eprintln!("{}:{}: *** missing separator.  Stop.", fname, lineno);
+                    } else {
+                        eprintln!("{}:{}: *** missing separator ({}).  Stop.", fname, lineno, hint);
+                    }
+                    std::process::exit(2);
                 }
                 _ => {}
             }

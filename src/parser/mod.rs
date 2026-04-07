@@ -265,7 +265,29 @@ impl Parser {
             return rule;
         }
 
-        // Unknown line - treat as recipe continuation or error
+        // Unknown line - missing separator error
+        // Check if this looks like a recipe line with spaces instead of a tab
+        if line.starts_with("        ") && !line.trim().is_empty() {
+            // 8 spaces at the start - did they mean a tab?
+            // But only if we're NOT using a custom recipe prefix
+            let recipe_prefix = state.db.variables.get(".RECIPEPREFIX")
+                .and_then(|v| v.value.chars().next())
+                .unwrap_or('\t');
+            if recipe_prefix == '\t' {
+                return ParsedLine::MissingSeparator(
+                    "did you mean TAB instead of 8 spaces?".to_string()
+                );
+            }
+        }
+        if !effective.is_empty() {
+            // Check for ifeq/ifneq without whitespace
+            if effective.starts_with("ifeq(") || effective.starts_with("ifneq(") {
+                return ParsedLine::MissingSeparator(
+                    "ifeq/ifneq must be followed by whitespace".to_string()
+                );
+            }
+            return ParsedLine::MissingSeparator(String::new());
+        }
         ParsedLine::Empty
     }
 }

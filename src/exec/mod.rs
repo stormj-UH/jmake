@@ -2040,6 +2040,20 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
+        // With --trace, print "file:line: update target 'X' due to: reason" before executing.
+        if self.trace && !recipe.is_empty() {
+            let (lineno, _) = &recipe[0];
+            let loc = make_location(source_file, *lineno);
+            // We don't have the reason computed here; callers pass it via
+            // execute_recipe_with_trace. This path is the legacy call site.
+            // For backward compat, compute a basic reason: if target doesn't exist, say so.
+            let reason = if !Path::new(target).exists() {
+                "target does not exist".to_string()
+            } else {
+                "target is out of date".to_string()
+            };
+            eprintln!("{}: update target '{}' due to: {}", loc, target, reason);
+        }
         if self.touch {
             // Just touch the target
             if !self.silent {

@@ -209,6 +209,8 @@ pub enum ParsedLine {
     Recipe(String),
     Comment,
     Empty,
+    /// Line that could not be parsed - missing separator error
+    MissingSeparator(String), // the hint message (e.g., "did you mean TAB instead of 8 spaces?")
     LoadDirective(String),
 }
 
