@@ -52,6 +52,8 @@ struct IncludeRuleInfo {
     /// (i.e., the other targets that would be built by the same recipe invocation).
     /// When this recipe runs for one target, all siblings are also considered attempted.
     sibling_targets: Vec<String>,
+    /// The stem matched when this came from a pattern rule (empty for explicit rules).
+    stem: String,
 }
 
 pub struct MakeState {
@@ -1075,7 +1077,15 @@ impl MakeState {
                                 // Deferred expansion: expand only the LHS (name / prefixes),
                                 // keep the value verbatim.
                                 // Reconstruct the line with only the name expanded.
-                                let expanded_name = self.expand(&raw_name);
+                                // EXCEPTION: for target-specific vars with variable references
+                                // in the name (e.g. `four:VAR$(FOO)=ok`), do NOT expand the
+                                // name here -- it must be expanded in the target's own variable
+                                // context (where `FOO=x` for target `four` makes `VAR$(FOO)=VARx`).
+                                let expanded_name = if raw_target.is_some() && raw_name.contains('$') {
+                                    raw_name.clone()
+                                } else {
+                                    self.expand(&raw_name)
+                                };
                                 let op_str = match raw_flavor {
                                     VarFlavor::Append => " += ",
                                     VarFlavor::Conditional => " ?= ",
@@ -2381,7 +2391,7 @@ impl MakeState {
                         if !rule.recipe.is_empty() {
                             let src = rule.source_file.clone();
                             self.run_include_recipe(
-                                prereq, &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                                prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
                             )?;
                         }
                     }
@@ -2407,7 +2417,7 @@ impl MakeState {
                 if needs_rebuild && !rule.recipe.is_empty() {
                     let src = rule.source_file.clone();
                     self.run_include_recipe(
-                        prereq, &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                        prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
                     )?;
                 }
             }
@@ -2430,6 +2440,7 @@ impl MakeState {
                         skippable: true,
                         imagined: false,
                         sibling_targets: Vec::new(),
+                        stem: String::new(),
                     });
                 }
                 // Single-colon rule with no recipe AND no prerequisites: sv 61226
@@ -2444,6 +2455,7 @@ impl MakeState {
                         skippable: false,
                         imagined: true,
                         sibling_targets: Vec::new(),
+                        stem: String::new(),
                     });
                 }
                 // A rule that has a recipe or has prerequisites counts
@@ -2458,6 +2470,7 @@ impl MakeState {
                         skippable: false,
                         imagined: false,
                         sibling_targets: Vec::new(),
+                        stem: String::new(),
                     });
                 }
             }
@@ -2506,6 +2519,7 @@ impl MakeState {
                             skippable: false,
                             imagined: false,
                             sibling_targets: siblings,
+                            stem: stem.clone(),
                         });
                     }
                 }
@@ -2519,15 +2533,17 @@ impl MakeState {
     /// Returns Err with formatted "[source_file:lineno: target] Error N" string on failure.
     /// Callers are responsible for printing warnings and propagating the error.
     fn run_include_recipe(
-        &self, target: &str, recipe: &[(usize, String)],
+        &self, target: &str, stem: &str, recipe: &[(usize, String)],
         shell: &str, shell_flags: &str, silent: bool,
         source_file: &str,
     ) -> Result<(), String> {
         use std::os::unix::process::ExitStatusExt;
 
-        // Set up automatic variables for recipe expansion ($@ = target)
+        // Set up automatic variables for recipe expansion.
+        // $@ = target, $* = stem (for pattern rules)
         let mut auto_vars = HashMap::new();
         auto_vars.insert("@".to_string(), target.to_string());
+        auto_vars.insert("*".to_string(), stem.to_string());
 
         let progname = make_progname();
 
@@ -2840,7 +2856,7 @@ impl MakeState {
 
                 // Run the recipe
                 let built = self.run_include_recipe(
-                    &mf_name, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
+                    &mf_name, &rule_info.stem, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
                     &rule_info.source_file.clone(),
                 );
 
@@ -2945,7 +2961,7 @@ impl MakeState {
                     // Mark as imagined so the main build phase doesn't try to build it.
                     self.include_imagined.insert(pi.file.clone());
                 }
-                Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, .. }) => {
+                Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, stem, .. }) => {
                     if self.include_recipe_ran.contains(&pi.file) {
                         // Recipe already ran (sibling pattern target)
                         if !pi.ignore_missing {
@@ -2993,7 +3009,7 @@ impl MakeState {
                                 }
                                 // Run the recipe
                                 let built = self.run_include_recipe(
-                                    &pi.file, &recipe, &shell, &shell_flags, silent, &source_file,
+                                    &pi.file, &stem, &recipe, &shell, &shell_flags, silent, &source_file,
                                 );
                                 match built {
                                     Ok(()) => {

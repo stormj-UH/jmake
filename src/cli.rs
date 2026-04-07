@@ -141,6 +141,22 @@ fn require_arg(args: &[String], i: usize, opt: &str) -> String {
     }
 }
 
+/// Accumulate a -C directory path.
+/// Multiple -C options are chained: each is relative to the previous result.
+fn accumulate_dir(current: Option<PathBuf>, new_dir: &str) -> Option<PathBuf> {
+    let new_path = PathBuf::from(new_dir);
+    let combined = if let Some(cur) = current {
+        if new_path.is_absolute() {
+            new_path
+        } else {
+            cur.join(new_path)
+        }
+    } else {
+        new_path
+    };
+    Some(combined)
+}
+
 pub fn parse_args() -> MakeArgs {
     let args: Vec<String> = env::args().collect();
     let mut result = MakeArgs::default();
@@ -189,7 +205,7 @@ pub fn parse_args() -> MakeArgs {
                 "--directory" => {
                     i += 1;
                     if i < args.len() {
-                        result.directory = Some(PathBuf::from(&args[i]));
+                        result.directory = accumulate_dir(result.directory.take(), &args[i]);
                     }
                 }
                 "--dry-run" | "--just-print" | "--recon" => {
@@ -272,7 +288,7 @@ pub fn parse_args() -> MakeArgs {
                     }
                 }
                 s if s.starts_with("--directory=") => {
-                    result.directory = Some(PathBuf::from(&s[12..]));
+                    result.directory = accumulate_dir(result.directory.take(), &s[12..]);
                 }
                 s if s.starts_with("--file=") || s.starts_with("--makefile=") => {
                     let val = if s.starts_with("--file=") { &s[7..] } else { &s[11..] };

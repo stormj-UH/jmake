@@ -292,7 +292,10 @@ impl<'a> Executor<'a> {
         // If we have explicit rules
         if let Some(ref rules) = rules {
             if !rules.is_empty() {
-                let is_double_colon = rules.first().map_or(false, |r| r.is_double_colon);
+                // Check if these are double-colon rules.  Target-specific variable
+                // placeholders (single-colon, no recipe) may appear first in the list
+                // before the actual :: rules, so check any() rather than first().
+                let is_double_colon = rules.iter().any(|r| r.is_double_colon);
                 if is_double_colon {
                     // For double-colon rules, each rule is independent.
                     // If a rule has grouped_siblings, treat it as its own grouped invocation.
@@ -408,7 +411,9 @@ impl<'a> Executor<'a> {
     fn build_with_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
         // Double-colon rules are treated as independent rules: each is evaluated
         // and executed separately if its prerequisites are out of date.
-        if rules.first().map_or(false, |r| r.is_double_colon) {
+        // Use any() instead of first() to handle the case where a target-specific
+        // variable placeholder (single-colon) appears before the actual :: rules.
+        if rules.iter().any(|r| r.is_double_colon) {
             return self.build_with_double_colon_rules(target, rules, is_phony);
         }
 
@@ -1468,13 +1473,14 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_rebuilt = true; }
                 }
                 Err(e) => {
-                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() {
+                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() && !rule.is_compat {
                         // GNU Make behavior: if a prerequisite doesn't exist and has
                         // no rule, but the parent target HAS a recipe, just consider
                         // the parent out of date. This handles auto-generated dependency
                         // files that list system headers as prerequisites.
                         // Only applies to DIRECT "no rule" errors (without "needed by"),
-                        // not to errors propagated from deeper in the dependency chain.
+                        // not to errors propagated from deeper in the dependency chain,
+                        // and not to compatibility rules (which propagate errors).
                         any_rebuilt = true;
                     } else {
                         // Propagate "No rule to make target" errors correctly
@@ -1788,6 +1794,11 @@ impl<'a> Executor<'a> {
             return Some(best);
         }
 
+        // Mark the compat rule as a compatibility rule so that
+        // build_with_pattern_rule knows to propagate errors from missing prereqs.
+        if let Some((ref mut rule, _)) = compat_rule {
+            rule.is_compat = true;
+        }
         compat_rule
     }
 
@@ -2651,6 +2662,15 @@ impl<'a> Executor<'a> {
                         } else {
                             let loc = make_location(source_file, last_lineno);
                             eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
+                            // Delete target on error only if .DELETE_ON_ERROR is set.
+                            let delete_on_error = self.db.special_targets
+                                .contains_key(&SpecialTarget::DeleteOnError);
+                            if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
+                                if Path::new(target).exists() {
+                                    eprintln!("{}: *** Deleting file '{}'", self.progname, target);
+                                    let _ = fs::remove_file(target);
+                                }
+                            }
                             return Err(String::new());
                         }
                     }
@@ -2784,8 +2804,11 @@ impl<'a> Executor<'a> {
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
                         } else {
                             eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
-                            if !self.db.is_precious(target) && !self.db.is_phony(target) {
-                                // Delete target on error unless .PRECIOUS
+                            // Delete target on error only if .DELETE_ON_ERROR is set
+                            // and the target is not .PRECIOUS.
+                            let delete_on_error = self.db.special_targets
+                                .contains_key(&SpecialTarget::DeleteOnError);
+                            if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
                                 if Path::new(target).exists() {
                                     eprintln!("{}: *** Deleting file '{}'", self.progname, target);
                                     let _ = fs::remove_file(target);

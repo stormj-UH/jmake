@@ -69,6 +69,10 @@ pub struct Rule {
     pub is_pattern: bool,
     pub is_double_colon: bool,
     pub is_terminal: bool, // pattern rule with no recipe terminates chain
+    /// True if this rule was chosen as a "compatibility" rule (last resort):
+    /// its prerequisite is only mentioned as someone else's dep, not a target.
+    /// In this mode, missing prerequisites cause errors rather than being swallowed.
+    pub is_compat: bool,
     /// Target-specific variable assignments, stored as a list to support
     /// multiple += entries for the same variable name.
     pub target_specific_vars: Vec<(String, Variable)>,
@@ -104,6 +108,7 @@ impl Rule {
             is_pattern: false,
             is_double_colon: false,
             is_terminal: false,
+            is_compat: false,
             target_specific_vars: Vec::new(),
             source_file: String::new(),
             lineno: 0,

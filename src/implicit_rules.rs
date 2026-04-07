@@ -173,6 +173,7 @@ fn make_pattern_rule(target: &str, prereqs: &[&str], recipe: &[&str]) -> Rule {
         is_pattern: true,
         is_double_colon: false,
         is_terminal: false,
+        is_compat: false,
         target_specific_vars: Vec::new(),
         source_file: String::new(),
         lineno: 0,
