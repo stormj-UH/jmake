@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
 // Recipe execution engine - dependency resolution and recipe running
 
+use crate::cli::ShuffleMode;
 use crate::database::MakeDatabase;
 use crate::eval::MakeState;
 use crate::functions;
@@ -55,6 +56,10 @@ pub struct Executor<'a> {
     /// Variables to explicitly unexport for the current target (target-specific unexport).
     /// Set before calling execute_recipe and cleared after.
     target_extra_unexports: HashSet<String>,
+    /// Shuffle mode for prerequisite ordering.
+    shuffle: Option<ShuffleMode>,
+    /// RNG seed for shuffle (updated after each use for seeded mode to simulate sequence).
+    shuffle_seed: u64,
 }
 
 impl<'a> Executor<'a> {
@@ -74,7 +79,21 @@ impl<'a> Executor<'a> {
         trace: bool,
         progname: String,
         what_if: Vec<String>,
+        shuffle: Option<ShuffleMode>,
     ) -> Self {
+        // Initialize seed for seeded/random shuffle modes.
+        let shuffle_seed = match &shuffle {
+            Some(ShuffleMode::Seeded(s)) => *s,
+            Some(ShuffleMode::Random) => {
+                // Use a time-based seed for true randomness.
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+                    .unwrap_or(42)
+            }
+            _ => 0,
+        };
         Executor {
             db,
             state,
@@ -102,6 +121,8 @@ impl<'a> Executor<'a> {
             inherited_vars_stack: Vec::new(),
             target_extra_exports: HashMap::new(),
             target_extra_unexports: HashSet::new(),
+            shuffle,
+            shuffle_seed,
         }
     }
 
@@ -539,6 +560,32 @@ impl<'a> Executor<'a> {
         let mut any_prereq_rebuilt = false;
         let mut prereq_errors = Vec::new();
 
+        // Step 0: build .EXTRA_PREREQS first (before regular prereqs).
+        // Extra prereqs are built before regular prereqs but are excluded from
+        // automatic variables ($^, $<, $+, $?, $|).
+        let extra_prereqs = self.get_extra_prereqs(target);
+        for prereq in &extra_prereqs {
+            match self.build_target(prereq) {
+                Ok(rebuilt) => {
+                    if rebuilt { any_prereq_rebuilt = true; }
+                }
+                Err(e) => {
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    } else {
+                        e
+                    };
+                    if self.keep_going {
+                        prereq_errors.push(propagated);
+                    } else {
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
+                }
+            }
+        }
+
         // Step 1: build non-SE normal prereqs
         for prereq in all_prereqs.clone() {
             match self.build_target(&prereq) {
@@ -702,18 +749,25 @@ impl<'a> Executor<'a> {
             (recipe, recipe_source_file, stem)
         };
 
-        // Determine if we need to rebuild
+        // Determine if we need to rebuild.
+        // Include extra_prereqs in the rebuild check (they count for mtime comparison)
+        // but they are NOT passed to make_auto_vars (excluded from $^, $<, etc.).
+        let all_prereqs_for_rebuild = {
+            let mut v = extra_prereqs.clone();
+            v.extend(all_prereqs.clone());
+            v
+        };
         let needs_rebuild = if self.always_make || is_phony {
             true
         } else {
-            self.needs_rebuild(target, &all_prereqs, any_prereq_rebuilt)
+            self.needs_rebuild(target, &all_prereqs_for_rebuild, any_prereq_rebuilt)
         };
 
         if !needs_rebuild {
             return Ok(false);
         }
 
-        // Set up automatic variables.
+        // Set up automatic variables (extra_prereqs are excluded from auto vars).
         let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
         let mut auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
 
@@ -1349,6 +1403,31 @@ impl<'a> Executor<'a> {
         self.inherited_vars_stack.push(my_target_vars.1);
 
         let mut any_rebuilt = false;
+
+        // Step 0: build .EXTRA_PREREQS first.
+        let extra_prereqs = self.get_extra_prereqs(target);
+        for prereq in &extra_prereqs {
+            match self.build_target(prereq) {
+                Ok(rebuilt) => {
+                    if rebuilt { any_rebuilt = true; }
+                }
+                Err(e) => {
+                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                        format!("{}, needed by '{}'.  Stop.", base, target)
+                    } else {
+                        e
+                    };
+                    if self.keep_going {
+                        // keep going: ignore error and continue
+                    } else {
+                        self.inherited_vars_stack.pop();
+                        return Err(propagated);
+                    }
+                }
+            }
+        }
+
         for prereq in prereqs.clone() {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
@@ -1382,9 +1461,15 @@ impl<'a> Executor<'a> {
 
         self.inherited_vars_stack.pop();
 
+        // Include extra_prereqs in rebuild check but not in auto vars.
+        let prereqs_for_rebuild = {
+            let mut v = extra_prereqs.clone();
+            v.extend(prereqs.clone());
+            v
+        };
         let needs_rebuild = if self.always_make || is_phony {
             true
-        } else if self.needs_rebuild(target, &prereqs, any_rebuilt) {
+        } else if self.needs_rebuild(target, &prereqs_for_rebuild, any_rebuilt) {
             true
         } else {
             // For grouped pattern rules, also rebuild if any concrete sibling is missing.
@@ -2212,6 +2297,74 @@ impl<'a> Executor<'a> {
         false
     }
 
+    /// Resolve `.EXTRA_PREREQS` for a given target.
+    /// Target-specific `.EXTRA_PREREQS` takes priority over the global value.
+    /// The value is variable-expanded and wildcard-expanded.
+    /// Returns a deduplicated list of extra prerequisite names.
+    fn get_extra_prereqs(&self, target: &str) -> Vec<String> {
+        // Use collect_target_vars to get the fully-expanded target-specific vars
+        // (which also handles inheritance, pattern-specific vars, etc.).
+        let collected = self.collect_target_vars(target);
+        let raw_value = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
+            val.clone()
+        } else {
+            // Fall back to global .EXTRA_PREREQS.
+            match self.db.variables.get(".EXTRA_PREREQS") {
+                Some(v) => {
+                    if v.flavor == VarFlavor::Simple {
+                        v.value.clone()
+                    } else {
+                        self.state.expand(&v.value)
+                    }
+                }
+                None => return Vec::new(),
+            }
+        };
+
+        if raw_value.trim().is_empty() {
+            return Vec::new();
+        }
+
+        // Expand the value.
+        let expanded = self.state.expand(&raw_value);
+        if expanded.trim().is_empty() {
+            return Vec::new();
+        }
+
+        // Split into tokens and apply wildcard expansion.
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for token in expanded.split_whitespace() {
+            // Apply wildcard expansion if the token contains glob characters.
+            if token.contains('*') || token.contains('?') || token.contains('[') {
+                let mut matched = Vec::new();
+                if let Ok(paths) = ::glob::glob(token) {
+                    for entry in paths.flatten() {
+                        matched.push(entry.to_string_lossy().to_string());
+                    }
+                }
+                matched.sort();
+                if matched.is_empty() {
+                    // No matches: treat as literal (like GNU Make does).
+                    if seen.insert(token.to_string()) {
+                        result.push(token.to_string());
+                    }
+                } else {
+                    for m in matched {
+                        if seen.insert(m.clone()) {
+                            result.push(m);
+                        }
+                    }
+                }
+            } else {
+                if seen.insert(token.to_string()) {
+                    result.push(token.to_string());
+                }
+            }
+        }
+        result
+    }
+
     fn make_auto_vars(&self, target: &str, prereqs: &[String], order_only: &[&str], stem: &str) -> HashMap<String, String> {
         let mut vars = HashMap::new();
 
@@ -2865,6 +3018,49 @@ impl<'a> Executor<'a> {
                     || (flag == "b" && (d == "basic"))
                     || (flag == "j" && (d == "jobs"))
             })
+    }
+
+    /// Print a keep-going error message to stderr.
+    /// Formats it as: `progname: *** message.`
+    fn print_error_keep_going(&self, err: &str) {
+        // Strip " Stop." suffix if present (we're not stopping).
+        let msg = if let Some(stripped) = err.strip_suffix("  Stop.") {
+            stripped.to_string()
+        } else {
+            err.to_string()
+        };
+        // Ensure message ends with a period.
+        let msg = msg.trim_end_matches('.');
+        eprintln!("{}: *** {}.", self.progname, msg);
+    }
+
+    /// Shuffle a list of prerequisites according to the current shuffle mode.
+    /// Returns the list in the new order.
+    fn shuffle_list(&mut self, mut list: Vec<String>) -> Vec<String> {
+        match &self.shuffle {
+            None | Some(ShuffleMode::Identity) => list,
+            Some(ShuffleMode::Reverse) => {
+                list.reverse();
+                list
+            }
+            Some(ShuffleMode::Random) | Some(ShuffleMode::Seeded(_)) => {
+                // Simple xorshift64 PRNG for portable shuffle
+                let seed = &mut self.shuffle_seed;
+                let n = list.len();
+                for i in (1..n).rev() {
+                    // Advance xorshift64
+                    let mut s = *seed;
+                    if s == 0 { s = 1; }
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    *seed = s;
+                    let j = (s as usize) % (i + 1);
+                    list.swap(i, j);
+                }
+                list
+            }
+        }
     }
 }
 

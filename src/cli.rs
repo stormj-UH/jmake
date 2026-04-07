@@ -61,6 +61,22 @@ pub struct MakeArgs {
     /// True if GNUMAKEFLAGS was set in the environment (even if empty).
     /// When true, export GNUMAKEFLAGS= (empty) to recipe environments.
     pub gnumakeflags_was_set: bool,
+    /// Shuffle mode for prerequisite ordering.
+    /// None = no shuffling, Some(0) = random, Some(n) = seeded, Some(u64::MAX) = reverse
+    pub shuffle: Option<ShuffleMode>,
+}
+
+/// Shuffle mode for --shuffle option
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShuffleMode {
+    /// Random order (no seed)
+    Random,
+    /// Seeded random order (--shuffle=N)
+    Seeded(u64),
+    /// Reverse order (--shuffle=reverse)
+    Reverse,
+    /// Normal order (--shuffle=none or --shuffle=identity)
+    Identity,
 }
 
 impl Default for MakeArgs {
@@ -110,6 +126,7 @@ impl Default for MakeArgs {
             no_keep_going_explicit: false,
             temp_stdin: None,
             gnumakeflags_was_set: false,
+            shuffle: None,
         }
     }
 }
@@ -245,7 +262,14 @@ pub fn parse_args() -> MakeArgs {
                 }
                 s if s.starts_with("--jobs=") => {
                     let val = &s[7..];
-                    result.jobs = val.parse().unwrap_or(1);
+                    match val.parse::<usize>() {
+                        Ok(n) => { result.jobs = n; }
+                        Err(_) => {
+                            let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
+                            eprintln!("{}: invalid option -- '--jobs={}'", progname, val);
+                            std::process::exit(2);
+                        }
+                    }
                 }
                 s if s.starts_with("--directory=") => {
                     result.directory = Some(PathBuf::from(&s[12..]));
@@ -281,8 +305,31 @@ pub fn parse_args() -> MakeArgs {
                 s if s.starts_with("--temp-stdin=") => {
                     result.temp_stdin = Some(PathBuf::from(&s[13..]));
                 }
-                // Silently ignore options that GNU Make supports but jmake does not implement
-                s if s.starts_with("--shuffle") || s == "--no-keep-going" || s == "--sync-output" || s.starts_with("--output-sync") => {
+                // --shuffle[=VALUE]
+                s if s.starts_with("--shuffle") => {
+                    let val = if s == "--shuffle" {
+                        // Next arg or default to random
+                        // Check if next arg could be the value (but --shuffle can also be standalone)
+                        "".to_string()
+                    } else if let Some(rest) = s.strip_prefix("--shuffle=") {
+                        rest.to_string()
+                    } else {
+                        "".to_string()
+                    };
+                    result.shuffle = Some(match val.as_str() {
+                        "" => ShuffleMode::Random,
+                        "reverse" => ShuffleMode::Reverse,
+                        "none" | "identity" => ShuffleMode::Identity,
+                        s => {
+                            if let Ok(seed) = s.parse::<u64>() {
+                                ShuffleMode::Seeded(seed)
+                            } else {
+                                ShuffleMode::Random
+                            }
+                        }
+                    });
+                }
+                s if s == "--no-keep-going" || s == "--sync-output" || s.starts_with("--output-sync") => {
                     // Accepted but not implemented
                 }
                 _ => {
@@ -382,13 +429,26 @@ pub fn parse_args() -> MakeArgs {
                     'j' => {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
-                            result.jobs = rest.parse().unwrap_or(1);
+                            // -j<value>: if value is not a valid number, it's an error.
+                            match rest.parse::<usize>() {
+                                Ok(n) => { result.jobs = n; }
+                                Err(_) => {
+                                    let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
+                                    eprintln!("{}: invalid option -- 'j{}'", progname, rest);
+                                    std::process::exit(2);
+                                }
+                            }
                             j = chars.len();
                             continue;
                         } else {
-                            i += 1;
-                            if i < args.len() {
-                                result.jobs = args[i].parse().unwrap_or(1);
+                            // -j <value>: if next arg is not a number, don't consume it
+                            // (it will be treated as a target).
+                            if i + 1 < args.len() {
+                                if let Ok(n) = args[i + 1].parse::<usize>() {
+                                    i += 1;
+                                    result.jobs = n;
+                                }
+                                // else: leave i unchanged; next arg becomes a target
                             }
                         }
                     }

@@ -343,6 +343,7 @@ impl MakeState {
             self.args.trace,
             progname.clone(),
             self.args.what_if.clone(),
+            self.args.shuffle.clone(),
         );
 
         let result = executor.build_targets(&targets);
@@ -2790,10 +2791,30 @@ impl MakeState {
 
                 let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
 
-                // Build prerequisites first (they may not exist yet but have their own rules).
-                // This must happen BEFORE the needs_rebuild check so that prereqs that don't
-                // yet exist (but have rules to create them) are built first, and we can then
-                // accurately check if any of them is newer than the target.
+                // Check if the makefile needs rebuild BEFORE trying to build prereqs.
+                // If a prerequisite doesn't exist on disk, this rule can't fire — skip.
+                // Only proceed if the target doesn't exist OR a prereq exists AND is newer.
+                // This matches GNU Make: missing implicit rule prereqs → rule silently skipped.
+                let needs_rebuild = if target_mtime.is_none() {
+                    // File doesn't exist → needs rebuild
+                    true
+                } else {
+                    let target_time = target_mtime.unwrap();
+                    // A prereq triggers rebuild only if it EXISTS and is newer than target.
+                    // If a prereq doesn't exist → rule cannot fire → not out of date.
+                    rule_info.prerequisites.iter().any(|prereq| {
+                        match std::fs::metadata(prereq) {
+                            Ok(m) => m.modified().ok().map_or(false, |pt| pt > target_time),
+                            Err(_) => false, // prereq doesn't exist → skip this rule
+                        }
+                    })
+                };
+
+                if !needs_rebuild {
+                    continue;
+                }
+
+                // Build prerequisites first (they exist but may themselves be out of date).
                 let prereqs = rule_info.prerequisites.clone();
                 let mut visited = HashSet::new();
                 visited.insert(mf_name.clone());
@@ -2803,24 +2824,6 @@ impl MakeState {
 
                 if let Err(e) = prereq_result {
                     return Err(e);
-                }
-
-                // Now determine if the makefile is out of date (after prereqs were built).
-                let needs_rebuild = if target_mtime.is_none() {
-                    // File doesn't exist → needs rebuild
-                    true
-                } else {
-                    let target_time = target_mtime.unwrap();
-                    // Check if any prerequisite is now newer than the target.
-                    rule_info.prerequisites.iter().any(|prereq| {
-                        std::fs::metadata(prereq).ok()
-                            .and_then(|m| m.modified().ok())
-                            .map_or(false, |pt| pt > target_time)
-                    })
-                };
-
-                if !needs_rebuild {
-                    continue;
                 }
 
                 if rule_info.recipe.is_empty() {
