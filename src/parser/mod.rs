@@ -453,6 +453,16 @@ fn find_inline_recipe_semi_pos(line: &str) -> Option<usize> {
                 }
             }
             b';' if depth == 0 && found_colon && !in_assignment => return Some(i),
+            b'#' if depth == 0 => {
+                // Comment: a '#' at top level starts a comment; no inline recipe
+                // can appear after it (e.g. "target: # comment ; cmd" has no inline recipe).
+                // Check for \# which is an escaped '#' (not a comment).
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    // escaped '#' — not a comment, continue scanning
+                } else {
+                    return None;
+                }
+            }
             _ => {}
         }
         i += 1;
