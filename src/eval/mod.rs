@@ -768,10 +768,18 @@ impl MakeState {
     }
 
     fn read_makefiles(&mut self) -> Result<(), String> {
-        // Process MAKEFILES environment variable: space-separated list of
-        // makefiles to include before the regular makefiles (like -include).
-        if let Ok(makefiles_env) = env::var("MAKEFILES") {
-            for file in makefiles_env.split_whitespace() {
+        // Process MAKEFILES variable: space-separated list of makefiles to
+        // include before the regular makefiles (like -include).
+        // GNU Make checks the MAKEFILES Make variable (which may be set from
+        // the environment OR from a command-line assignment like `make MAKEFILES=x`).
+        // Prefer the Make variable (which reflects command-line overrides) over
+        // the raw OS environment variable.
+        let makefiles_val = self.db.variables.get("MAKEFILES")
+            .map(|v| v.value.clone())
+            .or_else(|| env::var("MAKEFILES").ok())
+            .unwrap_or_default();
+        if !makefiles_val.is_empty() {
+            for file in makefiles_val.split_whitespace() {
                 // Each entry is treated as an optional include (ignore if missing,
                 // but still try to build if there is a rule).
                 let file_path = self.find_include_file(file);
@@ -942,6 +950,16 @@ impl MakeState {
         } else {
             path.to_path_buf()
         });
+        // Update MAKEFILE_LIST variable immediately so $(MAKEFILE_LIST) is available
+        // during parsing of this file (GNU Make updates it incrementally as each file
+        // is read, not just at the end of all reading).
+        {
+            let mf_list: Vec<String> = self.makefile_list.iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            self.db.variables.insert("MAKEFILE_LIST".into(),
+                Variable::new(mf_list.join(" "), VarFlavor::Simple, VarOrigin::File));
+        }
         self.process_parsed_lines(&mut parser)
     }
 
@@ -3035,20 +3053,35 @@ impl MakeState {
             return Some(path.to_path_buf());
         }
 
-        // Search include directories
-        for dir in &self.include_dirs {
+        // Determine if -I- (clear include dirs) was used by looking for "-" sentinel
+        // in the include_dirs list. When present, only dirs AFTER the last "-" are
+        // searched, and the default system include dirs are suppressed.
+        let has_reset = self.include_dirs.iter().any(|d| d.to_string_lossy() == "-");
+        let effective_dirs: Vec<&PathBuf> = if has_reset {
+            // Find the position of the LAST "-" sentinel and only use dirs after it.
+            let last_reset_pos = self.include_dirs.iter().rposition(|d| d.to_string_lossy() == "-")
+                .unwrap_or(0);
+            self.include_dirs[last_reset_pos + 1..].iter().collect()
+        } else {
+            self.include_dirs.iter().collect()
+        };
+
+        // Search include directories (only effective ones after any -I- reset)
+        for dir in &effective_dirs {
             let candidate = dir.join(file);
             if candidate.exists() {
                 return Some(candidate);
             }
         }
 
-        // Search default include dirs
-        let default_dirs = vec!["/usr/include", "/usr/local/include"];
-        for dir in default_dirs {
-            let candidate = Path::new(dir).join(file);
-            if candidate.exists() {
-                return Some(candidate);
+        // Search default include dirs only when -I- was NOT specified
+        if !has_reset {
+            let default_dirs = vec!["/usr/include", "/usr/local/include"];
+            for dir in default_dirs {
+                let candidate = Path::new(dir).join(file);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
 
@@ -3606,12 +3639,21 @@ impl MakeState {
 
             match &work_items_vec[i].outcome {
                 PendingOutcome::AlreadyExists => {
-                    if let Err(e) = self.read_makefile(file_path.as_path()) {
-                        if !pi_ignore_missing {
-                            return Err(format!("{}:{}: {}", pi_parent, pi_lineno, e));
+                    // Only re-read and trigger re-exec if the file was NOT already
+                    // successfully read (i.e., not in makefile_list). This avoids
+                    // spurious re-exec for the three default makefile candidates
+                    // (GNUmakefile, makefile, Makefile) that are added to pending_includes
+                    // after being read, which would otherwise cause an infinite re-exec
+                    // loop when using -C (the re-exec re-runs from the already-changed dir).
+                    let already_read = self.makefile_list.iter().any(|p| p == &file_path);
+                    if !already_read {
+                        if let Err(e) = self.read_makefile(file_path.as_path()) {
+                            if !pi_ignore_missing {
+                                return Err(format!("{}:{}: {}", pi_parent, pi_lineno, e));
+                            }
                         }
+                        any_really_rebuilt = true;
                     }
-                    any_really_rebuilt = true;
                 }
                 PendingOutcome::Error(msg) => {
                     if !pi_ignore_missing {
