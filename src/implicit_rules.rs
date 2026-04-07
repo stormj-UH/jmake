@@ -43,9 +43,10 @@ pub fn register_default_variables(db: &mut MakeDatabase) {
         ("LINK.cpp", "$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)"),
         ("LINK.o", "$(CC) $(LDFLAGS) $(TARGET_ARCH)"),
         ("LINK.f", "$(FC) $(FFLAGS) $(LDFLAGS) $(TARGET_ARCH)"),
+        ("LINK.F", "$(FC) $(FFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)"),
+        ("LINK.r", "$(FC) $(FFLAGS) $(RFLAGS) $(LDFLAGS) $(TARGET_ARCH)"),
         ("LINK.s", "$(CC) $(ASFLAGS) $(LDFLAGS) $(TARGET_MACH)"),
         ("LINK.S", "$(CC) $(ASFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_MACH)"),
-        ("LINK.r", "$(FC) $(FFLAGS) $(RFLAGS) $(LDFLAGS) $(TARGET_ARCH)"),
         ("PREPROCESS.F", "$(FC) $(FFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -F"),
         ("PREPROCESS.r", "$(FC) $(FFLAGS) $(RFLAGS) $(TARGET_ARCH) -F"),
         ("PREPROCESS.S", "$(CC) -E $(CPPFLAGS)"),
@@ -143,6 +144,24 @@ pub fn register_implicit_rules(db: &mut MakeDatabase) {
     db.pattern_rules.push(make_pattern_rule(
         "%", &["%.cpp"],
         &["$(LINK.cpp) $^ $(LOADLIBES) $(LDLIBS) -o $@"],
+    ));
+
+    // Fortran direct linking: %: %.f
+    db.pattern_rules.push(make_pattern_rule(
+        "%", &["%.f"],
+        &["$(LINK.f) $^ $(LOADLIBES) $(LDLIBS) -o $@"],
+    ));
+
+    // Fortran preprocessing and linking: %: %.F
+    db.pattern_rules.push(make_pattern_rule(
+        "%", &["%.F"],
+        &["$(LINK.F) $^ $(LOADLIBES) $(LDLIBS) -o $@"],
+    ));
+
+    // Ratfor: %: %.r
+    db.pattern_rules.push(make_pattern_rule(
+        "%", &["%.r"],
+        &["$(LINK.r) $^ $(LOADLIBES) $(LDLIBS) -o $@"],
     ));
 
     // Yacc: %.c: %.y

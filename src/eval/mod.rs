@@ -1759,6 +1759,15 @@ impl MakeState {
                     SpecialTarget::NotParallel => {
                         self.db.not_parallel = true;
                     }
+                    SpecialTarget::DeleteOnError => {
+                        // .DELETE_ON_ERROR: causes make to delete the target file on error.
+                        // Simply record that this special target was seen.
+                        self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                    }
+                    SpecialTarget::LowResolutionTime => {
+                        // Record that .LOW_RESOLUTION_TIME was seen.
+                        self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                    }
                     _ => {}
                 }
                 continue;
@@ -1795,6 +1804,45 @@ impl MakeState {
                     self.db.explicitly_mentioned.insert(prereq.clone());
                 }
             }
+
+            // GNU Make: a user pattern rule with no recipe cancels the matching
+            // built-in implicit rules for that pattern.  A builtin is cancelled
+            // when it has the same target-pattern set AND the same prerequisite-pattern
+            // set as the user's no-recipe rule.
+            // E.g., `%.o: %.f` with no recipe removes the builtin `%.o: %.f` rule,
+            // but does NOT remove `%.o: %.c` or `%.o: %.s`.
+            if rule.recipe.is_empty() {
+                let cancel_targets: std::collections::HashSet<String> =
+                    rule.targets.iter().cloned().collect();
+                let cancel_prereqs: std::collections::HashSet<String> =
+                    rule.prerequisites.iter().cloned().collect();
+                let mut i = 0;
+                while i < self.db.builtin_pattern_rules_count
+                    && i < self.db.pattern_rules.len()
+                {
+                    // Cancel if both target patterns AND prereq patterns match exactly.
+                    let same_targets = self.db.pattern_rules[i].targets.iter()
+                        .all(|t| cancel_targets.contains(t))
+                        && self.db.pattern_rules[i].targets.len() == cancel_targets.len();
+                    let same_prereqs = self.db.pattern_rules[i].prerequisites.iter()
+                        .all(|p| cancel_prereqs.contains(p))
+                        && self.db.pattern_rules[i].prerequisites.len() == cancel_prereqs.len();
+                    let remove = same_targets && same_prereqs;
+                    if remove {
+                        self.db.pattern_rules.remove(i);
+                        self.db.builtin_pattern_rules_count -= 1;
+                        // don't increment i; the next element shifts into position i
+                    } else {
+                        i += 1;
+                    }
+                }
+                // A cancellation-only rule (no recipe AND no prereqs) is done.
+                // A rule with no recipe BUT with prereqs is added as-is (provides prereqs).
+                if rule.prerequisites.is_empty() && rule.order_only_prerequisites.is_empty() {
+                    return;
+                }
+            }
+
             // A double-colon pattern rule (%:: ...) is "terminal" in GNU Make:
             // it can be used directly (pass 1) but cannot be used for chaining
             // intermediates (pass 2). Set is_terminal accordingly.

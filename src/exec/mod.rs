@@ -2249,8 +2249,26 @@ impl<'a> Executor<'a> {
     fn effective_mtime(&self, target: &str, depth: usize) -> Option<SystemTime> {
         // Prevent infinite recursion
         if depth > 10 { return None; }
-        // If target exists, use its actual mtime
+        // If target exists, use its actual mtime — but check if what-if or rule prereqs
+        // would cause a rebuild; if so, treat this target as infinitely new.
         if let Some(t) = get_mtime(target).or_else(|| self.find_in_vpath(target).and_then(|f| get_mtime(&f))) {
+            // Check explicit rules for this target
+            if let Some(rules) = self.db.rules.get(target) {
+                for rule in rules {
+                    for prereq in &rule.prerequisites {
+                        // If a prereq is what-if, target would be rebuilt → infinitely new
+                        if self.what_if.iter().any(|w| w == prereq) {
+                            return Some(SystemTime::now());
+                        }
+                        // If a prereq's effective mtime is newer than target, target would rebuild
+                        if let Some(pt) = self.effective_mtime(prereq, depth + 1) {
+                            if pt > t {
+                                return Some(SystemTime::now());
+                            }
+                        }
+                    }
+                }
+            }
             return Some(t);
         }
         // Target doesn't exist. If phony, treat as always new (infinite mtime).
@@ -2727,8 +2745,9 @@ impl<'a> Executor<'a> {
                 // all sub-lines.  This handles `@$(MULTI)` where MULTI has multiple lines.
                 let force = force_sub || outer_force;
 
-                // With --trace, the @ prefix does NOT suppress echoing (trace overrides @).
-                let at_silent = if self.trace { false } else { line_silent || outer_silent };
+                // With --trace or --dry-run (-n), the @ prefix does NOT suppress echoing.
+                // GNU Make prints all commands in -n mode regardless of @.
+                let at_silent = if self.trace || self.dry_run { false } else { line_silent || outer_silent };
                 let effective_silent = at_silent || self.silent || is_silent_target;
                 let effective_ignore = ignore_error || outer_ignore || self.ignore_errors;
 
