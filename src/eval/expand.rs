@@ -156,7 +156,10 @@ impl MakeState {
 
         // Variable reference with possible D/F modifier
         // $(@D), $(@F), etc.
-        if content.len() >= 2 {
+        // Only attempt if the last byte is ASCII (D/F are single ASCII chars;
+        // multi-byte UTF-8 continuation bytes have the high bit set, so this
+        // check is both necessary and sufficient to avoid invalid slice indices).
+        if content.len() >= 2 && content.as_bytes()[content.len()-1].is_ascii() {
             let first = &content[..content.len()-1];
             let modifier = &content[content.len()-1..];
             if (modifier == "D" || modifier == "F") && first.len() == 1 {
@@ -415,8 +418,7 @@ impl MakeState {
                                     (self.current_file.borrow().clone(), *self.current_line.borrow())
                                 }
                             };
-                            let progname = crate::eval::make_progname();
-                            eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
+                            eprintln!("{}:{}: *** prerequisites cannot be defined in recipes.  Stop.", file_str, line_num);
                             std::process::exit(2);
                         }
                     }

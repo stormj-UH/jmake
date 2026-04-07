@@ -316,6 +316,13 @@ impl MakeState {
     pub fn run(&mut self) -> Result<(), String> {
         self.init_variables();
 
+        // Print version banner when any debug output is requested (-d or --debug).
+        // GNU Make always prints its version string at the start of debug output.
+        let debug_active = self.args.debug_short || !self.args.debug.is_empty();
+        if debug_active {
+            println!("GNU Make 4.4.1");
+        }
+
         if !self.args.no_builtin_rules && !self.args.no_builtin_variables {
             implicit_rules::register_default_variables(&mut self.db);
         }
