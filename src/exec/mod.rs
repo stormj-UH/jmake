@@ -473,15 +473,32 @@ impl<'a> Executor<'a> {
         // accounts for deleted intermediates) are newer than the target, skip rebuilding.
         // This handles the case where intermediate files were deleted after a previous build:
         // they should not cause an unnecessary rebuild if their sources are still old.
-        // Only applicable for non-phony targets with no SE prereqs and no always-make,
-        // and only when we already have a recipe (otherwise a pattern rule may contribute
-        // additional prerequisites that we haven't examined yet).
-        if !is_phony && !self.always_make && !recipe.is_empty()
+        // Only applicable for non-phony targets with no SE prereqs and no always-make.
+        //
+        // When the recipe is empty (no recipe from explicit rules), we also peek at the
+        // pattern rule's prerequisites to include them in the check, so that
+        // .NOTINTERMEDIATE pattern-rule prereqs correctly trigger a rebuild.
+        if !is_phony && !self.always_make
             && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
             if let Some(target_time) = get_mtime(target).or_else(|| {
                 self.find_in_vpath(target).and_then(|f| get_mtime(&f))
             }) {
-                let any_prereq_newer = all_prereqs.iter().any(|p| {
+                // Start with the explicitly-collected prereqs.
+                let mut check_prereqs: Vec<String> = all_prereqs.clone();
+
+                // If there is no recipe from explicit rules yet, peek at the pattern rule
+                // to include its prereqs in the check (read-only, no building).
+                if recipe.is_empty() {
+                    if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
+                        for p in &pat_rule.prerequisites {
+                            if p != ".WAIT" {
+                                check_prereqs.push(p.replace('%', &stem));
+                            }
+                        }
+                    }
+                }
+
+                let any_prereq_newer = check_prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
                     if self.what_if.iter().any(|w| w == p) { return true; }
                     if self.db.is_phony(p) { return true; }
@@ -1751,11 +1768,15 @@ impl<'a> Executor<'a> {
         // to prerequisites (GNU Make private semantics: only blocks THIS target's override).
         let pre_step2_snap: HashMap<String, (String, bool)> = staging_idx.iter()
             .map(|(name, &i)| {
-                let (_, val, is_expanded, is_override, _) = &staging[i];
+                let (_, val, _is_expanded, is_override, _) = &staging[i];
                 // For snapshot we just want to know the key existed and its is_override
                 (name.clone(), (val.clone(), *is_override))
             })
             .collect();
+        // Also record which vars are private at the END of step 1. Pattern-specific private
+        // vars should NOT pass through their values to prerequisites (they are private at step 1).
+        // Only TARGET-specific private vars (introduced in step 2) should use the pre-step-2 passthrough.
+        let step1_private_flags: HashSet<String> = private_flags.clone();
 
         // 2. Apply target-specific variables (they override pattern-specific).
         if let Some(rules) = self.db.rules.get(target) {
@@ -1910,19 +1931,26 @@ impl<'a> Executor<'a> {
             result.insert(name.clone(), (val, *is_override, is_priv));
         }
 
-        // Build for_prereqs: like result, but for private vars that overrode an existing
-        // inherited/pattern value, use the pre-step-2 (inherited/pattern) value instead.
-        // Private vars that were NEW in step 2 (no pre-step-2 entry) are omitted entirely.
+        // Build for_prereqs: like result, but for private vars that were introduced/overridden
+        // in STEP 2 (target-specific), use the pre-step-2 (inherited/pattern) value instead.
+        // Pattern-specific private vars (set in step 1) should NOT pass through at all.
+        // Target-specific private vars (set in step 2) that override an existing value should
+        // let the pre-override value pass through to prerequisites.
         let mut for_prereqs: HashMap<String, (String, bool, bool)> = HashMap::new();
         for (name, (val, is_override, is_priv)) in &result {
             if *is_priv {
-                // This var was made private by this target's own assignment.
-                // For prereqs, use the pre-step-2 value if it existed.
-                if let Some((pre_val, pre_is_override)) = pre_step2_snap.get(name) {
-                    // Carry through the pre-override value, marking it as non-private.
-                    for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false));
+                if step1_private_flags.contains(name.as_str()) {
+                    // Private at step 1 (pattern-specific) → don't include in for_prereqs at all.
+                    // The pattern-specific private variable should not propagate.
+                } else {
+                    // Private at step 2 (target-specific, not step 1).
+                    // For prereqs, use the pre-step-2 value if it existed.
+                    if let Some((pre_val, pre_is_override)) = pre_step2_snap.get(name) {
+                        // Carry through the pre-override value, marking it as non-private.
+                        for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false));
+                    }
+                    // If no pre-step-2 entry: don't include in for_prereqs (new private var).
                 }
-                // If no pre-step-2 entry: don't include in for_prereqs at all.
             } else {
                 for_prereqs.insert(name.clone(), (val.clone(), *is_override, false));
             }
@@ -2238,9 +2266,10 @@ impl<'a> Executor<'a> {
             // Execute all recipe lines as one shell script.
             // In .ONESHELL mode:
             //   - ALL recipe lines are joined and passed to a single shell invocation.
-            //   - Prefix chars (@, -, +) are stripped ONLY from the FIRST recipe line.
-            //     Inner lines keep their content as-is (they are interpreter script body).
-            //   - Echo behaviour is controlled by the FIRST recipe line's prefix only.
+            //   - Prefix chars (@, -, +) are stripped from ALL recipe lines when building
+            //     the script (so they don't appear as invalid shell commands).
+            //   - Echo behaviour and error-ignore are controlled by the FIRST recipe
+            //     line's prefix only; inner-line prefix chars don't affect behavior.
             //   - The last recipe lineno is used for error messages.
 
             let mut script = String::new();
@@ -2258,18 +2287,16 @@ impl<'a> Executor<'a> {
                 // Pre-process: collapse \<newline> inside $(…)/${…} references
                 let preprocessed = preprocess_recipe_bsnl(line);
                 let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                // Strip @-+ prefixes from ALL lines for the script.
+                // First line: also record behavioral flags (silent, ignore errors).
                 if is_first {
-                    // First line: strip @-+ prefixes and record their effect.
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
-                    let cmd_line = strip_recipe_prefixes(&expanded);
-                    script.push_str(&cmd_line);
                     is_first = false;
-                } else {
-                    // Inner lines: keep content as-is (they are interpreter script body).
-                    script.push_str(&expanded);
                 }
+                let cmd_line = strip_recipe_prefixes(&expanded);
+                script.push_str(&cmd_line);
                 script.push('\n');
             }
 
@@ -2277,17 +2304,11 @@ impl<'a> Executor<'a> {
             let effective_ignore = first_line_ignore || self.ignore_errors;
 
             if !effective_silent {
-                // Echo lines; first line with @-+ stripped, inner lines as-is.
-                let mut echo_first = true;
+                // Echo lines with @-+ prefixes stripped from ALL lines.
                 for (_lineno, line) in recipe {
                     let preprocessed = preprocess_recipe_bsnl(line);
                     let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                    let display = if echo_first {
-                        echo_first = false;
-                        strip_recipe_prefixes(&expanded)
-                    } else {
-                        expanded.clone()
-                    };
+                    let display = strip_recipe_prefixes(&expanded);
                     if !display.trim().is_empty() {
                         println!("{}", display.trim_end());
                     }
