@@ -1,2 +1,0 @@
-.SECONDEXPANSION:
-%x: $$(info $$*); @echo '$*'
