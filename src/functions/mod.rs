@@ -666,15 +666,24 @@ pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
 }
 
 /// Process shell output per GNU Make rules:
-/// 1. Strip trailing newlines from the raw output.
-/// 2. Replace remaining (internal) newlines with spaces.
+/// 1. Strip exactly one trailing newline (if the output ends with one).
+/// 2. Replace all remaining newlines with spaces.
 /// Trailing non-newline whitespace (e.g. a trailing space) is preserved.
+/// This matches GNU Make's collapse_continuations / shell output behavior.
 fn process_shell_output(raw: &str) -> String {
-    // Strip trailing newlines only (not spaces or other whitespace)
-    let stripped = raw.trim_end_matches('\n');
-    // Also handle \r\n line endings: strip trailing \r after removing \n
-    let stripped = stripped.trim_end_matches('\r');
-    // Replace remaining internal newlines (and \r\n) with spaces
+    // Strip exactly one trailing newline (and its preceding \r if present).
+    let stripped = if raw.ends_with('\n') {
+        let without_lf = &raw[..raw.len() - 1];
+        // Handle \r\n: also strip the preceding \r
+        if without_lf.ends_with('\r') {
+            &without_lf[..without_lf.len() - 1]
+        } else {
+            without_lf
+        }
+    } else {
+        raw
+    };
+    // Replace remaining internal newlines (treating \r\n as a single newline) with spaces.
     stripped.replace("\r\n", " ").replace('\n', " ")
 }
 

@@ -4469,7 +4469,20 @@ impl<'a> Executor<'a> {
             // Env vars that were not explicitly overridden by the makefile still need
             // their original value in the environment, but `unexport` should suppress them
             // unless they were explicitly `export`ed.
-            let should_export = !var.is_private && (always_export || match var.export {
+            //
+            // POSIX special case for SHELL: per POSIX, the value of SHELL in the makefile
+            // has no effect on the shell used by subprocesses via the environment.  Only
+            // when SHELL is explicitly `export`ed from the makefile does the shell see the
+            // makefile's value.  Without explicit export, the child process should see the
+            // inherited SHELL from the invoking environment (not the makefile override).
+            // Therefore SHELL is never auto-exported even when it came from the environment,
+            // unless it is explicitly `export`ed (var.export == Some(true)) or the global
+            // export-all (.EXPORT_ALL_VARIABLES) is active.
+            let shell_blocks_auto_export = name == "SHELL"
+                && var.origin != VarOrigin::Environment
+                && var.export != Some(true)
+                && !self.db.export_all;
+            let should_export = !var.is_private && !shell_blocks_auto_export && (always_export || match var.export {
                 Some(true) => true,
                 Some(false) => false,
                 None => {
