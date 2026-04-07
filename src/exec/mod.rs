@@ -105,6 +105,12 @@ pub struct Executor<'a> {
     /// build_with_rules can process them alongside the vpath target's own SE texts.
     /// These are the raw SE texts (same format as Rule::second_expansion_prereqs).
     vpath_extra_se_texts: HashMap<String, Vec<String>>,
+    /// Targets whose SE side effects have already been fired during the implicit-rule
+    /// search phase (via trigger_prereq_se_side_effects).  When build_with_pattern_rule
+    /// encounters a target in this set it skips re-firing the SE expansion, preventing
+    /// duplicate $(info ...) output.  Entries are removed after the skip so that a
+    /// genuine re-build of the same target in a later invocation does fire SE.
+    se_search_fired: HashSet<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -180,6 +186,7 @@ impl<'a> Executor<'a> {
             lib_search_results: HashMap::new(),
             se_explicitly_mentioned: HashSet::new(),
             vpath_extra_se_texts: HashMap::new(),
+            se_search_fired: HashSet::new(),
         }
     }
 
@@ -1543,36 +1550,6 @@ impl<'a> Executor<'a> {
             Vec::new()
         };
         // Build pattern-rule prereqs first (before explicit prereqs).
-        // Apply GNU Make prereq ordering: standalone-explicit (literal, non-pattern prereqs)
-        // come first, then intermediate (pattern-derived) prereqs, then shared-explicit.
-        // This ensures that `%.4: %.1 %.15 a.3` builds `a.3` before `a.1` and `a.15`.
-        // Must be computed before the mutable borrow in the loop below.
-        let pre_pat_prereqs: Vec<String> = if !pre_pat_prereqs.is_empty() && self.shuffle.is_none() {
-            let standalone: Vec<String> = pre_pat_prereqs.iter()
-                .filter(|p| {
-                    self.is_explicitly_mentioned(p)
-                        && !self.prereq_shares_rule_with_intermediate(p, &pre_pat_prereqs)
-                })
-                .cloned()
-                .collect();
-            let intermediates: Vec<String> = pre_pat_prereqs.iter()
-                .filter(|p| !self.is_explicitly_mentioned(p))
-                .cloned()
-                .collect();
-            let shared: Vec<String> = pre_pat_prereqs.iter()
-                .filter(|p| {
-                    self.is_explicitly_mentioned(p)
-                        && self.prereq_shares_rule_with_intermediate(p, &pre_pat_prereqs)
-                })
-                .cloned()
-                .collect();
-            let mut ordered = standalone;
-            ordered.extend(intermediates);
-            ordered.extend(shared);
-            ordered
-        } else {
-            pre_pat_prereqs
-        };
         // When shuffle is active, skip prereqs that are already in all_prereqs
         // (they will be built in the correct shuffled order by step 1 below).
         let mut pre_pat_built: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2745,6 +2722,64 @@ impl<'a> Executor<'a> {
         Ok(any_rebuilt)
     }
 
+    /// sv 62706 ordering: Fire the SE side effects ($(info ...) etc.) for `target`'s
+    /// implicit rule WITHOUT running the recipe.  This simulates the "implicit rule
+    /// search" phase in GNU Make where SE prereqs are expanded as part of the search,
+    /// before the actual build begins.
+    ///
+    /// Specifically: when building `hello.tsk` via `%.tsk: %.o $$(info ...)`, GNU Make
+    /// searches for a rule to satisfy `hello.o` and during that search fires `hello.o`'s
+    /// own SE expansion.  Only after that does it fire `hello.tsk`'s SE expansion during
+    /// the build phase.  This function replicates that behaviour so that:
+    ///
+    ///   1. `hello.o`'s SE side effects fire (e.g. "second expansion of hello.o prereqs")
+    ///   2. `hello.tsk`'s SE side effects fire (e.g. "second expansion of hello.tsk prereqs")
+    ///   3. `hello.o`'s recipe runs ("hello.o")
+    ///   4. `hello.tsk`'s recipe runs ("hello.tsk from hello.o")
+    ///
+    /// After this function marks `target` in `se_search_fired`, the next call to
+    /// `build_with_pattern_rule` for `target` will skip re-firing the SE expansion
+    /// (removing `target` from `se_search_fired` as it goes so that genuinely later
+    /// re-builds still fire SE).
+    fn trigger_prereq_se_side_effects(&mut self, target: &str) {
+        // Only applies when the target has not been built yet.
+        if self.built.contains_key(target) {
+            return;
+        }
+        // Find the pattern rule for target.
+        let pat = self.find_pattern_rule_inner(target, &[]);
+        let (rule, stem) = match pat {
+            Some(x) => x,
+            None => return,
+        };
+        // Only relevant if the rule has SE prereqs.
+        let se_text = match rule.second_expansion_prereqs.clone() {
+            Some(t) => t,
+            None => return,
+        };
+        // Find which pattern target matched (for stem-directory substitution).
+        let matched_pat: String = rule.targets.iter()
+            .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let stem_subst = subst_stem_in_se_text_dir(&se_text, &stem, &matched_pat);
+
+        // Recursively fire SE for non-dollar words in this rule's SE text first.
+        let pre_words = se_extract_non_dollar_words(&stem_subst);
+        for word in pre_words {
+            self.trigger_prereq_se_side_effects(&word);
+        }
+
+        // Now fire the SE expansion for this target for side effects only.
+        // (We discard the results — we only care about $(info ...) / $(shell ...) etc.)
+        let oo_refs: Vec<&str> = Vec::new();
+        let auto_vars = self.make_auto_vars(target, &[], &oo_refs, &stem);
+        self.second_expand_prereqs(&stem_subst, &auto_vars, target);
+
+        // Mark this target so build_with_pattern_rule skips re-firing SE.
+        self.se_search_fired.insert(target.to_string());
+    }
+
     fn build_with_pattern_rule(&mut self, target: &str, rule: &Rule, stem: &str, is_phony: bool) -> Result<bool, String> {
         // Determine which pattern target in the rule matched `target` (needed for
         // GNU Make "stem directory" behaviour in prerequisite substitution).
@@ -3045,12 +3080,18 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // sv 62706 ordering: if this target's SE was already fired during the implicit-rule
+        // search phase (via trigger_prereq_se_side_effects called from a parent target's
+        // pre-build step), skip re-firing it.  Remove from se_search_fired so that a
+        // genuine re-build in a later invocation still fires SE.
+        let se_was_prefired = self.se_search_fired.remove(target);
+
         // Perform second expansion NOW — after building non-SE prereqs — so that
         // $(info ...) and other side effects in SE text fire in the correct order:
         // each target's non-SE prerequisites (and their own SE expansions) are fully
         // processed before the current target's SE side effects appear.
         // This matches GNU Make behavior (sv 62706 ordering test).
-        if has_se {
+        if has_se && !se_was_prefired {
             let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
             let mut base_auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
             base_auto_vars.insert("?".to_string(), String::new());
@@ -3067,36 +3108,24 @@ impl<'a> Executor<'a> {
 
             if let Some(ref text) = rule.second_expansion_prereqs.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
-                // sv 62706 ordering: before running the SE expansion (which fires $(info ...)
-                // and other side effects), pre-build any "non-deferred" words — i.e., top-level
-                // whitespace tokens in the substituted text that contain no '$'.  These come
-                // from prerequisite words that were NOT double-dollar-escaped in the source
-                // (e.g. `%.o` in `%.tsk: %.o $$(info ...)`).  Building them first ensures that
-                // their own SE expansions fire before the current target's SE side-effects.
-                // This matches GNU Make's implicit-rule-search ordering (sv 62706 test 27).
+                // sv 62706 ordering: before running the SE expansion for the current target
+                // (which fires $(info ...) and other side effects), fire the SE side effects
+                // for any "non-deferred" words — top-level tokens in the substituted text
+                // that contain no '$'.  These are prerequisites that were NOT double-dollar-
+                // escaped in the source (e.g. `%.o` in `%.tsk: %.o $$(info ...)`).
+                //
+                // GNU Make fires SE for these prerequisite targets during the IMPLICIT RULE
+                // SEARCH phase (before building), not during the build phase.  We replicate
+                // that by calling trigger_prereq_se_side_effects(), which expands the SE text
+                // for side effects only (without running the recipe) and marks the target in
+                // se_search_fired so that build_with_pattern_rule skips re-firing the SE when
+                // it actually builds the target.
+                //
+                // This gives the correct ordering: prereq SE fires, then current-target SE
+                // fires, then prereq recipe runs, then current-target recipe runs.
                 let pre_prereqs: Vec<String> = se_extract_non_dollar_words(&stem_subst);
-                for pre_prereq in &pre_prereqs {
-                    match self.build_target(pre_prereq) {
-                        Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
-                        Err(e) => {
-                            if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() && !rule.is_compat {
-                                // Missing non-deferred prereq with no rule: treat as out of date
-                                // (same logic as the regular prereq loop above)
-                                any_rebuilt = true;
-                            } else {
-                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
-                                    let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
-                                    format!("{}, needed by '{}'.  Stop.", base, target)
-                                } else {
-                                    e
-                                };
-                                *self.state.current_file.borrow_mut() = saved_file.clone();
-                                *self.state.current_line.borrow_mut() = saved_line;
-                                self.inherited_vars_stack.pop();
-                                return Err(propagated);
-                            }
-                        }
-                    }
+                for pre_prereq in pre_prereqs {
+                    self.trigger_prereq_se_side_effects(&pre_prereq);
                 }
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
                 // Mark SE prereqs as explicitly mentioned on a per-word basis.
@@ -3167,7 +3196,7 @@ impl<'a> Executor<'a> {
             }
 
             // Restore file context after pattern rule SE expansion.
-            *self.state.current_file.borrow_mut() = saved_file;
+            *self.state.current_file.borrow_mut() = saved_file.clone();
             *self.state.current_line.borrow_mut() = saved_line;
 
             // Glob-expand wildcard patterns introduced by SE expansion.
@@ -3175,6 +3204,39 @@ impl<'a> Executor<'a> {
             se_added_oo = Self::glob_expand_prereqs(se_added_oo);
             se_added_prereqs.retain(|p| p != ".WAIT");
             se_added_oo.retain(|p| p != ".WAIT");
+
+            // sv 62706: Validate SE-generated prerequisites BEFORE building any of them.
+            // GNU Make performs SE during its implicit rule SEARCH phase; if any SE-generated
+            // prereq cannot be satisfied, the pattern rule is REJECTED at that point (before
+            // any recipes have run).  jmake performs SE during the BUILD phase, so we must
+            // simulate this by pre-checking all SE prereqs first.
+            //
+            // If every SE prereq is satisfiable (exists, has explicit rule, or has a
+            // pattern rule), proceed to build.  If any SE prereq is NOT satisfiable, return
+            // "No rule to make target '<parent>'" so the caller sees the parent as having no
+            // applicable rule — matching GNU Make's implicit rule rejection behaviour.
+            //
+            // Only apply this to pattern rules (not compat rules) to avoid changing existing
+            // explicit-rule SE behaviour.
+            if !rule.is_compat {
+                for se_prereq in &se_added_prereqs {
+                    let satisfiable = Path::new(se_prereq).exists()
+                        || self.db.rules.contains_key(se_prereq.as_str())
+                        || self.db.is_phony(se_prereq)
+                        || self.find_in_vpath(se_prereq).is_some()
+                        || self.find_pattern_rule_exists(se_prereq)
+                        || self.built.contains_key(se_prereq.as_str());
+                    if !satisfiable {
+                        // SE prereq can't be satisfied: reject the pattern rule.
+                        // Return "No rule to make target '<parent>'" (no "needed by" suffix)
+                        // so that the caller can propagate it correctly.
+                        *self.state.current_file.borrow_mut() = saved_file.clone();
+                        *self.state.current_line.borrow_mut() = saved_line;
+                        self.inherited_vars_stack.pop();
+                        return Err(format!("No rule to make target '{}'.  Stop.", target));
+                    }
+                }
+            }
 
             // Build SE-expanded prerequisites.
             for se_prereq in &se_added_prereqs {
@@ -3424,16 +3486,9 @@ impl<'a> Executor<'a> {
                     // pattern rule make the entire rule invocation "explicit").
                     let any_literal_prereq_explicit = literal_rule_prereqs.iter()
                         .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
-                    // Also check expanded (stem-substituted) prereqs: if any expanded prereq
-                    // is explicitly mentioned, the whole invocation is treated as explicit.
-                    // This handles `%.z %.q: %.x` with `unrelated: hello.x` → hello.x is
-                    // explicitly mentioned → hello.q is not intermediate.
-                    let any_expanded_prereq_explicit = prereqs.iter()
-                        .any(|p| self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p));
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib)
-                        || any_literal_prereq_explicit
-                        || any_expanded_prereq_explicit;
+                        || any_literal_prereq_explicit;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
