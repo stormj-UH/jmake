@@ -153,6 +153,22 @@ impl Parser {
             self.pos += 1;
         }
 
+        // Handle the case where the line still ends with '\' at end-of-file.
+        // For non-recipe, non-inline-recipe lines, a trailing '\' followed by
+        // EOF is treated as a continuation to an empty next line: consume the
+        // backslash and append a single space (matching GNU Make's
+        // collapse_continuations behaviour where backslash-newline at EOF
+        // still triggers the join, just with an empty continuation).
+        if line.ends_with('\\') && !line.starts_with('\t') && !line_has_inline_recipe(&line) {
+            line.pop(); // remove the trailing backslash
+            if !self.posix_mode {
+                let trimmed_len = line.trim_end_matches(|c: char| c == ' ' || c == '\t').len();
+                line.truncate(trimmed_len);
+            }
+            line.push(' ');
+            // No continuation content (EOF acts like empty next line)
+        }
+
         self.lineno = start_lineno;
         Some((line, start_lineno))
     }
@@ -676,7 +692,7 @@ pub fn try_parse_rule(line: &str) -> Option<ParsedLine> {
 
     // Use split_filenames to handle escaped spaces (`\ `) and escaped colons (`\:`)
     let targets: Vec<String> = split_filenames(targets_str);
-    if targets.is_empty() {
+    if targets.is_empty() && !_is_grouped {
         return None;
     }
 

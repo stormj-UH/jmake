@@ -217,6 +217,8 @@ pub enum ParsedLine {
     Empty,
     /// Line that could not be parsed - missing separator error
     MissingSeparator(String), // the hint message (e.g., "did you mean TAB instead of 8 spaces?")
+    /// Invalid syntax in a conditional directive (e.g. `ifeq` with no args or bad args)
+    InvalidConditional,
     LoadDirective(String),
 }
 
@@ -245,6 +247,9 @@ pub struct MakeDatabase {
     pub second_expansion: bool,
     pub one_shell: bool,
     pub export_all: bool,
+    /// `unexport` (with no prerequisites) was seen: the global default is to NOT export
+    /// variables to children, unless they are explicitly `export`ed.
+    pub unexport_all: bool,
     pub posix_mode: bool,
     pub not_parallel: bool,
     pub default_rule: Option<Rule>,
@@ -296,6 +301,7 @@ impl MakeDatabase {
             second_expansion: false,
             one_shell: false,
             export_all: false,
+            unexport_all: false,
             posix_mode: false,
             not_parallel: false,
             env_var_names: HashSet::new(),

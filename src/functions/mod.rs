@@ -468,11 +468,15 @@ pub fn fn_shell_exec_with_status_env(
 
     match c.output() {
         Ok(out) => {
-            // Print any stderr output (e.g. "command not found" errors) prefixed with progname.
+            // Print any stderr output (e.g. "command not found" errors).
+            // GNU Make strips the "sh: " or "/bin/sh: " prefix from the shell's error
+            // messages and replaces it with the make program name.
             if !out.stderr.is_empty() {
                 let stderr_str = String::from_utf8_lossy(&out.stderr);
                 for line in stderr_str.lines() {
-                    eprintln!("{}: {}", progname, line);
+                    // Strip the shell prefix (e.g. "sh: " or "/bin/sh: ")
+                    let msg = strip_shell_prefix(line);
+                    eprintln!("{}: {}", progname, msg);
                 }
             }
             let exit_code = out.status.code().unwrap_or(-1);
@@ -482,6 +486,33 @@ pub fn fn_shell_exec_with_status_env(
         }
         Err(_) => (String::new(), 127),
     }
+}
+
+/// Strip shell error prefix ("sh: " or "/bin/sh: " or similar) from a stderr line.
+fn strip_shell_prefix(line: &str) -> &str {
+    // Common patterns: "sh: cmd: msg", "/bin/sh: cmd: msg", "/bin/sh: line N: cmd: msg"
+    // We strip up to and including the first colon-space that comes from the shell binary name.
+    if let Some(colon_pos) = line.find(": ") {
+        let prefix = &line[..colon_pos];
+        // Check if prefix looks like a shell binary path.
+        let basename = prefix.rsplit('/').next().unwrap_or(prefix);
+        let is_shell = matches!(basename, "sh" | "bash" | "ksh" | "dash" | "zsh" | "ash");
+        if is_shell {
+            let rest = &line[colon_pos + 2..];
+            // Also strip "line N: " prefix if present (e.g., "/bin/sh: line 1: cmd: msg")
+            if let Some(line_prefix) = rest.strip_prefix("line ") {
+                if let Some(end) = line_prefix.find(": ") {
+                    let digits = &line_prefix[..end];
+                    if digits.chars().all(|c| c.is_ascii_digit()) {
+                        // Skip "line N: " (5 + len(digits) + 2)
+                        return &rest[5 + end + 2..];
+                    }
+                }
+            }
+            return rest;
+        }
+    }
+    line
 }
 
 /// Execute a shell command, returning (stdout_processed, exit_code).

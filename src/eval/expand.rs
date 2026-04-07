@@ -442,7 +442,9 @@ impl MakeState {
             }
             "shell" => {
                 let cmd = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
-                let (output, status) = functions::fn_shell_exec_with_status(&cmd);
+                // Execute with the makefile's exported environment so that
+                // $(shell echo $$FOO) sees make-defined FOO, not just the process env.
+                let (output, status) = self.shell_exec_with_env(&cmd);
                 // Store exit code; variable lookup for .SHELLSTATUS checks this field.
                 *self.last_shell_status.borrow_mut() = Some(status);
                 return output;

@@ -85,6 +85,10 @@ pub struct MakeState {
     /// Used to pass --temp-stdin=PATH when re-exec'ing, and deleted on exit.
     /// None if -f- was not used or if re-exec read from --temp-stdin= (already have path in args).
     pub stdin_temp_path: Option<PathBuf>,
+    /// Set of file names whose include-phase recipe ran but produced no file (sv 61226 "imagined").
+    /// During the main build phase, these files are treated as if they were already attempted
+    /// so we don't re-run their recipes and avoid duplicate output.
+    pub include_imagined: HashSet<String>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -150,6 +154,7 @@ impl MakeState {
             entering_directory_printed: false,
             makeoverrides_cleared: false,
             stdin_temp_path: None,
+            include_imagined: HashSet::new(),
         };
 
         // Change directory if requested
@@ -459,6 +464,44 @@ impl MakeState {
         self.build_makeflags_from_args(&self.args.variables)
     }
 
+    /// Execute a shell command with the makefile's exported variable environment.
+    /// Returns (stdout_processed, exit_status).
+    /// This ensures $(shell ...) sees the correct values of exported make variables,
+    /// overriding environment variables that have been redefined in the makefile.
+    pub fn shell_exec_with_env(&self, cmd: &str) -> (String, i32) {
+        let mut extra_env: HashMap<String, String> = HashMap::new();
+        let mut remove_env: Vec<String> = Vec::new();
+        for (name, var) in &self.db.variables {
+            if name == "MAKELEVEL" {
+                continue;
+            }
+            let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
+            let was_from_env = self.db.env_var_names.contains(name.as_str());
+            let should_export = always_export || match var.export {
+                Some(true) => true,
+                Some(false) => false,
+                None => self.db.export_all || was_from_env,
+            };
+            if should_export {
+                let value = self.expand(&var.value);
+                extra_env.insert(name.clone(), value);
+            } else {
+                // Remove from env so the child doesn't see a stale env value.
+                // Only do this for vars that were originally from the environment.
+                if was_from_env {
+                    remove_env.push(name.clone());
+                }
+            }
+        }
+        let progname = self.progname();
+        functions::fn_shell_exec_with_status_env(cmd, &extra_env, &remove_env, &progname)
+    }
+
+    /// Return the program name for error messages.
+    fn progname(&self) -> String {
+        make_progname()
+    }
+
     pub fn build_makeflags_from_args(&self, variables: &[(String, String)]) -> String {
         let mut single_flags = String::new();
         if self.args.always_make { single_flags.push('B'); }
@@ -765,7 +808,7 @@ impl MakeState {
                         VarFlavor::Simple => self.expand(&raw_value),
                         VarFlavor::Shell => {
                             let expanded_cmd = self.expand(&raw_value);
-                            let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
+                            let (result, status) = self.shell_exec_with_env(&expanded_cmd);
                             *self.last_shell_status.borrow_mut() = Some(status);
                             result
                         }
@@ -897,9 +940,11 @@ impl MakeState {
                                     let expanded_target = self.expand(&tgt);
                                     format!("{}: {}{}{}{}", expanded_target, var_prefix, expanded_name, op_str, raw_value)
                                 } else {
-                                    // Preserve outer override/export/private prefixes from the original
-                                    let outer_prefix = extract_var_prefixes(trimmed);
-                                    format!("{}{}{}{}", outer_prefix, expanded_name, op_str, raw_value)
+                                    // Use var_prefix (built from parsed flags) instead of re-extracting
+                                    // from the original line. Re-extracting from the original can produce
+                                    // double prefixes when the variable name is also a keyword (e.g.,
+                                    // `export export = 456` where "export" is both a prefix and the name).
+                                    format!("{}{}{}{}", var_prefix, expanded_name, op_str, raw_value)
                                 }
                             }
                         }
@@ -968,6 +1013,9 @@ impl MakeState {
                             self.register_rule(sib);
                         }
                         self.register_rule(prev);
+                        // Sync parser flags that may have been set by register_rule
+                        // (e.g. posix_mode is set when .POSIX: is registered).
+                        parser.posix_mode = self.db.posix_mode;
                     }
                     static_rule_siblings.clear();
 
@@ -1017,6 +1065,14 @@ impl MakeState {
                         if entry.0 == 0 {
                             entry.0 = lineno;
                         }
+                    }
+
+                    // GNU Make detects .POSIX: upon definition and immediately applies it.
+                    // We must set posix_mode NOW (before the next line is read) so that
+                    // the parser's next_logical_line correctly handles backslash-newlines.
+                    if rule.targets.iter().any(|t| t == ".POSIX") {
+                        self.db.posix_mode = true;
+                        parser.posix_mode = true;
                     }
 
                     parser.in_recipe = true;
@@ -1253,26 +1309,41 @@ impl MakeState {
                         self.db.export_all = true;
                     } else {
                         for name in &names {
-                            if let Some(var) = self.db.variables.get_mut(name) {
-                                var.export = Some(export);
-                            } else {
-                                let mut var = Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::File);
-                                var.export = Some(export);
-                                self.db.variables.insert(name.clone(), var);
+                            // Expand variable references in the name (e.g. `export $(FOO)`)
+                            let expanded_name = self.expand(name);
+                            for n in parser::split_words(&expanded_name) {
+                                if let Some(var) = self.db.variables.get_mut(&n) {
+                                    var.export = Some(export);
+                                } else {
+                                    let mut var = Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::File);
+                                    var.export = Some(export);
+                                    self.db.variables.insert(n, var);
+                                }
                             }
                         }
                     }
                 }
                 ParsedLine::UnExport { names } => {
                     if names.is_empty() {
-                        // unexport all
-                        for (_, var) in self.db.variables.iter_mut() {
-                            var.export = Some(false);
-                        }
+                        // `unexport` with no args: set global unexport-all flag.
+                        // This is the default (don't export) but explicit per-variable
+                        // `export VAR` directives still take precedence.
+                        // We do NOT iterate all variables here to avoid overwriting
+                        // explicit per-variable export flags.
+                        self.db.unexport_all = true;
                     } else {
                         for name in &names {
-                            if let Some(var) = self.db.variables.get_mut(name) {
-                                var.export = Some(false);
+                            // Expand variable references in the name (e.g. `unexport $(FOO)`)
+                            let expanded_name = self.expand(name);
+                            for n in parser::split_words(&expanded_name) {
+                                if let Some(var) = self.db.variables.get_mut(&n) {
+                                    var.export = Some(false);
+                                } else {
+                                    // Create a placeholder to mark as unexported even if not yet defined
+                                    let mut var = Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::File);
+                                    var.export = Some(false);
+                                    self.db.variables.insert(n, var);
+                                }
                             }
                         }
                     }
@@ -1315,6 +1386,11 @@ impl MakeState {
                     // GNU Make allows blank lines between recipe lines; only a
                     // non-empty, non-recipe line (rule, assignment, directive)
                     // should clear in_recipe / current_rule.
+                }
+                ParsedLine::InvalidConditional => {
+                    let fname = parser.filename.to_string_lossy();
+                    eprintln!("{}:{}: *** invalid syntax in conditional.  Stop.", fname, lineno);
+                    std::process::exit(2);
                 }
                 ParsedLine::MissingSeparator(hint) => {
                     let fname = parser.filename.to_string_lossy();
@@ -1376,9 +1452,73 @@ impl MakeState {
 
                 match special {
                     SpecialTarget::Phony | SpecialTarget::Precious |
-                    SpecialTarget::Intermediate | SpecialTarget::Secondary |
-                    SpecialTarget::Silent | SpecialTarget::Ignore |
+                    SpecialTarget::Silent | SpecialTarget::Ignore => {
+                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        set.extend(prereqs);
+                    }
                     SpecialTarget::NotIntermediate => {
+                        // Check for conflicts with .INTERMEDIATE and .SECONDARY
+                        if prereqs.is_empty() {
+                            // .NOTINTERMEDIATE: (all) conflicts with .SECONDARY: (all)
+                            let secondary_set = self.db.special_targets.get(&SpecialTarget::Secondary);
+                            if secondary_set.map_or(false, |s| s.is_empty()) {
+                                eprintln!("{}:{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
+                                    rule.source_file, rule.lineno);
+                                std::process::exit(2);
+                            }
+                        } else {
+                            // Check each prereq for conflict with .INTERMEDIATE or .SECONDARY
+                            for name in &prereqs {
+                                if self.db.special_targets.get(&SpecialTarget::Intermediate)
+                                    .map_or(false, |s| s.contains(name)) {
+                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
+                                        rule.source_file, rule.lineno, name);
+                                    std::process::exit(2);
+                                }
+                                if self.db.special_targets.get(&SpecialTarget::Secondary)
+                                    .map_or(false, |s| s.contains(name)) {
+                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
+                                        rule.source_file, rule.lineno, name);
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
+                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        set.extend(prereqs);
+                    }
+                    SpecialTarget::Intermediate => {
+                        // Check for conflicts with .NOTINTERMEDIATE
+                        for name in &prereqs {
+                            if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
+                                .map_or(false, |s| s.contains(name) || s.is_empty()) {
+                                eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
+                                    rule.source_file, rule.lineno, name);
+                                std::process::exit(2);
+                            }
+                        }
+                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        set.extend(prereqs);
+                    }
+                    SpecialTarget::Secondary => {
+                        if prereqs.is_empty() {
+                            // .SECONDARY: (all) conflicts with .NOTINTERMEDIATE: (all)
+                            let ni_set = self.db.special_targets.get(&SpecialTarget::NotIntermediate);
+                            if ni_set.map_or(false, |s| s.is_empty()) {
+                                eprintln!("{}:{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
+                                    rule.source_file, rule.lineno);
+                                std::process::exit(2);
+                            }
+                        } else {
+                            // Check each prereq for conflict with .NOTINTERMEDIATE
+                            for name in &prereqs {
+                                if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
+                                    .map_or(false, |s| s.contains(name) || s.is_empty()) {
+                                    eprintln!("{}:{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
+                                        rule.source_file, rule.lineno, name);
+                                    std::process::exit(2);
+                                }
+                            }
+                        }
                         let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
                         set.extend(prereqs);
                     }
@@ -1720,7 +1860,7 @@ impl MakeState {
                 // != executes value as shell command; expand Make variable references
                 // first (like := expansion) then pass the result to the shell.
                 let expanded_cmd = self.expand(value);
-                let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
+                let (result, status) = self.shell_exec_with_env(&expanded_cmd);
                 *self.last_shell_status.borrow_mut() = Some(status);
                 let existing = self.db.variables.get(name);
                 if !is_override {
@@ -1957,54 +2097,69 @@ impl MakeState {
     ) -> Result<(), String> {
         for prereq in prerequisites {
             let prereq_path = Path::new(prereq);
-            if prereq_path.exists() {
+
+            if visited.contains(prereq) {
+                // Cycle detected: skip silently
                 continue;
             }
-            if visited.contains(prereq) {
-                // Cycle detected: treat as can't build
-                return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
-                    prereq, include_target));
-            }
-            visited.insert(prereq.clone());
 
             // Only look at explicit rules (not pattern rules) to avoid infinite
             // recursion through implicit rule chains like %: %.o: %.c etc.
             let explicit_rule = self.db.rules.get(prereq).and_then(|rules| {
                 rules.iter().find(|r| {
-                    // Skip double-colon with no prerequisites
                     !(r.is_double_colon && r.prerequisites.is_empty())
-                    // Has something to do (recipe or dependencies)
                     && (!r.recipe.is_empty() || !r.prerequisites.is_empty())
                 })
             }).cloned();
 
-            match explicit_rule {
-                None => {
-                    // No explicit rule and file doesn't exist
-                    return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
-                        prereq, include_target));
+            if !prereq_path.exists() {
+                match explicit_rule {
+                    None => {
+                        if !ignore_missing {
+                            return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
+                                prereq, include_target));
+                        }
+                        continue;
+                    }
+                    Some(rule) => {
+                        visited.insert(prereq.clone());
+                        if !rule.prerequisites.is_empty() {
+                            self.build_include_prerequisites(
+                                &rule.prerequisites.clone(), prereq,
+                                shell, shell_flags, silent, ignore_missing, visited,
+                            )?;
+                        }
+                        if !rule.recipe.is_empty() {
+                            let src = rule.source_file.clone();
+                            self.run_include_recipe(
+                                prereq, &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                            )?;
+                        }
+                    }
                 }
-                Some(rule) => {
-                    // Build this prereq's prerequisites first
-                    if !rule.prerequisites.is_empty() {
-                        self.build_include_prerequisites(
-                            &rule.prerequisites.clone(),
-                            prereq,
-                            shell,
-                            shell_flags,
-                            silent,
-                            ignore_missing,
-                            visited,
-                        )?;
-                    }
-                    // Run the recipe
-                    if !rule.recipe.is_empty() {
-                        let src = rule.source_file.clone();
-                        self.run_include_recipe(
-                            prereq, &rule.recipe.clone(), shell, shell_flags, silent,
-                            &src,
-                        )?;
-                    }
+            } else if let Some(ref rule) = explicit_rule {
+                // File exists: check if it's out of date (any prereq is newer).
+                let prereq_mtime = prereq_path.metadata().ok().and_then(|m| m.modified().ok());
+                // Recursively build this prereq's prerequisites first
+                if !rule.prerequisites.is_empty() {
+                    visited.insert(prereq.clone());
+                    self.build_include_prerequisites(
+                        &rule.prerequisites.clone(), prereq,
+                        shell, shell_flags, silent, ignore_missing, visited,
+                    )?;
+                }
+                // Check if any prereq is now newer than this target
+                let needs_rebuild = rule.prerequisites.iter().any(|p| {
+                    std::fs::metadata(p).ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|pt| prereq_mtime.map(|tt| pt > tt))
+                        .unwrap_or(false)
+                });
+                if needs_rebuild && !rule.recipe.is_empty() {
+                    let src = rule.source_file.clone();
+                    self.run_include_recipe(
+                        prereq, &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                    )?;
                 }
             }
         }
@@ -2126,7 +2281,10 @@ impl MakeState {
                 }
             }
             let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
-            if !silent && !cmd_silent {
+            // Only echo the recipe if not silent and the expansion is non-empty.
+            // When make functions like $(info ...) expand to empty string, don't print
+            // a blank line (the function's side effects already produced output).
+            if !silent && !cmd_silent && !expanded_cmd.is_empty() {
                 println!("{}", expanded_cmd);
             }
             let status = std::process::Command::new(shell)
@@ -2365,7 +2523,8 @@ impl MakeState {
                     // sv 61226: rule with no recipe and no prereqs → "imagined update"
                     // Treat as if file was updated but don't actually create it,
                     // don't re-exec, and don't error. Just silently continue.
-                    // (The file remains "missing" but include treats it as empty)
+                    // Mark as imagined so the main build phase doesn't try to build it.
+                    self.include_imagined.insert(pi.file.clone());
                 }
                 Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, .. }) => {
                     if self.include_recipe_ran.contains(&pi.file) {
@@ -2403,7 +2562,10 @@ impl MakeState {
                                 // Has prerequisites but no recipe: just check if file exists
                                 // (sv 61226: "imagined" if prereqs exist but file doesn't)
                                 // Don't error, don't re-exec - treat as imagined update
-                                // Continue silently
+                                // Mark as imagined so main build phase doesn't try to rebuild.
+                                if !file_path.exists() {
+                                    self.include_imagined.insert(pi.file.clone());
+                                }
                             } else {
                                 // Mark siblings as ran
                                 self.include_recipe_ran.insert(pi.file.clone());
@@ -2426,7 +2588,9 @@ impl MakeState {
                                         } else {
                                             // sv 61226: recipe ran but file not created
                                             // → "imagined update", no error, no re-exec
-                                            // (whether include or -include doesn't matter here)
+                                            // Mark as imagined so the main build phase
+                                            // doesn't re-run the recipe.
+                                            self.include_imagined.insert(pi.file.clone());
                                         }
                                     }
                                     Err(recipe_err) => {

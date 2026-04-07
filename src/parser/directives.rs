@@ -48,18 +48,30 @@ fn find_assignment_op_in(line: &str, op: &str) -> Option<usize> {
 pub fn parse_conditional(line: &str) -> Option<ParsedLine> {
     let trimmed = line.trim();
 
-    if trimmed.starts_with("ifeq ") || trimmed.starts_with("ifeq\t") || trimmed.starts_with("ifeq(") {
+    // Note: ifeq( and ifneq( (without whitespace) are intentionally NOT handled here.
+    // GNU Make requires whitespace after ifeq/ifneq. "ifeq(" falls through to
+    // MissingSeparator("ifeq/ifneq must be followed by whitespace") in parse_line.
+    if trimmed.starts_with("ifeq ") || trimmed.starts_with("ifeq\t") {
         let rest = trimmed.strip_prefix("ifeq").unwrap().trim();
         if let Some((a, b)) = parse_conditional_args(rest) {
             return Some(ParsedLine::Conditional(ConditionalKind::Ifeq(a, b)));
         }
+        // ifeq followed by whitespace but invalid args (e.g., "ifeq blah", "ifeq")
+        return Some(ParsedLine::InvalidConditional);
     }
 
-    if trimmed.starts_with("ifneq ") || trimmed.starts_with("ifneq\t") || trimmed.starts_with("ifneq(") {
+    if trimmed.starts_with("ifneq ") || trimmed.starts_with("ifneq\t") {
         let rest = trimmed.strip_prefix("ifneq").unwrap().trim();
         if let Some((a, b)) = parse_conditional_args(rest) {
             return Some(ParsedLine::Conditional(ConditionalKind::Ifneq(a, b)));
         }
+        // ifneq followed by whitespace but invalid args (e.g., "ifneq blah", "ifneq")
+        return Some(ParsedLine::InvalidConditional);
+    }
+
+    // Bare "ifeq" or "ifneq" with no following text: invalid syntax in conditional
+    if trimmed == "ifeq" || trimmed == "ifneq" {
+        return Some(ParsedLine::InvalidConditional);
     }
 
     if trimmed.starts_with("ifdef ") || trimmed.starts_with("ifdef\t") {
@@ -276,8 +288,8 @@ pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
                 value: var_value,
                 flavor,
                 is_override: false,
-                is_export: true,
-                is_unexport: false,
+                is_export: is_export,
+                is_unexport: !is_export,
                 is_private: false,
                 target: None,
             };

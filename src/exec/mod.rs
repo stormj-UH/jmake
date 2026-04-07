@@ -125,7 +125,9 @@ impl<'a> Executor<'a> {
                     if !rebuilt && !self.silent && !self.question
                         && (!self.any_recipe_ran || is_grouped_covered)
                     {
-                        let has_recipe = self.target_has_recipe(target);
+                        // Grouped-covered siblings always get "Nothing to be done" since
+                        // they were covered by the group recipe, not individually built.
+                        let has_recipe = !is_grouped_covered && self.target_has_recipe(target);
                         if has_recipe {
                             println!("{}: '{}' is up to date.", self.progname, target);
                         } else {
@@ -208,6 +210,14 @@ impl<'a> Executor<'a> {
         // Already built?
         if let Some(&rebuilt) = self.built.get(target) {
             return Ok(rebuilt);
+        }
+
+        // If this target was "imagined" as updated during the include phase (sv 61226),
+        // treat it as if it was already built (not actually rebuilt = no file created).
+        // This prevents re-running the recipe that already ran during include processing.
+        if self.state.include_imagined.contains(target) {
+            self.built.insert(target.to_string(), false);
+            return Ok(false);
         }
 
         // Cycle detection
@@ -475,7 +485,12 @@ impl<'a> Executor<'a> {
                     // Use effective_mtime to handle deleted intermediates
                     match self.effective_mtime(p, 0) {
                         Some(pt) => pt > target_time,
-                        None => false, // Can't determine mtime → assume not newer
+                        None => {
+                            // File doesn't exist and has no known sources to determine mtime.
+                            // For .NOTINTERMEDIATE files: they must be built (not skipped),
+                            // so treat as "needs rebuild" to force the build to proceed.
+                            self.db.is_notintermediate(p)
+                        }
                     }
                 });
                 if !any_prereq_newer {
@@ -1977,8 +1992,9 @@ impl<'a> Executor<'a> {
                     } else if self.db.is_phony(prereq) {
                         return true; // Phony prereqs always trigger rebuild
                     } else {
-                        // Secondary files that don't exist don't trigger rebuilds
-                        if self.db.is_secondary(prereq) {
+                        // Secondary files that don't exist don't trigger rebuilds,
+                        // UNLESS they are also marked .NOTINTERMEDIATE (which overrides).
+                        if self.db.is_secondary(prereq) && !self.db.is_notintermediate(prereq) {
                             continue;
                         }
                         // A prereq that was visited (has a rule, even an empty one) but
@@ -2455,11 +2471,28 @@ impl<'a> Executor<'a> {
             // re-exported to children (possibly with an overridden value from the
             // Makefile), unless explicitly unexported.
             let was_from_env = self.db.env_var_names.contains(name.as_str());
-            let should_export = always_export || match var.export {
+            // Private global variables are NOT exported to recipe shells.
+            // (They may still be exported to top-level $(shell) calls via shell_exec_with_env.)
+            // When `unexport` (all) was seen, the default changes: don't export unless
+            // explicitly marked as exported (Some(true)) or always-export (MAKEFLAGS etc).
+            // Env vars that were not explicitly overridden by the makefile still need
+            // their original value in the environment, but `unexport` should suppress them
+            // unless they were explicitly `export`ed.
+            let should_export = !var.is_private && (always_export || match var.export {
                 Some(true) => true,
                 Some(false) => false,
-                None => self.db.export_all || was_from_env,
-            };
+                None => {
+                    if self.db.unexport_all {
+                        // Global unexport: only export if var originated from env AND
+                        // was not changed by the makefile (still Environment origin).
+                        // If the makefile explicitly set the var, it must have been
+                        // explicitly `export`ed to be exported.
+                        was_from_env && var.origin == VarOrigin::Environment
+                    } else {
+                        self.db.export_all || was_from_env
+                    }
+                }
+            });
             if should_export {
                 let value = self.state.expand(&var.value);
                 cmd.env(name, &value);
@@ -2467,6 +2500,7 @@ impl<'a> Executor<'a> {
                 // Ensure the child does not see this variable from the inherited
                 // environment. This covers:
                 // - explicitly unexported variables (export = Some(false))
+                // - private global variables (not inherited by recipes)
                 // - file-defined variables that shadow an env var but aren't exported
                 // - make-internal default variables that should not leak to children
                 cmd.env_remove(name);
@@ -2500,10 +2534,28 @@ impl<'a> Executor<'a> {
                 return true;
             }
             let was_from_env = self.db.env_var_names.contains(var_name);
-            match self.db.variables.get(var_name).map(|v| v.export) {
-                Some(Some(true)) => true,
-                Some(Some(false)) => false,
-                _ => self.db.export_all || was_from_env,
+            if let Some(gvar) = self.db.variables.get(var_name) {
+                // Private global variables are not exported to child recipe shells.
+                if gvar.is_private {
+                    return false;
+                }
+                match gvar.export {
+                    Some(true) => true,
+                    Some(false) => false,
+                    None => {
+                        if self.db.unexport_all {
+                            was_from_env && gvar.origin == VarOrigin::Environment
+                        } else {
+                            self.db.export_all || was_from_env
+                        }
+                    }
+                }
+            } else {
+                if self.db.unexport_all {
+                    false
+                } else {
+                    self.db.export_all || was_from_env
+                }
             }
         };
 
