@@ -339,14 +339,6 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // If this target is being built as a prerequisite (not a top-level target)
-        // and its name looks like a header file, silently treat the parent as out of date.
-        // This matches GNU Make behavior with auto-generated dependency files that
-        // reference system headers that may not exist as files.
-        if target.ends_with(".h") || target.ends_with(".inc") || target.ends_with(".tbl") {
-            return Ok(true); // Treat parent as needing rebuild
-        }
-
         Err(format!("No rule to make target '{}'.  Stop.", target))
     }
 
