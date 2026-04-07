@@ -203,6 +203,20 @@ impl MakeState {
             self.args.targets.clone()
         };
 
+        // GNU Make: -R (--no-builtin-variables) implies -r (--no-builtin-rules).
+        // Apply this implication after all makefiles are read (so it doesn't affect
+        // parse-time $(info $(MAKEFLAGS)) calls) but before building targets (so it
+        // does affect recipe-time $(info $(MAKEFLAGS))).
+        if self.args.no_builtin_variables && !self.args.no_builtin_rules {
+            self.args.no_builtin_rules = true;
+            // Rebuild MAKEFLAGS so the recipe-level $(info $(MAKEFLAGS)) includes 'r'.
+            let new_makeflags = self.build_makeflags();
+            if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
+                var.value = new_makeflags.clone();
+            }
+            env::set_var("MAKEFLAGS", &new_makeflags);
+        }
+
         // Print database and exit if -p
         if self.args.print_data_base {
             self.print_database();
@@ -1535,8 +1549,10 @@ impl MakeState {
                 });
             }
             VarFlavor::Shell => {
-                // != executes value as shell command; also sets .SHELLSTATUS
-                let (result, status) = functions::fn_shell_exec_with_status(value);
+                // != executes value as shell command; expand Make variable references
+                // first (like := expansion) then pass the result to the shell.
+                let expanded_cmd = self.expand(value);
+                let (result, status) = functions::fn_shell_exec_with_status(&expanded_cmd);
                 *self.last_shell_status.borrow_mut() = status;
                 let existing = self.db.variables.get(name);
                 if !is_override {
