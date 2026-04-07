@@ -424,7 +424,7 @@ pub struct ParallelScheduler {
 impl ParallelScheduler {
     pub fn new(
         max_jobs: usize,
-        plans: HashMap<String, TargetPlan>,
+        mut plans: HashMap<String, TargetPlan>,
         job_tx: mpsc::Sender<Job>,
         result_rx: mpsc::Receiver<JobResult>,
         keep_going: bool,
@@ -450,6 +450,131 @@ impl ParallelScheduler {
                     .push(name.clone());
             }
             prereqs_of.insert(name.clone(), deps);
+        }
+
+        // ---------------------------------------------------------------------------
+        // .WAIT group processing: inject virtual barrier nodes to enforce ordering.
+        //
+        // For a target with `wait_groups = [[A, B], [C, D], [E]]`:
+        //   • Create barrier `target##wait##0` with prereqs [A, B] (completes when A+B done)
+        //   • Create barrier `target##wait##1` with prereqs [C, D, target##wait##0]
+        //   • Add `target##wait##0` to prereqs_of[C] and prereqs_of[D] (they must wait)
+        //   • Add `target##wait##1` to prereqs_of[E]
+        //
+        // Safety: only inject the barrier into T's prereqs_of if T does NOT appear as a
+        // non-waited (group 0 or no-wait-groups) prerequisite in any OTHER plan.  This
+        // prevents deadlocks when the same target is shared between a parent that has .WAIT
+        // and another parent that doesn't (per-target .WAIT semantics).
+        // ---------------------------------------------------------------------------
+
+        // Collect all targets that appear as "unguarded" prerequisites (first group or
+        // plans with no wait_groups).  These targets can be dispatched before any barrier.
+        let mut globally_unguarded: HashSet<String> = HashSet::new();
+        for (_name, plan) in &plans {
+            if plan.wait_groups.is_empty() {
+                for p in &plan.prerequisites {
+                    globally_unguarded.insert(p.clone());
+                }
+            } else if let Some(first_group) = plan.wait_groups.first() {
+                for p in first_group {
+                    globally_unguarded.insert(p.clone());
+                }
+            }
+        }
+
+        // Build barrier plans and extra prereq edges.
+        let mut barrier_plans: HashMap<String, TargetPlan> = HashMap::new();
+        // Extra entries to add to prereqs_of after iteration (can't borrow+mutate).
+        let mut extra_prereqs: Vec<(String, String)> = Vec::new(); // (target, barrier_dep)
+        let mut extra_dependents: Vec<(String, String)> = Vec::new(); // (dep, dependent)
+
+        for (name, plan) in &plans {
+            if plan.wait_groups.len() < 2 {
+                continue;
+            }
+            let mut last_barrier: Option<String> = None;
+            for (gi, group) in plan.wait_groups.iter().enumerate() {
+                // The last group needs no barrier after it.
+                if gi + 1 >= plan.wait_groups.len() {
+                    break;
+                }
+                let barrier_name = format!("{}##wait##{}", name, gi);
+
+                // Barrier prerequisites: targets in the current group that are known.
+                let mut barrier_prereqs: Vec<String> = group.iter()
+                    .filter(|t| plans.contains_key(t.as_str()))
+                    .cloned()
+                    .collect();
+                // Chain: also depend on the previous barrier so groups are strictly ordered.
+                if let Some(ref prev) = last_barrier {
+                    if !barrier_prereqs.contains(prev) {
+                        barrier_prereqs.push(prev.clone());
+                    }
+                }
+
+                // Register prereqs_of for the barrier node.
+                prereqs_of.insert(barrier_name.clone(), barrier_prereqs.clone());
+                for dep in &barrier_prereqs {
+                    dependents_of
+                        .entry(dep.clone())
+                        .or_default()
+                        .push(barrier_name.clone());
+                }
+
+                // For each target in the NEXT group, inject the barrier as a prerequisite
+                // UNLESS the target is "globally unguarded" (appears without a wait guard
+                // in another plan — injecting would risk deadlock).
+                let next_group = &plan.wait_groups[gi + 1];
+                for after_target in next_group {
+                    if globally_unguarded.contains(after_target.as_str()) {
+                        // Skip: target is unguarded elsewhere — don't impose barrier.
+                        continue;
+                    }
+                    if plans.contains_key(after_target.as_str()) {
+                        extra_prereqs.push((after_target.clone(), barrier_name.clone()));
+                        extra_dependents.push((barrier_name.clone(), after_target.clone()));
+                    }
+                }
+
+                // Create the virtual barrier plan (empty recipe, completes immediately).
+                barrier_plans.insert(barrier_name.clone(), TargetPlan {
+                    target: barrier_name.clone(),
+                    prerequisites: barrier_prereqs,
+                    order_only: Vec::new(),
+                    recipe: Vec::new(),
+                    source_file: String::new(),
+                    auto_vars: HashMap::new(),
+                    is_phony: false,
+                    needs_rebuild: true,
+                    grouped_primary: None,
+                    grouped_siblings: Vec::new(),
+                    extra_exports: HashMap::new(),
+                    extra_unexports: Vec::new(),
+                    is_intermediate: false,
+                    wait_groups: Vec::new(),
+                });
+
+                last_barrier = Some(barrier_name);
+            }
+        }
+
+        // Apply extra prereqs/dependents edges.
+        for (target, barrier_dep) in extra_prereqs {
+            let entry = prereqs_of.entry(target).or_default();
+            if !entry.contains(&barrier_dep) {
+                entry.push(barrier_dep);
+            }
+        }
+        for (dep, dependent) in extra_dependents {
+            let entry = dependents_of.entry(dep).or_default();
+            if !entry.contains(&dependent) {
+                entry.push(dependent);
+            }
+        }
+
+        // Merge barrier plans into the main plans map.
+        for (k, v) in barrier_plans {
+            plans.insert(k, v);
         }
 
         // Initialize states based on needs_rebuild and prereq availability.
