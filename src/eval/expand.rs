@@ -468,28 +468,34 @@ impl MakeState {
                     } else {
                         expanded
                     };
-                    // GNU Make executes $(eval ...) immediately during expansion.
-                    // We use an unsafe raw pointer to call eval_string() with &mut self,
-                    // bypassing the borrow checker.  This is safe here because:
-                    //  - eval_string() only inserts/modifies entries in self.db.variables
-                    //    (via IndexMap); it does NOT remove entries nor reallocate while
-                    //    we hold a live &-reference into the map.
-                    //  - The value string we are currently expanding was cloned before
-                    //    calling expand_with_auto_vars(), so we hold no live reference
-                    //    into self.db.variables at this point.
-                    // SAFETY: we have exclusive logical access to self at this call site;
-                    // no other thread is mutating self, and no live &-borrows into
-                    // self.db.variables exist from the caller's stack frame.
-                    // We call through a raw pointer (not &mut Self ref) to avoid the
-                    // UB lint for &T → &mut T casts.
-                    let result = unsafe {
-                        let self_ptr: *mut Self = self as *const Self as *mut Self;
-                        (*self_ptr).eval_string(&final_content)
-                    };
-                    if let Err(e) = result {
-                        if !e.is_empty() {
-                            eprintln!("{}", e);
+                    // When inside a $(foreach)/$(call)/$(let) context (auto_vars is non-empty),
+                    // execute eval IMMEDIATELY so that variable changes (e.g. `$(eval res:=...)`)
+                    // are visible to subsequent loop iterations.
+                    // When at the top level (auto_vars is empty), defer via eval_pending so
+                    // that any current_rule pending in the outer process_parsed_lines loop is
+                    // registered BEFORE the eval'd rules (preserving definition order for
+                    // double-colon rules like `all:: ; @echo it` followed by `$(eval all:: ; @echo worked)`).
+                    if !auto_vars.is_empty() {
+                        // Inside call/foreach/let: execute immediately.
+                        // SAFETY: eval_string only inserts/modifies entries in self.db.variables
+                        // (via IndexMap); it does NOT remove entries nor reallocate while we hold
+                        // a live &-reference into the map. We have exclusive logical access to self
+                        // at this call site; no other thread is mutating self, and no live
+                        // &-borrows into self.db.variables exist from the caller's stack frame.
+                        let result = unsafe {
+                            let self_ptr: *mut Self = self as *const Self as *mut Self;
+                            (*self_ptr).eval_string(&final_content)
+                        };
+                        if let Err(e) = result {
+                            if !e.is_empty() {
+                                eprintln!("{}", e);
+                            }
                         }
+                    } else {
+                        // Top-level (no call/foreach context): defer to eval_pending.
+                        // This ensures the outer process_parsed_lines loop can flush
+                        // current_rule BEFORE processing the eval'd content.
+                        self.eval_pending.borrow_mut().push(final_content);
                     }
                 }
                 return String::new();

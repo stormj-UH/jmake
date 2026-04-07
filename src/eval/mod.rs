@@ -1691,8 +1691,12 @@ impl MakeState {
                     static_rule_siblings.clear();
 
                     for path_pattern in &paths {
-                        let expanded = self.expand(path_pattern);
-                        let files: Vec<String> = parser::split_words(&expanded);
+                        // The path_pattern was already expanded by the pre-expansion step
+                        // (the include line went through self.expand() before parse_line).
+                        // We must NOT expand again — that would cause double-expansion of
+                        // any `$` signs (e.g. `include foo$$bar` → `include foo$bar` after
+                        // first expansion; re-expanding would turn `$b` → empty, giving `fooar`).
+                        let files: Vec<String> = parser::split_words(path_pattern);
                         for file in files {
                             // Mark included files as explicitly mentioned so they are
                             // not treated as intermediate targets (sv63484).
