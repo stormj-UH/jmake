@@ -1000,6 +1000,18 @@ impl MakeState {
                 if let Some(define_expanded) = try_expand_define_name(&trimmed, self) {
                     define_expanded
                 } else if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
+                    // If the raw-line parse already detected a fatal problem (e.g. a
+                    // whitespace-containing variable name like `x $X=`), emit the error
+                    // immediately without expansion and without going through parse_line again.
+                    if let ParsedLine::MissingSeparator(ref hint) = raw_parsed {
+                        let fname = parser.filename.to_string_lossy();
+                        if hint.is_empty() {
+                            eprintln!("{}:{}: *** missing separator.  Stop.", fname, lineno);
+                        } else {
+                            eprintln!("{}:{}: *** missing separator ({}).  Stop.", fname, lineno, hint);
+                        }
+                        std::process::exit(2);
+                    }
                     if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: raw_is_unexport, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple | VarFlavor::PosixSimple => {

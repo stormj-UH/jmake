@@ -595,8 +595,15 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
 
             // Valid variable name check (no colons or spaces in plain variable names;
             // colons indicate it could be a rule, spaces indicate multiple targets)
-            if name.contains(':') || name.contains(' ') || name.contains('\t') {
+            if name.contains(':') {
                 return None;
+            }
+            if name.contains(' ') || name.contains('\t') {
+                // Name has whitespace but no colon: looks like "x $X=" where $X is a
+                // variable reference that expands to something with a space (or contains
+                // literal space). GNU Make reports "missing separator" for this pattern
+                // at parse time before expansion.
+                return Some(ParsedLine::MissingSeparator(String::new()));
             }
 
             return Some(ParsedLine::VariableAssignment {

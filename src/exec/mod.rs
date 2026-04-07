@@ -2380,18 +2380,33 @@ impl<'a> Executor<'a> {
             return Ok(true);
         }
 
+        // GNU Make pre-expands all recipe lines before executing any of them.
+        // This means $(shell ...) and other make functions in recipe lines are
+        // evaluated before any shell commands from the recipe run.  For example,
+        // if recipe line 2 has $(shell bad-cmd) and recipe line 1 has echo hi,
+        // the error from $(shell bad-cmd) appears BEFORE "hi" is printed.
+        // Pre-expand all recipe lines first.
+        let pre_expanded: Vec<(usize, String, Vec<String>)> = recipe.iter().map(|(lineno, line)| {
+            *self.state.current_file.borrow_mut() = source_file.to_string();
+            *self.state.current_line.borrow_mut() = *lineno;
+            let preprocessed = preprocess_recipe_bsnl(line);
+            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+            let sub_lines = split_recipe_sub_lines(&expanded);
+            (*lineno, line.clone(), sub_lines)
+        }).collect();
+
         // Execute each recipe line separately.
         // Track whether any actual shell commands were executed.
         let mut any_cmd_ran = false;
-        for (lineno, line) in recipe {
-            // Update current_file/current_line so that errors during expansion
-            // (e.g. from $(word ...) or $(wordlist ...)) report the correct location.
+        for (lineno, line, sub_lines) in &pre_expanded {
+            let lineno = *lineno;
+            // Update current_file/current_line for error reporting during execution.
             *self.state.current_file.borrow_mut() = source_file.to_string();
-            *self.state.current_line.borrow_mut() = *lineno;
-            // Pre-process: collapse \<newline> inside $(…)/${…} references
-            // (GNU Make job.c behavior: \<nl> inside variable refs is eaten before expansion).
-            let preprocessed = preprocess_recipe_bsnl(line);
-            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+            *self.state.current_line.borrow_mut() = lineno;
+            // The expanded value is already in sub_lines (pre-expanded above).
+            // We still need the expanded string for prefix-flag extraction.
+            // Reconstruct it from sub_lines.
+            let expanded = sub_lines.join("\n");
 
             // Extract prefix flags (@, -, +) from the ORIGINAL recipe line (before expansion).
             // These flags propagate to ALL sub-lines from the expansion.
@@ -2399,15 +2414,9 @@ impl<'a> Executor<'a> {
             // not just the first one.
             let (_outer_display, outer_silent, outer_ignore, outer_force) = parse_recipe_prefix(line);
 
-            // A recipe line may expand to multiple sub-lines when it contains a
-            // multi-line `define` variable.  Split on bare newlines (not preceded
-            // by a backslash) and treat each sub-line as an independent recipe
-            // command with its own prefix chars.  Backslash-newline sequences
-            // (shell line continuations) must NOT be split: they are passed as a
-            // single command to the shell, which handles the continuation itself.
-            let sub_lines: Vec<String> = split_recipe_sub_lines(&expanded);
-
-            'sub_line_loop: for sub_line in &sub_lines {
+            // sub_lines were already computed during pre-expansion above.
+            // Each sub-line is an independent recipe command.
+            'sub_line_loop: for sub_line in sub_lines {
                 let (display_line, line_silent, ignore_error, force_sub) = parse_recipe_prefix(sub_line);
                 // Outer flags (from the original recipe line before expansion) propagate to
                 // all sub-lines.  This handles `@$(MULTI)` where MULTI has multiple lines.
@@ -2485,7 +2494,7 @@ impl<'a> Executor<'a> {
                 match status {
                     Ok(s) if !s.success() => {
                         let code = s.code().unwrap_or(1);
-                        let loc = make_location(source_file, *lineno);
+                        let loc = make_location(source_file, lineno);
                         if effective_ignore {
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
                         } else {
@@ -2502,10 +2511,10 @@ impl<'a> Executor<'a> {
                     }
                     Err(e) => {
                         if effective_ignore {
-                            let loc = make_location(source_file, *lineno);
+                            let loc = make_location(source_file, lineno);
                             eprintln!("{}: [{}{}] Error: {} (ignored)", self.progname, loc, target, e);
                         } else {
-                            let loc = make_location(source_file, *lineno);
+                            let loc = make_location(source_file, lineno);
                             eprintln!("{}: *** [{}{}] Error: {}", self.progname, loc, target, e);
                             return Err(String::new());
                         }
