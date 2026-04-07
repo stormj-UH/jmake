@@ -415,12 +415,8 @@ impl MakeState {
                                     (self.current_file.borrow().clone(), *self.current_line.borrow())
                                 }
                             };
-                            if file_str.is_empty() {
-                                let progname = crate::eval::make_progname();
-                                eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
-                            } else {
-                                eprintln!("{}:{}: *** prerequisites cannot be defined in recipes.  Stop.", file_str, line_num);
-                            }
+                            let progname = crate::eval::make_progname();
+                            eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
                             std::process::exit(2);
                         }
                     }

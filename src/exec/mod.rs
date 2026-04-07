@@ -237,16 +237,23 @@ impl<'a> Executor<'a> {
                         failed_top_level_targets.push(target.clone());
                         self.errors.push(e);
                     } else {
-                        // Clean up intermediate files even on error
-                        self.delete_intermediate_files();
+                        // Clean up intermediate files even on error.
+                        // Skip during collect_plans dry-run (no files were actually created).
+                        if !self.collect_plans_mode {
+                            self.delete_intermediate_files();
+                        }
                         return Err(e);
                     }
                 }
             }
         }
 
-        // Delete intermediate files that were built during this run
-        self.delete_intermediate_files();
+        // Delete intermediate files that were built during this run.
+        // Skip this during collect_plans dry-run (collect_plans_mode=true) since no
+        // files were actually created and the parallel executor will handle deletion.
+        if !self.collect_plans_mode {
+            self.delete_intermediate_files();
+        }
 
         if !self.errors.is_empty() {
             // Print "Target 'X' not remade because of errors." without "***",
@@ -291,11 +298,6 @@ impl<'a> Executor<'a> {
         // After this call, all TargetPlans are in self.parallel_plans.
         // ------------------------------------------------------------------
         let plans = self.collect_plans(targets)?;
-
-        // DEBUG: print all plans and their prerequisites
-        for (name, plan) in &plans {
-            eprintln!("PLAN[{}]: needs_rebuild={} prereqs={:?} intermediate={}", name, plan.needs_rebuild, plan.prerequisites, plan.is_intermediate);
-        }
 
         // Store plans so build_job_from_plan can look them up.
         self.parallel_plans = Some(plans);
@@ -1235,7 +1237,10 @@ impl<'a> Executor<'a> {
                     }
 
                     // In collect_plans_mode (parallel path), create a plan for this target
-                    // so the BFS can reach the transitive PHONY order-only prereqs and run them.
+                    // so the BFS can reach the transitive PHONY order-only prereqs and run them,
+                    // AND so the dependency chain is preserved for targets that are up-to-date
+                    // but have prerequisites that other targets depend on (e.g. `2.a: 1.c` where
+                    // 2.a is up-to-date but 2.b must still wait for 1.c to be built).
                     if self.collect_plans_mode {
                         // Combine direct order-only prereqs with transitive ones from skipped intermediates.
                         let mut plan_order_only = all_order_only.clone();
@@ -1244,7 +1249,13 @@ impl<'a> Executor<'a> {
                                 plan_order_only.push(p.clone());
                             }
                         }
-                        if !plan_order_only.is_empty() {
+                        // Always create a plan entry (even when target is up-to-date and has no
+                        // order-only prereqs) so that the parallel scheduler correctly tracks this
+                        // target as a dependency that must complete before its dependents run.
+                        // Without this, targets like `2.a: 1.c` (where 2.a is already up-to-date)
+                        // would not appear in the plan, and targets depending on 2.a (e.g. 2.b)
+                        // would start without waiting for 1.c to complete.
+                        if !all_prereqs.is_empty() || !plan_order_only.is_empty() {
                             if let Some(ref mut plans) = self.pending_plans {
                                 if !plans.contains_key(target) {
                                     plans.insert(target.to_string(), parallel::TargetPlan {
@@ -1254,14 +1265,14 @@ impl<'a> Executor<'a> {
                                         recipe: Vec::new(),
                                         source_file: String::new(),
                                         auto_vars: HashMap::new(),
-                                        is_phony: false,
+                                        is_phony,
                                         needs_rebuild: false,
                                         grouped_primary: None,
                                         grouped_siblings: Vec::new(),
                                         extra_exports: HashMap::new(),
                                         extra_unexports: Vec::new(),
                                         is_intermediate: false,
-                                        wait_groups: Vec::new(),
+                                        wait_groups: wait_groups.clone(),
                                     });
                                 }
                             }
@@ -1774,6 +1785,17 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
             let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
+            // If this target is in .NOTPARALLEL: target_list, force sequential prereqs
+            // by putting each prerequisite in its own wait group.
+            let effective_wait_groups = if wait_groups.is_empty()
+                && self.db.not_parallel_targets.contains(target)
+                && all_prereqs.len() > 1
+            {
+                // Each prereq is its own group: [pre1], [pre2], [pre3], ...
+                all_prereqs.iter().map(|p| vec![p.clone()]).collect()
+            } else {
+                wait_groups.clone()
+            };
             let plan = parallel::TargetPlan {
                 target: target.to_string(),
                 prerequisites: all_prereqs.clone(),
@@ -1788,7 +1810,7 @@ impl<'a> Executor<'a> {
                 extra_exports: self.compute_target_exports(target),
                 extra_unexports: self.compute_target_unexports(target).into_iter().collect(),
                 is_intermediate: self.db.is_intermediate(target),
-                wait_groups: wait_groups.clone(),
+                wait_groups: effective_wait_groups,
             };
             if let Some(ref mut plans) = self.pending_plans {
                 plans.insert(target.to_string(), plan);
@@ -1800,13 +1822,13 @@ impl<'a> Executor<'a> {
         }
 
         // Set up automatic variables (extra_prereqs are excluded from auto vars).
-        // Use the original (pre-shuffle) prerequisite order for auto vars ($^, $<, $|, etc.)
-        // so that shuffle only affects BUILD ORDER, not the values of automatic variables.
-        // Append SE-expanded prereqs (which are always new, no pre-shuffle version).
+        // Use all_prereqs which by this point contains:
+        //   - explicit prereqs + SE-expanded prereqs (always)
+        //   - pattern rule prereqs prepended (if recipe came from a pattern rule)
+        // This ensures $^ is non-empty when a pattern rule provides both prereqs and recipe
+        // for an explicit target that had no prereqs of its own.
         let auto_vars_prereqs_for_recipe: Vec<String> = {
-            let mut v = auto_var_prereqs.clone();
-            // Append SE-expanded prereqs (they have no pre-shuffle original; append at end).
-            v.extend(se_expanded_prereqs.clone());
+            let mut v = all_prereqs.clone();
             v.retain(|p| p != ".WAIT");
             v
         };
@@ -2960,7 +2982,15 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             self.pending_plan_prereqs = prereqs.clone();
             self.pending_plan_order_only = order_only.clone();
-            self.pending_plan_wait_groups = Vec::new(); // pattern rules: no .WAIT groups
+            // If this target is in .NOTPARALLEL: target_list, force sequential prereqs.
+            self.pending_plan_wait_groups = if self.db.not_parallel_targets.contains(target)
+                && prereqs.len() > 1
+            {
+                // Each prereq in its own group to force sequential execution.
+                prereqs.iter().map(|p| vec![p.clone()]).collect()
+            } else {
+                Vec::new() // pattern rules: no .WAIT groups by default
+            };
         }
         let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
@@ -2977,54 +3007,16 @@ impl<'a> Executor<'a> {
             // potentially intermediate. These siblings were produced by the same recipe.
             // GNU Make tracks also_make siblings BEFORE the primary target in the
             // intermediate deletion list (so they are removed first).
-            for sib in &also_make_siblings {
-                // Mark as built/covered so we don't run the recipe again for them.
-                self.grouped_covered.insert(sib.clone());
-                self.built.insert(sib.clone(), true);
 
-                // Track intermediate status for also_make siblings.
-                if self.db.is_intermediate(sib) {
-                    if !self.intermediate_built.contains(sib) {
-                        self.intermediate_built.push(sib.clone());
-                    }
-                } else if !self.db.is_precious(sib)
-                    && !self.db.is_notintermediate(sib)
-                    && !self.db.is_secondary(sib)
-                {
-                    let is_explicit = self.top_level_targets.contains(sib.as_str())
-                        || self.is_explicitly_mentioned(sib);
-                    if !is_explicit {
-                        // Only mark as intermediate if the sibling was NOT already present
-                        // on disk before this recipe ran. GNU Make only deletes intermediates
-                        // that were created during this build — pre-existing files are left alone.
-                        // Check by looking at whether it was already in built-before-this-run
-                        // state: if it existed before and is now still there, skip marking it.
-                        // Heuristic: if the file currently exists AND is NOT the primary target
-                        // being built (meaning it was pre-existing), skip intermediate marking.
-                        // For the non-primary sibling case: if the file exists after the recipe,
-                        // we can't easily tell if it was pre-existing. Use the 'prereq_existed'
-                        // hint: a sibling that existed before the recipe ran should not be
-                        // treated as intermediate.
-                        // Simple heuristic: if the sib file exists but was not in our
-                        // intermediate_built list before, skip it (it was probably pre-existing).
-                        // Actually the cleanest fix: DON'T auto-mark non-grouped pattern rule
-                        // siblings as intermediate. Only truly grouped (&:) rules should have
-                        // automatic sibling cleanup. For regular multi-target pattern rules,
-                        // siblings are only intermediate if explicitly marked .INTERMEDIATE.
-                        // GNU Make behavior: for `%.z %.q: %.x`, the peer `%.q` is NOT automatically
-                        // intermediate — only targets built as side-effects of grouped (&:) rules are.
-                        // Skip adding here; rely on explicit .INTERMEDIATE only.
-                        let _ = (); // No-op: don't auto-mark pattern rule siblings as intermediate
-                    }
-                }
-            }
-
-            // Now track the primary target as intermediate (after siblings).
+            // First, determine if the primary target is intermediate.
+            // Siblings inherit this status if they themselves are not explicitly mentioned.
+            let is_target_intermediate;
             if self.db.is_intermediate(target) {
                 // Explicitly marked .INTERMEDIATE
                 if !self.intermediate_built.contains(&target.to_string()) {
                     self.intermediate_built.push(target.to_string());
                 }
+                is_target_intermediate = true;
             } else if !self.db.is_precious(target)
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
@@ -3036,6 +3028,51 @@ impl<'a> Executor<'a> {
                 if !is_explicit {
                     if !self.intermediate_built.contains(&target.to_string()) {
                         self.intermediate_built.push(target.to_string());
+                    }
+                    is_target_intermediate = true;
+                } else {
+                    is_target_intermediate = false;
+                }
+            } else {
+                is_target_intermediate = false;
+            }
+
+            // Now handle also_make siblings (after we know if primary is intermediate).
+            for sib in &also_make_siblings {
+                // Mark as built/covered so we don't run the recipe again for them.
+                self.grouped_covered.insert(sib.clone());
+                self.built.insert(sib.clone(), true);
+
+                // Track intermediate status for also_make siblings.
+                // A sibling is intermediate if:
+                //   1. It is explicitly marked .INTERMEDIATE, OR
+                //   2. The primary target is intermediate (was built only as a stepping stone)
+                //      AND the sibling is not explicitly mentioned / top-level / precious / secondary.
+                if self.db.is_intermediate(sib) {
+                    if !self.intermediate_built.contains(sib) {
+                        self.intermediate_built.push(sib.clone());
+                    }
+                } else if is_target_intermediate
+                    && !self.db.is_precious(sib)
+                    && !self.db.is_notintermediate(sib)
+                    && !self.db.is_secondary(sib)
+                {
+                    let is_explicit = self.top_level_targets.contains(sib.as_str())
+                        || self.is_explicitly_mentioned(sib);
+                    if !is_explicit {
+                        if !self.intermediate_built.contains(sib) {
+                            self.intermediate_built.push(sib.clone());
+                        }
+                    }
+                }
+            }
+            // In collect_plans_mode, update the plan's is_intermediate flag now that we
+            // know the runtime intermediate status (db.is_intermediate only covers explicit
+            // .INTERMEDIATE declarations, not pattern-rule-built intermediates).
+            if self.collect_plans_mode && is_target_intermediate {
+                if let Some(ref mut plans) = self.pending_plans {
+                    if let Some(plan) = plans.get_mut(target) {
+                        plan.is_intermediate = true;
                     }
                 }
             }
@@ -5550,11 +5587,38 @@ fn run_cmd_with_error_handling(
     recipe_cmd: &str,
     progname: &str,
 ) -> std::io::Result<i32> {
-    // Run the child with inherited stderr so that all output (stdout and stderr)
-    // appears in real-time and in the correct order.  Piping stderr would cause
-    // all stderr output from the child to arrive after all stdout, breaking the
-    // expected "Entering/Leaving directory" ordering for recursive makes.
-    let status = cmd.status()?;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    // Pipe stderr so we can filter the shell's own "command not found" / "inaccessible or not
+    // found" messages (emitted by shells like mksh/dash before exiting with code 127/126).
+    // We emit all other stderr lines immediately, line-by-line, to preserve real-time ordering
+    // for programs that write to stderr while running (e.g. recursive make -w).
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    // Drain stderr in the current thread (stdout is still inherited = real-time).
+    let stderr_pipe = child.stderr.take().unwrap();
+    let reader = BufReader::new(stderr_pipe);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        // Suppress lines that are just the shell's own "not found" error.
+        // These take the form: "/bin/sh: cmd: inaccessible or not found"
+        //                       "mksh: cmd: not found"
+        //                       "sh: cmd: command not found"
+        // We detect them by their well-known suffix patterns.
+        let is_shell_notfound = line.ends_with(": inaccessible or not found")
+            || line.ends_with(": not found")
+            || line.ends_with(": command not found");
+        if !is_shell_notfound {
+            eprintln!("{}", line);
+        }
+    }
+
+    let status = child.wait()?;
     let code = status.code().unwrap_or(1);
 
     // If exit code is 127 (command not found) or 126 (permission/exec error),

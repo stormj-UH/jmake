@@ -2106,7 +2106,15 @@ impl MakeState {
                         self.db.posix_mode = true;
                     }
                     SpecialTarget::NotParallel => {
-                        self.db.not_parallel = true;
+                        // .NOTPARALLEL with no prerequisites: global sequential mode.
+                        // .NOTPARALLEL: target1 target2: only those targets run sequentially.
+                        if rule.prerequisites.is_empty() {
+                            self.db.not_parallel = true;
+                        } else {
+                            for prereq in &rule.prerequisites {
+                                self.db.not_parallel_targets.insert(prereq.clone());
+                            }
+                        }
                     }
                     SpecialTarget::DeleteOnError => {
                         // .DELETE_ON_ERROR: causes make to delete the target file on error.
