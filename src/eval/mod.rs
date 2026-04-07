@@ -1564,6 +1564,9 @@ impl MakeState {
 
     fn set_variable(&mut self, name: &str, value: &str, flavor: &VarFlavor, is_override: bool, is_export: bool) {
         let origin = if is_override { VarOrigin::Override } else { VarOrigin::File };
+        // Capture current source location for error reporting during lazy expansion.
+        let src_file = self.current_file.borrow().clone();
+        let src_line = *self.current_line.borrow();
 
         // A non-override assignment cannot change a variable that was set via
         // the command line (CommandLine origin) OR via an `override` directive
@@ -1582,6 +1585,14 @@ impl MakeState {
         let makeflags_protected = name == "MAKEFLAGS"
             && !is_override
             && self.args.environment_overrides;
+
+        // Helper to create a new Variable with source location attached.
+        let make_var = |val: String, fl: VarFlavor, orig: VarOrigin| {
+            let mut v = Variable::new(val, fl, orig);
+            v.source_file = src_file.clone();
+            v.source_line = src_line;
+            v
+        };
 
         match flavor {
             VarFlavor::Append => {
@@ -1606,15 +1617,18 @@ impl MakeState {
                     if is_override {
                         existing.origin = VarOrigin::Override;
                     }
+                    // Update source location to the most recent assignment site.
+                    existing.source_file = src_file.clone();
+                    existing.source_line = src_line;
                 } else {
                     self.db.variables.insert(name.to_string(),
-                        Variable::new(value.to_string(), VarFlavor::Recursive, origin));
+                        make_var(value.to_string(), VarFlavor::Recursive, origin));
                 }
             }
             VarFlavor::Conditional => {
                 // ?= only sets if not already defined
                 self.db.variables.entry(name.to_string()).or_insert_with(|| {
-                    Variable::new(value.to_string(), VarFlavor::Recursive, origin)
+                    make_var(value.to_string(), VarFlavor::Recursive, origin)
                 });
             }
             VarFlavor::Shell => {
@@ -1635,7 +1649,7 @@ impl MakeState {
                 // any $(VAR) references in the shell output are re-expanded
                 // when the variable is later used.
                 self.db.variables.insert(name.to_string(),
-                    Variable::new(result, VarFlavor::Recursive, origin));
+                    make_var(result, VarFlavor::Recursive, origin));
             }
             _ => {
                 let existing = self.db.variables.get(name);
@@ -1650,7 +1664,7 @@ impl MakeState {
                     return; // -e protects MAKEFLAGS from makefile changes
                 }
                 self.db.variables.insert(name.to_string(),
-                    Variable::new(value.to_string(), flavor.clone(), origin));
+                    make_var(value.to_string(), flavor.clone(), origin));
             }
         }
 

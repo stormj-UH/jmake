@@ -33,6 +33,10 @@ pub struct Variable {
     pub export: Option<bool>, // None = inherit, Some(true) = export, Some(false) = unexport
     /// When true, this target-specific variable is private and NOT inherited by prerequisites.
     pub is_private: bool,
+    /// The makefile file path where this variable was defined (empty if unknown/built-in).
+    pub source_file: String,
+    /// The line number in the makefile where this variable was defined (0 if unknown).
+    pub source_line: usize,
 }
 
 impl Variable {
@@ -43,6 +47,8 @@ impl Variable {
             origin,
             export: None,
             is_private: false,
+            source_file: String::new(),
+            source_line: 0,
         }
     }
 }

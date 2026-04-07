@@ -2102,7 +2102,11 @@ impl<'a> Executor<'a> {
             let mut first_line_ignore = false;
             let mut is_first = true;
 
-            for (_lineno, line) in recipe {
+            for (lineno, line) in recipe {
+                // Update current_file/current_line so that errors during expansion
+                // (e.g. from $(word ...) or $(wordlist ...)) report the correct location.
+                *self.state.current_file.borrow_mut() = source_file.to_string();
+                *self.state.current_line.borrow_mut() = *lineno;
                 let expanded = self.state.expand_with_auto_vars(line, auto_vars);
                 let cmd_line = strip_recipe_prefixes(&expanded);
                 if is_first {
@@ -2177,6 +2181,10 @@ impl<'a> Executor<'a> {
         // Track whether any actual shell commands were executed.
         let mut any_cmd_ran = false;
         for (lineno, line) in recipe {
+            // Update current_file/current_line so that errors during expansion
+            // (e.g. from $(word ...) or $(wordlist ...)) report the correct location.
+            *self.state.current_file.borrow_mut() = source_file.to_string();
+            *self.state.current_line.borrow_mut() = *lineno;
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
 
             // Extract prefix flags (@, -, +) from the ORIGINAL recipe line (before expansion).

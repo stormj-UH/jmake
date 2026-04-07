@@ -199,7 +199,24 @@ impl MakeState {
 
     fn expand_var_value(&self, var: &Variable, auto_vars: &HashMap<String, String>) -> String {
         match var.flavor {
-            VarFlavor::Recursive => self.expand_with_auto_vars(&var.value, auto_vars),
+            VarFlavor::Recursive => {
+                // For lazily-expanded variables, temporarily set current_file/current_line
+                // to the variable's definition site so that errors (e.g. from $(word ...) or
+                // $(wordlist ...)) report the location where the function was written, not
+                // where the variable was referenced from.
+                if !var.source_file.is_empty() && var.source_line != 0 {
+                    let saved_file = self.current_file.borrow().clone();
+                    let saved_line = *self.current_line.borrow();
+                    *self.current_file.borrow_mut() = var.source_file.clone();
+                    *self.current_line.borrow_mut() = var.source_line;
+                    let result = self.expand_with_auto_vars(&var.value, auto_vars);
+                    *self.current_file.borrow_mut() = saved_file;
+                    *self.current_line.borrow_mut() = saved_line;
+                    result
+                } else {
+                    self.expand_with_auto_vars(&var.value, auto_vars)
+                }
+            }
             VarFlavor::Simple => var.value.clone(),
             _ => self.expand_with_auto_vars(&var.value, auto_vars),
         }
