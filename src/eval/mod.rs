@@ -3727,12 +3727,14 @@ impl MakeState {
 
             match &work_items_vec[i].outcome {
                 PendingOutcome::AlreadyExists => {
-                    // Only re-read and trigger re-exec if the file was NOT already
-                    // successfully read (i.e., not in makefile_list). This avoids
-                    // spurious re-exec for the three default makefile candidates
-                    // (GNUmakefile, makefile, Makefile) that are added to pending_includes
-                    // after being read, which would otherwise cause an infinite re-exec
-                    // loop when using -C (the re-exec re-runs from the already-changed dir).
+                    // The file already existed before any recipe ran — it was NOT rebuilt.
+                    // Re-read it if it wasn't already in makefile_list (e.g., an `include`
+                    // of a new file that happens to exist). But do NOT set any_really_rebuilt:
+                    // a file that existed before is not a "rebuild", so no re-exec is needed.
+                    // This is critical for the three default makefile candidates (GNUmakefile,
+                    // makefile, Makefile) when only one was selected: the others also exist but
+                    // were not selected, and reading them + triggering re-exec would create
+                    // an infinite restart loop.
                     let already_read = self.makefile_list.iter().any(|p| p == &file_path);
                     if !already_read {
                         if let Err(e) = self.read_makefile(file_path.as_path()) {
@@ -3740,7 +3742,8 @@ impl MakeState {
                                 return Err(format!("{}:{}: {}", pi_parent, pi_lineno, e));
                             }
                         }
-                        any_really_rebuilt = true;
+                        // NOTE: Do NOT set any_really_rebuilt here. AlreadyExists means
+                        // the file was not rebuilt by a recipe — no re-exec is warranted.
                     }
                 }
                 PendingOutcome::Error(msg) => {
