@@ -1002,6 +1002,12 @@ impl<'a> Executor<'a> {
         se_expanded_prereqs.retain(|p| p != ".WAIT");
         se_expanded_order_only.retain(|p| p != ".WAIT");
 
+        // Glob-expand wildcard patterns in non-SE prerequisites.
+        // GNU Make expands wildcards in targets/prerequisites at read time; we do it
+        // here before building so that patterns like a.t* expand to real files.
+        all_prereqs = Self::glob_expand_prereqs(all_prereqs);
+        all_order_only = Self::glob_expand_prereqs(all_order_only);
+
         // Apply shuffle to prerequisite ordering (unless .NOTPARALLEL is set).
         if self.shuffle.is_some() && !self.db.not_parallel {
             all_prereqs = self.shuffle_list(all_prereqs);
@@ -1296,9 +1302,12 @@ impl<'a> Executor<'a> {
                 let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
+                // Glob-expand wildcard patterns in pattern rule prereqs (e.g. %.t* -> a.three a.two).
+                pat_prereqs = Self::glob_expand_prereqs(pat_prereqs);
                 let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
+                pat_order_only = Self::glob_expand_prereqs(pat_order_only);
 
                 // Handle second expansion for the pattern rule.
                 // Auto vars are built from the ALREADY-accumulated explicit prereqs
@@ -3493,6 +3502,34 @@ impl<'a> Executor<'a> {
         }
 
         false
+    }
+
+    /// Expand glob wildcards in a list of prerequisite tokens.
+    /// Each token that contains `*`, `?`, or `[` is glob-expanded against the filesystem.
+    /// If no files match, the literal token is kept (GNU Make behaviour).
+    /// Tokens without wildcards are passed through unchanged.
+    fn glob_expand_prereqs(prereqs: Vec<String>) -> Vec<String> {
+        let mut result = Vec::with_capacity(prereqs.len());
+        for token in prereqs {
+            if token.contains('*') || token.contains('?') || token.contains('[') {
+                let mut matched: Vec<String> = Vec::new();
+                if let Ok(paths) = ::glob::glob(&token) {
+                    for entry in paths.flatten() {
+                        matched.push(entry.to_string_lossy().to_string());
+                    }
+                }
+                matched.sort();
+                if matched.is_empty() {
+                    // No matches: keep the literal token (GNU Make keeps unmatched globs).
+                    result.push(token);
+                } else {
+                    result.extend(matched);
+                }
+            } else {
+                result.push(token);
+            }
+        }
+        result
     }
 
     /// Resolve `.EXTRA_PREREQS` for a given target.

@@ -399,7 +399,13 @@ impl MakeState {
             }
             "let" => {
                 let args = split_function_args_max(args_str, 3);
-                if args.len() < 3 { return String::new(); }
+                if args.len() < 3 {
+                    let file = self.current_file.borrow();
+                    let line = *self.current_line.borrow();
+                    let loc = if file.is_empty() { String::new() } else { format!("{}:{}: ", *file, line) };
+                    eprintln!("{}*** insufficient number of arguments ({}) to function 'let'.  Stop.", loc, args.len());
+                    std::process::exit(2);
+                }
                 let var_names_str = self.expand_with_auto_vars(&args[0], auto_vars);
                 let var_names: Vec<&str> = var_names_str.split_whitespace().collect();
                 let list_str = self.expand_with_auto_vars(&args[1], auto_vars);
@@ -409,12 +415,34 @@ impl MakeState {
                     return self.expand_with_auto_vars(body, auto_vars);
                 }
 
-                // Bind words from list to variable names using auto_vars overlay
+                // Bind words from list to variable names.
+                // For variables before the last: use individual words (whitespace-split).
+                // For the last variable: use the remaining raw text starting at the
+                // beginning of that word, preserving trailing whitespace (GNU Make behavior).
                 let words: Vec<&str> = list_str.split_whitespace().collect();
                 let mut let_vars = auto_vars.clone();
+                let num_vars = var_names.len();
                 for (i, var) in var_names.iter().enumerate() {
-                    let val = if i == var_names.len() - 1 {
-                        if i < words.len() { words[i..].join(" ") } else { String::new() }
+                    let val = if i == num_vars - 1 {
+                        // Last variable: find the start of word i in the raw string
+                        // and take the rest of the string (preserving trailing whitespace).
+                        if i < words.len() {
+                            // Find the position of words[i] in list_str by scanning past
+                            // the first `i` whitespace-delimited words.
+                            let mut rest = list_str.as_str();
+                            let mut skipped = 0;
+                            while skipped < i {
+                                rest = rest.trim_start();
+                                // skip the next word
+                                let word_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                                rest = &rest[word_end..];
+                                skipped += 1;
+                            }
+                            // rest now starts at optional whitespace before words[i]
+                            rest.trim_start().to_string()
+                        } else {
+                            String::new()
+                        }
                     } else if i < words.len() {
                         words[i].to_string()
                     } else {
@@ -616,7 +644,11 @@ impl MakeState {
     fn expand_foreach(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         let args = split_function_args(args_str);
         if args.len() < 3 {
-            return String::new();
+            let file = self.current_file.borrow();
+            let line = *self.current_line.borrow();
+            let loc = if file.is_empty() { String::new() } else { format!("{}:{}: ", *file, line) };
+            eprintln!("{}*** insufficient number of arguments ({}) to function 'foreach'.  Stop.", loc, args.len());
+            std::process::exit(2);
         }
 
         let var = self.expand_with_auto_vars(&args[0], auto_vars).trim().to_string();

@@ -764,10 +764,11 @@ fn fn_intcmp(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
             if ord == std::cmp::Ordering::Less { expand(&args[2]) } else { String::new() }
         }
         4 => {
+            // With 4 args, the 4th arg (args[3]) is the "greater-or-equal" catch-all:
+            // it is returned for both == and > cases.
             match ord {
                 std::cmp::Ordering::Less => expand(&args[2]),
-                std::cmp::Ordering::Equal => expand(&args[3]),
-                std::cmp::Ordering::Greater => String::new(),
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => expand(&args[3]),
             }
         }
         5 | _ => {

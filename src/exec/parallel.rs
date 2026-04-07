@@ -485,10 +485,13 @@ impl ParallelScheduler {
     pub fn find_initial_ready(&mut self, roots: &[String]) {
         // Walk all plans reachable from roots using BFS to find which targets need
         // to be considered. Then among those, find ones with no unfinished prereqs.
+        // We use a Vec (visited_order) to maintain BFS-order for deterministic scheduling.
         let mut visited: HashSet<String> = HashSet::new();
+        let mut visited_order: Vec<String> = Vec::new();
         let mut queue: VecDeque<String> = roots.iter().cloned().collect();
         while let Some(t) = queue.pop_front() {
             if !visited.insert(t.clone()) { continue; }
+            visited_order.push(t.clone());
             if let Some(deps) = self.prereqs_of.get(&t) {
                 for d in deps.clone() {
                     queue.push_back(d);
@@ -497,7 +500,10 @@ impl ParallelScheduler {
         }
 
         // Among reachable targets that need rebuilding, find those with all deps done.
-        for t in &visited {
+        // Process in BFS order to maintain the order targets were specified as prerequisites.
+        // This ensures `all: first second` processes `first` before `second`, preserving
+        // the user-specified order in the ready queue.
+        for t in &visited_order {
             if self.states.contains_key(t.as_str()) {
                 // Already handled (Done or grouped sibling).
                 continue;
