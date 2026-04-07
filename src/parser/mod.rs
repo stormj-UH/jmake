@@ -599,10 +599,15 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                 return None;
             }
             if name.contains(' ') || name.contains('\t') {
-                // Name has whitespace but no colon: looks like "x $X=" where $X is a
-                // variable reference that expands to something with a space (or contains
-                // literal space). GNU Make reports "missing separator" for this pattern
-                // at parse time before expansion.
+                // Name has whitespace but no colon. This could be:
+                // (a) "x $X=" where $X expands to something with spaces → missing separator
+                // (b) a rule like "ten one=two =: ; recipe" where the `=` in a target name
+                //     was found first before the rule's `:`.
+                // Distinguish: if there is a bare rule colon ANYWHERE in `work`,
+                // this is a rule (case b). Return None so try_parse_rule can handle it.
+                if find_rule_colon(work).is_some() {
+                    return None;
+                }
                 return Some(ParsedLine::MissingSeparator(String::new()));
             }
 

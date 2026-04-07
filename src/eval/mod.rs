@@ -1008,6 +1008,13 @@ impl MakeState {
                 // If so, handle value expansion based on flavor.
                 let trimmed = line.trim();
 
+                // Comment lines (starting with #) are handled by parse_line; don't
+                // run try_parse_variable_assignment on them as it may falsely detect
+                // a "missing separator" (e.g. `# Test = escaping` has name "# Test").
+                if trimmed.starts_with('#') {
+                    trimmed.to_string()
+                } else
+
                 // Special case: `define` directives (and `override define`, `export define`).
                 // These look like "define VAR_NAME [OP]" where VAR_NAME may contain variable
                 // references.  We must expand VAR_NAME at this point (first expansion), but NOT
@@ -2791,39 +2798,32 @@ impl MakeState {
 
                 let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
 
-                // Check if the makefile needs rebuild BEFORE trying to build prereqs.
-                // If a prerequisite doesn't exist on disk, this rule can't fire — skip.
-                // Only proceed if the target doesn't exist OR a prereq exists AND is newer.
-                // This matches GNU Make: missing implicit rule prereqs → rule silently skipped.
+                // Build prerequisites first (using ignore_missing=true so that prereqs
+                // without rules are silently skipped rather than causing errors).
+                // Prereqs that DO have rules and don't yet exist will be built here.
+                let prereqs = rule_info.prerequisites.clone();
+                let mut visited = HashSet::new();
+                visited.insert(mf_name.clone());
+                let _ = self.build_include_prerequisites(
+                    &prereqs, &mf_name, &shell, &shell_flags, silent, true, &mut visited,
+                );
+
+                // Now determine if the makefile needs rebuild (after prereqs were built).
                 let needs_rebuild = if target_mtime.is_none() {
                     // File doesn't exist → needs rebuild
                     true
                 } else {
                     let target_time = target_mtime.unwrap();
-                    // A prereq triggers rebuild only if it EXISTS and is newer than target.
-                    // If a prereq doesn't exist → rule cannot fire → not out of date.
+                    // A prereq triggers rebuild only if it now EXISTS and is newer than target.
                     rule_info.prerequisites.iter().any(|prereq| {
-                        match std::fs::metadata(prereq) {
-                            Ok(m) => m.modified().ok().map_or(false, |pt| pt > target_time),
-                            Err(_) => false, // prereq doesn't exist → skip this rule
-                        }
+                        std::fs::metadata(prereq).ok()
+                            .and_then(|m| m.modified().ok())
+                            .map_or(false, |pt| pt > target_time)
                     })
                 };
 
                 if !needs_rebuild {
                     continue;
-                }
-
-                // Build prerequisites first (they exist but may themselves be out of date).
-                let prereqs = rule_info.prerequisites.clone();
-                let mut visited = HashSet::new();
-                visited.insert(mf_name.clone());
-                let prereq_result = self.build_include_prerequisites(
-                    &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
-                );
-
-                if let Err(e) = prereq_result {
-                    return Err(e);
                 }
 
                 if rule_info.recipe.is_empty() {
@@ -2868,12 +2868,22 @@ impl MakeState {
         // If any regular makefile was really rebuilt, re-exec from scratch now
         // (before processing pending includes, so that on re-exec we can try
         // to rebuild missing makefiles with the updated rules).
+        // BUT: don't re-exec if there are pending includes with ignore_missing=false
+        // that don't exist and have no rule — those would fail on re-exec too, so
+        // just fail now without the extra invocation (and extra duplicate warning).
         if any_really_rebuilt {
-            let restart_val = env::var("MAKE_RESTARTS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
-            self.do_reinvoke(restart_val + 1);
+            let has_fatal_pending = self.pending_includes.iter().any(|pi| {
+                !pi.ignore_missing
+                    && !Path::new(&pi.file).exists()
+                    && self.find_include_rule(&pi.file).is_none()
+            });
+            if !has_fatal_pending {
+                let restart_val = env::var("MAKE_RESTARTS")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                self.do_reinvoke(restart_val + 1);
+            }
         }
 
         // Second, handle pending includes (files that were missing when first read)

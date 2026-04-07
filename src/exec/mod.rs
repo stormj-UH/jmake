@@ -131,6 +131,13 @@ impl<'a> Executor<'a> {
         for t in targets {
             self.top_level_targets.insert(t.clone());
         }
+        // Apply shuffle to goal ordering (unless .NOTPARALLEL is set).
+        let targets_list = if self.shuffle.is_some() && !self.db.not_parallel {
+            self.shuffle_list(targets.to_vec())
+        } else {
+            targets.to_vec()
+        };
+        let targets = &targets_list;
         let mut failed_top_level_targets: Vec<String> = Vec::new();
         for target in targets {
             match self.build_target(target) {
@@ -490,6 +497,14 @@ impl<'a> Executor<'a> {
         se_expanded_prereqs.retain(|p| p != ".WAIT");
         se_expanded_order_only.retain(|p| p != ".WAIT");
 
+        // Apply shuffle to prerequisite ordering (unless .NOTPARALLEL is set).
+        if self.shuffle.is_some() && !self.db.not_parallel {
+            all_prereqs = self.shuffle_list(all_prereqs);
+            all_order_only = self.shuffle_list(all_order_only);
+            se_expanded_prereqs = self.shuffle_list(se_expanded_prereqs);
+            se_expanded_order_only = self.shuffle_list(se_expanded_order_only);
+        }
+
         // Pre-check: if the target exists and none of the prereqs (by effective mtime, which
         // accounts for deleted intermediates) are newer than the target, skip rebuilding.
         // This handles the case where intermediate files were deleted after a previous build:
@@ -570,13 +585,15 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
                         e
                     };
                     if self.keep_going {
+                        if is_new { self.print_error_keep_going(&propagated); }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -593,13 +610,16 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
                         e
                     };
                     if self.keep_going {
+                        // Only print at the first occurrence (when we just added "needed by").
+                        if is_new { self.print_error_keep_going(&propagated); }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -621,13 +641,15 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
                         e
                     };
                     if self.keep_going {
+                        if is_new { self.print_error_keep_going(&propagated); }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -884,13 +906,15 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
                         e
                     };
                     if self.keep_going {
+                        if is_new { self.print_error_keep_going(&propagated); }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -910,13 +934,15 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_prereq_rebuilt = true; }
                 }
                 Err(e) => {
-                    let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
                     } else {
                         e
                     };
                     if self.keep_going {
+                        if is_new { self.print_error_keep_going(&propagated); }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -1232,13 +1258,15 @@ impl<'a> Executor<'a> {
                         if rebuilt { any_prereq_rebuilt = true; }
                     }
                     Err(e) => {
-                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
                         } else {
                             e
                         };
                         if self.keep_going {
+                            if is_new { self.print_error_keep_going(&propagated); }
                             prereq_errors.push(propagated);
                         } else {
                             self.inherited_vars_stack.pop();
@@ -1397,6 +1425,12 @@ impl<'a> Executor<'a> {
             *self.state.current_line.borrow_mut() = saved_line;
         }
 
+        // Apply shuffle to pattern rule prerequisites.
+        if self.shuffle.is_some() && !self.db.not_parallel {
+            prereqs = self.shuffle_list(prereqs);
+            order_only = self.shuffle_list(order_only);
+        }
+
         // Build prerequisites
         // Push target vars onto stack for inheritance by prerequisites.
         let my_target_vars = self.collect_target_vars(target);
@@ -1434,11 +1468,13 @@ impl<'a> Executor<'a> {
                     if rebuilt { any_rebuilt = true; }
                 }
                 Err(e) => {
-                    if e.starts_with("No rule to make target '") && !rule.recipe.is_empty() {
+                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() {
                         // GNU Make behavior: if a prerequisite doesn't exist and has
                         // no rule, but the parent target HAS a recipe, just consider
                         // the parent out of date. This handles auto-generated dependency
                         // files that list system headers as prerequisites.
+                        // Only applies to DIRECT "no rule" errors (without "needed by"),
+                        // not to errors propagated from deeper in the dependency chain.
                         any_rebuilt = true;
                     } else {
                         // Propagate "No rule to make target" errors correctly
@@ -1524,28 +1560,10 @@ impl<'a> Executor<'a> {
         // 4. Marked .NOTINTERMEDIATE
         // 5. Marked .SECONDARY
         if let Ok(true) = &result {
-            if self.db.is_intermediate(target) {
-                // Explicitly marked .INTERMEDIATE
-                if !self.intermediate_built.contains(&target.to_string()) {
-                    self.intermediate_built.push(target.to_string());
-                }
-            } else if !self.db.is_precious(target)
-                && !self.db.is_notintermediate(target)
-                && !self.db.is_secondary(target)
-            {
-                // Only mark as intermediate if the target is NOT explicitly mentioned
-                // in the makefile and NOT a top-level target.
-                let is_explicit = self.top_level_targets.contains(target)
-                    || self.db.is_explicitly_mentioned(target);
-                if !is_explicit {
-                    if !self.intermediate_built.contains(&target.to_string()) {
-                        self.intermediate_built.push(target.to_string());
-                    }
-                }
-            }
-
             // For multi-target pattern rules: mark also_make siblings as built and
             // potentially intermediate. These siblings were produced by the same recipe.
+            // GNU Make tracks also_make siblings BEFORE the primary target in the
+            // intermediate deletion list (so they are removed first).
             for sib in &also_make_siblings {
                 // Mark as built/covered so we don't run the recipe again for them.
                 self.grouped_covered.insert(sib.clone());
@@ -1569,6 +1587,27 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+
+            // Now track the primary target as intermediate (after siblings).
+            if self.db.is_intermediate(target) {
+                // Explicitly marked .INTERMEDIATE
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
+                }
+            } else if !self.db.is_precious(target)
+                && !self.db.is_notintermediate(target)
+                && !self.db.is_secondary(target)
+            {
+                // Only mark as intermediate if the target is NOT explicitly mentioned
+                // in the makefile and NOT a top-level target.
+                let is_explicit = self.top_level_targets.contains(target)
+                    || self.db.is_explicitly_mentioned(target);
+                if !is_explicit {
+                    if !self.intermediate_built.contains(&target.to_string()) {
+                        self.intermediate_built.push(target.to_string());
+                    }
+                }
+            }
         } else {
             // Even if recipe failed or didn't rebuild, mark also_make siblings as covered
             // so we don't try to rebuild them separately.
@@ -1579,18 +1618,22 @@ impl<'a> Executor<'a> {
         }
 
         // Check if peer targets were actually updated (emit warning if not).
-        // Per GNU Make: if a multi-target pattern rule ran but a peer target wasn't updated
-        // (mtime didn't change), emit a warning.
+        // Per GNU Make: if a multi-target pattern rule ran AND the primary target now exists
+        // on disk (was actually created/touched), but a peer target doesn't exist, warn.
+        // Do NOT warn if the primary target also doesn't exist (recipe didn't create any files).
         if let Ok(true) = &result {
-            for sib in &also_make_siblings {
-                if !Path::new(sib.as_str()).exists() {
-                    // Peer target wasn't created: warn
-                    let loc = if !rule.source_file.is_empty() && rule.lineno > 0 {
-                        format!("{}:{}: ", rule.source_file, rule.lineno)
-                    } else {
-                        String::new()
-                    };
-                    eprintln!("{}warning: pattern recipe did not update peer target '{}'.", loc, sib);
+            let primary_exists = Path::new(target).exists();
+            if primary_exists {
+                for sib in &also_make_siblings {
+                    if !Path::new(sib.as_str()).exists() {
+                        // Peer target wasn't created: warn
+                        let loc = if !rule.source_file.is_empty() && rule.lineno > 0 {
+                            format!("{}:{}: ", rule.source_file, rule.lineno)
+                        } else {
+                            String::new()
+                        };
+                        eprintln!("{}warning: pattern recipe did not update peer target '{}'.", loc, sib);
+                    }
                 }
             }
         }
@@ -2305,7 +2348,8 @@ impl<'a> Executor<'a> {
         // Use collect_target_vars to get the fully-expanded target-specific vars
         // (which also handles inheritance, pattern-specific vars, etc.).
         let collected = self.collect_target_vars(target);
-        let raw_value = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
+        // The value from collect_target_vars is already fully expanded.
+        let expanded = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
             val.clone()
         } else {
             // Fall back to global .EXTRA_PREREQS.
@@ -2321,12 +2365,6 @@ impl<'a> Executor<'a> {
             }
         };
 
-        if raw_value.trim().is_empty() {
-            return Vec::new();
-        }
-
-        // Expand the value.
-        let expanded = self.state.expand(&raw_value);
         if expanded.trim().is_empty() {
             return Vec::new();
         }
@@ -3157,8 +3195,11 @@ fn subst_stem_in_prereq(prereq: &str, stem: &str) -> String {
 }
 
 /// Apply `%` → stem substitution to a raw SE prerequisite text.
-/// The text may contain function calls and spaces. We process it word-by-word
-/// (respecting nested parentheses) so that only the first `%` per word is replaced.
+/// GNU Make rule: in SE prerequisite text, replace the first `%` in each
+/// whitespace-delimited word.  Whitespace inside function calls (e.g. between
+/// arguments in `$(wordlist 1, 99, %.1 %.2)`) still acts as a word separator,
+/// so `%.1` and `%.2` are treated as separate words even though they are
+/// arguments to the same function.
 fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
     let mut result = String::with_capacity(text.len() + stem.len() * 4);
     let chars: Vec<char> = text.chars().collect();
@@ -3166,44 +3207,25 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
     let n = chars.len();
 
     while i < n {
-        // Skip leading whitespace
+        // Copy any leading whitespace verbatim.
         if chars[i].is_whitespace() {
             result.push(chars[i]);
             i += 1;
             continue;
         }
 
-        // Collect one "word" (may contain nested parens from function calls)
-        let word_start = i;
-        let mut depth = 0usize;
-        let mut word = String::new();
+        // Collect one word (any non-whitespace run) and replace only the first %.
         let mut first_percent_replaced = false;
-
-        while i < n {
+        while i < n && !chars[i].is_whitespace() {
             let c = chars[i];
-            if c == '(' || c == '{' {
-                depth += 1;
-                word.push(c);
-                i += 1;
-            } else if (c == ')' || c == '}') && depth > 0 {
-                depth -= 1;
-                word.push(c);
-                i += 1;
-            } else if c.is_whitespace() && depth == 0 {
-                // End of word
-                break;
-            } else if c == '%' && !first_percent_replaced {
-                // Replace first % in this word
-                word.push_str(stem);
+            if c == '%' && !first_percent_replaced {
+                result.push_str(stem);
                 first_percent_replaced = true;
-                i += 1;
             } else {
-                word.push(c);
-                i += 1;
+                result.push(c);
             }
+            i += 1;
         }
-        let _ = word_start;
-        result.push_str(&word);
     }
 
     result
