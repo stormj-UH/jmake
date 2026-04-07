@@ -1223,12 +1223,9 @@ impl<'a> Executor<'a> {
                 // without performing the expansion (the SE might produce explicitly-mentioned
                 // files that need building).  In that case skip the precheck entirely.
                 let mut pat_rule_has_se = false;
-                eprintln!("DEBUG: precheck target='{}' recipe.is_empty={} se_prereq_texts.len={}", target, recipe.is_empty(), se_prereq_texts.len());
                 if recipe.is_empty() {
                     let pat_find = self.find_pattern_rule_inner(target, &all_prereqs);
-                    eprintln!("DEBUG: find_pattern_rule_inner for '{}' returned: {}", target, pat_find.is_some());
                     if let Some((pat_rule, stem)) = pat_find {
-                        eprintln!("DEBUG: precheck for '{}' found pattern rule targets={:?} se_prereqs={:?}", target, pat_rule.targets, pat_rule.second_expansion_prereqs);
                         if pat_rule.second_expansion_prereqs.is_some()
                             || pat_rule.second_expansion_order_only.is_some()
                         {
@@ -1369,6 +1366,7 @@ impl<'a> Executor<'a> {
                                         extra_unexports: Vec::new(),
                                         is_intermediate: false,
                                         wait_groups: effective_wg_uptodate,
+                                        intermediate_also_make: Vec::new(),
                                     });
                                 }
                             }
@@ -1818,6 +1816,7 @@ impl<'a> Executor<'a> {
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
                         wait_groups: effective_wg_here,
+                        intermediate_also_make: Vec::new(),
                     };
                     if let Some(ref mut plans) = self.pending_plans {
                         plans.insert(target.to_string(), plan);
@@ -1917,6 +1916,7 @@ impl<'a> Executor<'a> {
                 extra_unexports: self.compute_target_unexports(target).into_iter().collect(),
                 is_intermediate: self.db.is_intermediate(target),
                 wait_groups: effective_wait_groups,
+                intermediate_also_make: Vec::new(),
             };
             if let Some(ref mut plans) = self.pending_plans {
                 plans.insert(target.to_string(), plan);
@@ -2577,6 +2577,7 @@ impl<'a> Executor<'a> {
                     extra_unexports,
                     is_intermediate: self.db.is_intermediate(target),
                     wait_groups: Vec::new(),
+                    intermediate_also_make: Vec::new(),
                 };
                 if let Some(ref mut plans) = self.pending_plans {
                     plans.insert(virtual_key.clone(), virtual_plan);
@@ -2630,6 +2631,7 @@ impl<'a> Executor<'a> {
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
                         wait_groups: Vec::new(),
+                        intermediate_also_make: Vec::new(),
                     });
                 } else if !plans.contains_key(target) {
                     // No rules needed rebuilding. Record a no-op plan so the
@@ -2649,6 +2651,7 @@ impl<'a> Executor<'a> {
                         extra_unexports: Vec::new(),
                         is_intermediate: self.db.is_intermediate(target),
                         wait_groups: Vec::new(),
+                        intermediate_also_make: Vec::new(),
                     });
                 }
             }
@@ -3340,10 +3343,30 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+                // For parallel mode: add intermediate siblings to the PRIMARY target's plan
+                // via intermediate_also_make. When the primary completes with rebuilt=true,
+                // the scheduler will add all entries from intermediate_also_make to
+                // intermediate_built. This is necessary because siblings don't have their own
+                // jobs and handle_completion is never called for them directly.
+                let intermediate_sibs: Vec<String> = also_make_siblings.iter()
+                    .filter(|sib| self.intermediate_built.contains(*sib))
+                    .cloned()
+                    .collect();
+                if !intermediate_sibs.is_empty() {
+                    if let Some(ref mut plans) = self.pending_plans {
+                        if let Some(plan) = plans.get_mut(target) {
+                            for sib in &intermediate_sibs {
+                                if !plan.intermediate_also_make.contains(sib) {
+                                    plan.intermediate_also_make.push(sib.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 // Also mark sibling plans as intermediate if they were pushed to intermediate_built.
                 // If the sibling doesn't have a plan yet (it was only covered as a sibling,
-                // never explicitly planned), create a minimal plan so the parallel scheduler
-                // can track its intermediate status.
+                // never explicitly planned), create a minimal plan so the sequential
+                // intermediate_built tracking works correctly.
                 for sib in &also_make_siblings {
                     if self.intermediate_built.contains(sib) {
                         if let Some(ref mut plans) = self.pending_plans {
@@ -3363,6 +3386,7 @@ impl<'a> Executor<'a> {
                                     extra_unexports: Vec::new(),
                                     is_intermediate: false,
                                     wait_groups: Vec::new(),
+                                    intermediate_also_make: Vec::new(),
                                 }
                             });
                             plan.is_intermediate = true;
@@ -4705,6 +4729,7 @@ impl<'a> Executor<'a> {
                         extra_unexports: self.target_extra_unexports.iter().cloned().collect(),
                         is_intermediate: self.db.is_intermediate(target),
                         wait_groups: std::mem::take(&mut self.pending_plan_wait_groups),
+                        intermediate_also_make: Vec::new(),
                     };
                     plans.insert(target.to_string(), plan);
                 }
@@ -5421,6 +5446,7 @@ impl<'a> Executor<'a> {
                     extra_unexports: Vec::new(),
                     is_intermediate: false,
                     wait_groups: Vec::new(),
+                    intermediate_also_make: Vec::new(),
                 });
             }
         }

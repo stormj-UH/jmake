@@ -587,6 +587,7 @@ impl ParallelScheduler {
                     extra_unexports: Vec::new(),
                     is_intermediate: false,
                     wait_groups: Vec::new(),
+                    intermediate_also_make: Vec::new(),
                 });
 
                 last_barrier = Some(barrier_name);
@@ -900,10 +901,20 @@ impl ParallelScheduler {
             // Complete grouped siblings.
             self.complete_grouped_siblings(&target, rebuilt);
             // Track intermediate targets that were rebuilt.
-            if let Some(plan) = self.plans.get(&target) {
+            if let Some(plan) = self.plans.get(&target).cloned() {
                 if rebuilt && plan.is_intermediate {
                     if !self.intermediate_built.contains(&target) {
                         self.intermediate_built.push(target.clone());
+                    }
+                }
+                // Also track intermediate also_make siblings that were built by this recipe.
+                // These siblings don't have their own jobs so handle_completion is never
+                // called for them directly — we track them via the primary's plan.
+                if rebuilt {
+                    for sib in &plan.intermediate_also_make {
+                        if !self.intermediate_built.contains(sib) {
+                            self.intermediate_built.push(sib.clone());
+                        }
                     }
                 }
             }
