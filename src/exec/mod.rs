@@ -29,6 +29,7 @@ pub struct Executor<'a> {
     trace: bool,
     built: HashMap<String, bool>, // target -> was rebuilt
     building: HashSet<String>,    // cycle detection
+    building_stack: Vec<String>,  // ordered stack for cycle detection messages
     question_out_of_date: bool,
     errors: Vec<String>,
     progname: String,
@@ -60,6 +61,9 @@ pub struct Executor<'a> {
     shuffle: Option<ShuffleMode>,
     /// RNG seed for shuffle (updated after each use for seeded mode to simulate sequence).
     shuffle_seed: u64,
+    /// Targets that have already failed (in keep-going mode).
+    /// Avoids re-running recipes for targets that already failed in this session.
+    failed_targets: HashSet<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -110,6 +114,7 @@ impl<'a> Executor<'a> {
             trace,
             built: HashMap::new(),
             building: HashSet::new(),
+            building_stack: Vec::new(),
             question_out_of_date: false,
             errors: Vec::new(),
             progname,
@@ -123,6 +128,7 @@ impl<'a> Executor<'a> {
             target_extra_unexports: HashSet::new(),
             shuffle,
             shuffle_seed,
+            failed_targets: HashSet::new(),
         }
     }
 
@@ -240,6 +246,11 @@ impl<'a> Executor<'a> {
             return Ok(rebuilt);
         }
 
+        // Already failed (in keep-going mode)?  Don't retry.
+        if self.failed_targets.contains(target) {
+            return Err(String::new());
+        }
+
         // If this target was "imagined" as updated during the include phase (sv 61226),
         // treat it as if it was already built (not actually rebuilt = no file created).
         // This prevents re-running the recipe that already ran during include processing.
@@ -250,20 +261,31 @@ impl<'a> Executor<'a> {
 
         // Cycle detection
         if self.building.contains(target) {
-            eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, target, target);
+            // The "requester" is the most recent target on the building_stack:
+            // GNU Make prints "Circular A <- B" where A is the target currently
+            // being built (last on the stack) and B is the already-in-progress target.
+            let requester = self.building_stack.last()
+                .map(|s| s.as_str())
+                .unwrap_or(target);
+            eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, requester, target);
             return Ok(false);
         }
         self.building.insert(target.to_string());
+        self.building_stack.push(target.to_string());
 
         let result = self.build_target_inner(target);
 
+        self.building_stack.pop();
         self.building.remove(target);
 
         match &result {
             Ok(rebuilt) => {
                 self.built.insert(target.to_string(), *rebuilt);
             }
-            Err(_) => {}
+            Err(_) => {
+                // Record this target as failed so we don't retry it in keep-going mode.
+                self.failed_targets.insert(target.to_string());
+            }
         }
 
         result
@@ -542,6 +564,10 @@ impl<'a> Executor<'a> {
                 let any_prereq_newer = check_prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
                     if self.what_if.iter().any(|w| w == p) { return true; }
+                    // Also check VPATH-resolved path against what-if list
+                    if let Some(ref vp) = self.find_in_vpath(p) {
+                        if self.what_if.iter().any(|w| w == vp) { return true; }
+                    }
                     if self.db.is_phony(p) { return true; }
                     // Use effective_mtime to handle deleted intermediates
                     match self.effective_mtime(p, 0) {
@@ -1709,7 +1735,11 @@ impl<'a> Executor<'a> {
                                 || self.db.is_phony(&resolved)
                                 || self.db.rules.contains_key(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
-                                || self.find_in_vpath(&resolved).is_some();
+                                || self.find_in_vpath(&resolved).is_some()
+                                // A prerequisite currently being built (cycle) counts as
+                                // available in pass 1; the cycle will be detected and dropped
+                                // gracefully when we actually try to build it.
+                                || self.building.contains(&resolved);
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
@@ -1764,7 +1794,8 @@ impl<'a> Executor<'a> {
                                 || self.db.is_phony(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
                                 || self.find_pattern_rule_exists(&resolved)
-                                || self.find_in_vpath(&resolved).is_some();
+                                || self.find_in_vpath(&resolved).is_some()
+                                || self.building.contains(&resolved);
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
@@ -1805,6 +1836,20 @@ impl<'a> Executor<'a> {
     /// Check if `target` can be built by any pattern rule (recursive/intermediate context).
     /// Non-terminal match-anything rules (%) are skipped: they cannot create intermediates.
     fn find_pattern_rule_exists(&self, target: &str) -> bool {
+        self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new())
+    }
+
+    fn find_pattern_rule_exists_inner(&self, target: &str, visited: &mut HashSet<String>) -> bool {
+        // If this target is currently being built, treat it as available (cycle case).
+        if self.building.contains(target) {
+            return true;
+        }
+        // Prevent infinite recursion from circular dependencies.
+        if visited.contains(target) {
+            return false;
+        }
+        visited.insert(target.to_string());
+
         let n_builtins = self.db.builtin_pattern_rules_count;
         let n_total = self.db.pattern_rules.len();
         let user_rules = &self.db.pattern_rules[n_builtins..n_total];
@@ -1830,6 +1875,8 @@ impl<'a> Executor<'a> {
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
+                                || self.building.contains(&resolved)
+                                || self.find_pattern_rule_exists_inner(&resolved, visited)
                         })
                     };
                     if prereqs_ok { return true; }
@@ -2256,9 +2303,14 @@ impl<'a> Executor<'a> {
             if let Some(rules) = self.db.rules.get(target) {
                 for rule in rules {
                     for prereq in &rule.prerequisites {
-                        // If a prereq is what-if, target would be rebuilt → infinitely new
+                        // If a prereq is what-if (or its VPATH-resolved path is), target would rebuild
                         if self.what_if.iter().any(|w| w == prereq) {
                             return Some(SystemTime::now());
+                        }
+                        if let Some(ref vp) = self.find_in_vpath(prereq) {
+                            if self.what_if.iter().any(|w| w == vp) {
+                                return Some(SystemTime::now());
+                            }
                         }
                         // If a prereq's effective mtime is newer than target, target would rebuild
                         if let Some(pt) = self.effective_mtime(prereq, depth + 1) {
@@ -2301,10 +2353,17 @@ impl<'a> Executor<'a> {
             return true;
         }
 
-        // -W/--what-if: if any prereq is in the what_if list, treat it as infinitely new
+        // -W/--what-if: if any prereq is in the what_if list, treat it as infinitely new.
+        // Also check the VPATH-resolved path (e.g., prereq "x" found as "x-dir/x" via VPATH,
+        // and "-W x-dir/x" was given).
         for prereq in prereqs {
             if self.what_if.iter().any(|w| w == prereq) {
                 return true;
+            }
+            if let Some(ref vp) = self.find_in_vpath(prereq) {
+                if self.what_if.iter().any(|w| w == vp) {
+                    return true;
+                }
             }
         }
 
