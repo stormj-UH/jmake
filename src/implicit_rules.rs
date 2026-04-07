@@ -200,5 +200,6 @@ fn make_pattern_rule(target: &str, prereqs: &[&str], recipe: &[&str]) -> Rule {
         second_expansion_prereqs: None,
         second_expansion_order_only: None,
         grouped_siblings: Vec::new(),
+        has_inline_recipe_marker: false,
     }
 }

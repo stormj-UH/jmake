@@ -108,21 +108,27 @@ pub fn parse_conditional_args(s: &str) -> Option<(String, String)> {
 }
 
 fn split_conditional_parens(s: &str) -> Option<(String, String)> {
-    // Find the comma that splits the two args, accounting for nested variable refs
+    // Find the comma that splits the two args, accounting for nested variable refs.
+    // We track nesting depth: `$(` or `${` opens a reference (depth += 1),
+    // `)` or `}` closes a reference (depth -= 1 if depth > 0).
+    // Commas at depth == 0 split the two arguments.
     let mut depth = 0i32;
     let bytes = s.as_bytes();
+    let mut i = 0;
 
-    for i in 0..bytes.len() {
+    while i < bytes.len() {
+        // `$(` or `${` starts a variable/function reference
+        if bytes[i] == b'$' && i + 1 < bytes.len() && (bytes[i+1] == b'(' || bytes[i+1] == b'{') {
+            depth += 1;
+            i += 2; // skip both `$` and the opening delimiter
+            continue;
+        }
         match bytes[i] {
-            b'$' if i + 1 < bytes.len() && (bytes[i+1] == b'(' || bytes[i+1] == b'{') => {
-                depth += 1;
-            }
-            b'(' | b'{' if depth > 0 => depth += 1,
             b')' | b'}' if depth > 0 => depth -= 1,
             b',' if depth == 0 => {
                 let a = s[..i].trim().to_string();
                 let rest = &s[i+1..];
-                // Find closing paren
+                // Find closing paren of the outer ifeq(...)
                 if let Some(close) = find_closing_paren(rest) {
                     let b = rest[..close].trim().to_string();
                     return Some((a, b));
@@ -134,6 +140,7 @@ fn split_conditional_parens(s: &str) -> Option<(String, String)> {
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
