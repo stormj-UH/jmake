@@ -1,0 +1,42 @@
+name: Build jmake
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: docker
+    container:
+      image: jonerix:builder-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build jmake
+        run: cargo build --release
+
+      - name: Verify binary
+        run: |
+          echo 'all:;@echo "jmake works"' > /tmp/test.mk
+          ./target/release/jmake -f /tmp/test.mk
+
+      - name: Run GNU Make test suite
+        run: |
+          cd /tmp
+          curl -sL https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz | tar xz
+          cd make-4.4.1/tests
+          perl run_make_tests.pl -make $GITHUB_WORKSPACE/target/release/jmake 2>&1 | tail -5
+
+      - name: Package jpkg
+        run: |
+          mkdir -p /tmp/jpkg/bin
+          cp target/release/jmake /tmp/jpkg/bin/jmake
+          ln -sf jmake /tmp/jpkg/bin/make
+          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
+          cd /tmp/jpkg
+          tar czf /tmp/jmake-$(cat $GITHUB_WORKSPACE/Cargo.toml | grep '^version' | head -1 | sed 's/.*"\(.*\)"/\1/')-aarch64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: jmake-aarch64
+          path: /tmp/jmake-*-aarch64.tar.gz

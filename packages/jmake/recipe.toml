@@ -1,0 +1,19 @@
+[package]
+name = "jmake"
+version = "0.1.0"
+license = "All rights reserved"
+description = "Clean-room drop-in replacement for GNU Make, written in Rust"
+
+[source]
+type = "local"
+
+[build]
+system = "custom"
+build = "cargo build --release"
+install = """install -Dm755 target/release/jmake $DESTDIR/bin/jmake
+ln -sf jmake $DESTDIR/bin/make
+llvm-strip --strip-all $DESTDIR/bin/jmake 2>/dev/null || true"""
+
+[depends]
+runtime = ["musl"]
+build = ["rust"]
