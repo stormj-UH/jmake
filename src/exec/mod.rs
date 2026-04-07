@@ -3055,11 +3055,15 @@ impl<'a> Executor<'a> {
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
             {
-                // Only mark as intermediate if the target is NOT explicitly mentioned
-                // in the makefile and NOT a top-level target.
-                let is_explicit = self.top_level_targets.contains(target)
-                    || self.is_explicitly_mentioned(target);
-                if !is_explicit {
+                // A target built by a pattern rule is intermediate unless:
+                // - it is a top-level target (explicitly requested by the user), OR
+                // - it has its own explicit rules (user provided explicit build instructions).
+                // Note: appearing as a prerequisite of another rule does NOT prevent
+                // a file from being intermediate (GNU Make behavior).
+                let has_explicit_rules = self.db.rules.get(target)
+                    .map_or(false, |rules| !rules.is_empty());
+                let is_top_level = self.top_level_targets.contains(target);
+                if !is_top_level && !has_explicit_rules {
                     if !self.intermediate_built.contains(&target.to_string()) {
                         self.intermediate_built.push(target.to_string());
                     }
@@ -3080,8 +3084,12 @@ impl<'a> Executor<'a> {
                 // Track intermediate status for also_make siblings.
                 // A sibling is intermediate if:
                 //   1. It is explicitly marked .INTERMEDIATE, OR
-                //   2. The primary target is intermediate (was built only as a stepping stone)
-                //      AND the sibling is not explicitly mentioned / top-level / precious / secondary.
+                //   2. The primary target is intermediate AND the sibling:
+                //      - is not a top-level target, AND
+                //      - has no explicit rules of its own (only implicit/pattern rules), AND
+                //      - is not precious, not .NOTINTERMEDIATE, not .SECONDARY
+                // Note: merely appearing as a prerequisite of another rule does NOT
+                // prevent a file from being intermediate (GNU Make behavior).
                 if self.db.is_intermediate(sib) {
                     if !self.intermediate_built.contains(sib) {
                         self.intermediate_built.push(sib.clone());
@@ -3091,9 +3099,12 @@ impl<'a> Executor<'a> {
                     && !self.db.is_notintermediate(sib)
                     && !self.db.is_secondary(sib)
                 {
-                    let is_explicit = self.top_level_targets.contains(sib.as_str())
-                        || self.is_explicitly_mentioned(sib);
-                    if !is_explicit {
+                    // Only exclude from intermediate if the sibling is a top-level target
+                    // OR has its own explicit rules (not just pattern rules).
+                    let has_explicit_rules = self.db.rules.get(sib.as_str())
+                        .map_or(false, |rules| !rules.is_empty());
+                    let is_top_level = self.top_level_targets.contains(sib.as_str());
+                    if !is_top_level && !has_explicit_rules {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
                         }
