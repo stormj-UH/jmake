@@ -967,6 +967,40 @@ pub fn subst_first_percent_per_word_in_se_text(text: &str, stem: &str) -> String
 
 /// Replace the **first** occurrence of `%` in `pattern` with `stem`.
 /// Subsequent `%` characters are left unchanged (GNU Make semantics).
+/// Replace bare `$*` (dollar + asterisk, where the `*` is not part of a `$(`
+/// or `${` expression) with the literal `stem` value.  This is used when storing
+/// second-expansion prerequisite text for static pattern rules: the stem is known
+/// at parse time and baking it in prevents the wrong stem being used after the
+/// evaluator merges multiple static pattern rules into one rule object.
+///
+/// Only the bare two-character sequence `$*` is replaced.  `$(*)`, `$(*D)`,
+/// `$(*F)` etc. are left unchanged (they are uncommon in static pattern rules and
+/// handled at build time).
+pub fn subst_dollar_star_in_se_text(text: &str, stem: &str) -> String {
+    if !text.contains("$*") {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len() + stem.len() * 4);
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        if bytes[i] == b'$' && i + 1 < n && bytes[i + 1] == b'*' {
+            // Make sure this isn't `$(*` (i.e. `$` followed by `*` then `(`/`{`)
+            // which would be part of a longer variable reference.
+            let next_next = if i + 2 < n { bytes[i + 2] } else { 0 };
+            if next_next != b'(' && next_next != b'{' {
+                result.push_str(stem);
+                i += 2; // skip `$*`
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
 pub fn apply_stem(pattern: &str, stem: &str) -> String {
     match pattern.find('%') {
         None => pattern.to_string(),
@@ -1059,14 +1093,19 @@ fn expand_static_pattern_rule(
         // Other auto vars ($$@, $$<, etc.) are still expanded at build time.
         if raw_prereq_text.contains('$') {
             let raw_with_stem = subst_first_percent_per_word_in_se_text(&raw_prereq_text, &stem);
-            // Replace $$* with the literal stem so that per-rule stem is preserved
-            // after merging by the evaluator.
-            let raw_with_star = raw_with_stem.replace("$$*", &stem);
+            // Replace `$*` (the stem auto-variable, already reduced from `$$*` by
+            // first-expansion) with the literal stem so that each static pattern rule's
+            // own stem is baked in at parse time.  This prevents the wrong stem from being
+            // used when the evaluator merges multiple static pattern rules for the same
+            // target and replaces the collective static_stem with the last rule's value.
+            // Only the bare `$*` form is replaced here; `$(*D)` / `$(*F)` etc. are left
+            // for second expansion at build time (they are uncommon in static pattern rules).
+            let raw_with_star = subst_dollar_star_in_se_text(&raw_with_stem, &stem);
             rule.second_expansion_prereqs = Some(raw_with_star);
         }
         if raw_order_only_text.contains('$') {
             let raw_oo_with_stem = subst_first_percent_per_word_in_se_text(&raw_order_only_text, &stem);
-            let raw_oo_with_star = raw_oo_with_stem.replace("$$*", &stem);
+            let raw_oo_with_star = subst_dollar_star_in_se_text(&raw_oo_with_stem, &stem);
             rule.second_expansion_order_only = Some(raw_oo_with_star);
         }
 

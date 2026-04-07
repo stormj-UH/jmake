@@ -464,14 +464,19 @@ pub fn parse_args() -> MakeArgs {
                             j = chars.len();
                             continue;
                         } else {
-                            // -j <value>: if next arg is not a number, don't consume it
-                            // (it will be treated as a target).
+                            // -j <value>: if next arg is a number, consume it.
+                            // If not (or no next arg), bare -j means unlimited parallelism.
+                            let mut consumed = false;
                             if i + 1 < args.len() {
                                 if let Ok(n) = args[i + 1].parse::<usize>() {
                                     i += 1;
                                     result.jobs = n;
+                                    consumed = true;
                                 }
-                                // else: leave i unchanged; next arg becomes a target
+                            }
+                            if !consumed {
+                                // bare -j with no number = unlimited parallel jobs
+                                result.jobs = usize::MAX;
                             }
                         }
                     }

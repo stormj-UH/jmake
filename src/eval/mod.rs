@@ -2685,7 +2685,9 @@ impl MakeState {
         let progname = make_progname();
 
         for (lineno, cmd_template) in recipe {
-            let mut cmd = cmd_template.clone();
+            // Trim leading whitespace that may remain after stripping a custom
+            // RECIPEPREFIX character (e.g. `>` leaves a leading space in ` @cmd`).
+            let mut cmd = cmd_template.trim_start().to_string();
             let mut cmd_silent = false;
             let mut ignore_error = false;
             loop {
