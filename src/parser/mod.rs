@@ -481,11 +481,12 @@ pub fn strip_comment(line: &str) -> String {
 pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
     let mut is_override = false;
     let mut is_export = false;
+    let mut is_unexport = false;
     let mut is_private = false;
     let mut target: Option<String> = None;
     let mut work = line.to_string();
 
-    // Check for override/export/private prefixes
+    // Check for override/export/unexport/private prefixes
     // Note: these are only keywords when followed by another keyword or a valid
     // variable name+operator (not when the word IS the variable name, e.g. "private = g").
     let is_keyword_prefix = |keyword: &str, rest: &str| -> bool {
@@ -519,6 +520,14 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
             let after = &trimmed["export ".len()..];
             if is_keyword_prefix("export", after) {
                 is_export = true;
+                work = after.to_string();
+                continue;
+            }
+        }
+        if trimmed.starts_with("unexport ") {
+            let after = &trimmed["unexport ".len()..];
+            if is_keyword_prefix("unexport", after) {
+                is_unexport = true;
                 work = after.to_string();
                 continue;
             }
@@ -565,7 +574,7 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                     strip_var_prefixes(raw_var_part);
                 let effective_override = is_override || inner_override;
                 let effective_export = is_export || inner_export;
-                let effective_unexport = inner_unexport;
+                let effective_unexport = is_unexport || inner_unexport;
                 let effective_private = is_private || inner_private;
                 if !potential_target.is_empty() && !potential_var.is_empty()
                     && !potential_var.contains('/')
@@ -617,7 +626,7 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
                 flavor,
                 is_override,
                 is_export,
-                is_unexport: false,
+                is_unexport,
                 is_private,
                 target: None,
             });

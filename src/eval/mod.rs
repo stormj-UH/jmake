@@ -580,6 +580,11 @@ impl MakeState {
             }
         }
 
+        // Job count: -j N (only when > 1; -j1 is the default and not passed on)
+        if self.args.jobs > 1 {
+            long_parts.push(format!("-j{}", self.args.jobs));
+        }
+
         // No-arg long options (come after options-with-args)
         if self.args.trace { long_parts.push("--trace".to_string()); }
         if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
@@ -1102,6 +1107,7 @@ impl MakeState {
                                 if raw_is_private { var_prefix.push_str("private "); }
                                 if raw_is_override { var_prefix.push_str("override "); }
                                 if raw_is_export { var_prefix.push_str("export "); }
+                                if raw_is_unexport { var_prefix.push_str("unexport "); }
                                 if let Some(tgt) = raw_target {
                                     // Target-specific variable: "target: [modifiers] name op value"
                                     let expanded_target = self.expand(&tgt);

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
 // Recipe execution engine - dependency resolution and recipe running
 
+pub mod parallel;
+
 use crate::cli::ShuffleMode;
 use crate::database::MakeDatabase;
 use crate::eval::MakeState;
@@ -11,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 use std::time::SystemTime;
 
 pub struct Executor<'a> {
@@ -64,6 +68,19 @@ pub struct Executor<'a> {
     /// Targets that have already failed (in keep-going mode).
     /// Avoids re-running recipes for targets that already failed in this session.
     failed_targets: HashSet<String>,
+    /// When true, execute_recipe() stores a TargetPlan instead of running the recipe.
+    /// Used during the graph-resolution phase of parallel builds.
+    collect_plans_mode: bool,
+    /// Accumulated TargetPlans during graph resolution (only Some when collect_plans_mode).
+    pending_plans: Option<HashMap<String, parallel::TargetPlan>>,
+    /// Resolved TargetPlans for the current parallel build (set after collect_plans()).
+    /// Used by build_job_from_plan() to look up plan data.
+    parallel_plans: Option<HashMap<String, parallel::TargetPlan>>,
+    /// Prerequisites for the current target being resolved (set before execute_recipe).
+    /// Used in collect_plans_mode to populate TargetPlan.prerequisites.
+    pending_plan_prereqs: Vec<String>,
+    /// Order-only prerequisites for the current target (set before execute_recipe).
+    pending_plan_order_only: Vec<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -129,10 +146,25 @@ impl<'a> Executor<'a> {
             shuffle,
             shuffle_seed,
             failed_targets: HashSet::new(),
+            collect_plans_mode: false,
+            pending_plans: None,
+            parallel_plans: None,
+            pending_plan_prereqs: Vec::new(),
+            pending_plan_order_only: Vec::new(),
         }
     }
 
     pub fn build_targets(&mut self, targets: &[String]) -> Result<(), String> {
+        // Dispatch to parallel or sequential path based on job count and .NOTPARALLEL.
+        if self.jobs > 1 && !self.db.not_parallel {
+            return self.build_targets_parallel(targets);
+        }
+        self.build_targets_sequential(targets)
+    }
+
+    /// Sequential build path (existing logic, unchanged from original build_targets).
+    /// Used when jobs == 1 or .NOTPARALLEL is set.
+    fn build_targets_sequential(&mut self, targets: &[String]) -> Result<(), String> {
         // Record top-level targets so they are not deleted even if .INTERMEDIATE
         for t in targets {
             self.top_level_targets.insert(t.clone());
@@ -206,6 +238,326 @@ impl<'a> Executor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Parallel build path: used when jobs > 1 and .NOTPARALLEL is not set.
+    ///
+    /// Phase 1: Sequential graph resolution on the main thread to compute TargetPlans,
+    /// then parallel execution with a thread pool.
+    fn build_targets_parallel(&mut self, targets: &[String]) -> Result<(), String> {
+        use parallel::{ParallelScheduler, TargetState};
+
+        // Record top-level targets for intermediate deletion.
+        for t in targets {
+            self.top_level_targets.insert(t.clone());
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 1: Graph resolution (sequential, main thread)
+        //
+        // Run the full build graph walk in "plan collection" mode.
+        // execute_recipe() stores TargetPlans instead of spawning processes.
+        // After this call, all TargetPlans are in self.parallel_plans.
+        // ------------------------------------------------------------------
+        let plans = self.collect_plans(targets)?;
+
+        // Store plans so build_job_from_plan can look them up.
+        self.parallel_plans = Some(plans);
+
+        // Snapshot execution parameters before moving anything.
+        let env_ops = self.build_env_ops_for_workers();
+        let shell = self.shell.to_string();
+        let shell_flags = self.shell_flags.to_string();
+        let makelevel = self.get_makelevel();
+        let gnumakeflags_was_set = self.state.args.gnumakeflags_was_set;
+        let one_shell = self.db.one_shell;
+        let delete_on_error = self.db.special_targets.contains_key(&SpecialTarget::DeleteOnError);
+
+        // ------------------------------------------------------------------
+        // Phase 2: Set up worker thread pool and scheduler
+        // ------------------------------------------------------------------
+        let num_workers = self.jobs;
+        let (job_tx, job_rx) = mpsc::channel::<parallel::Job>();
+        let (result_tx, result_rx) = mpsc::channel::<parallel::JobResult>();
+        let job_rx_shared = Arc::new(Mutex::new(job_rx));
+
+        // Move plans into the scheduler (clone from parallel_plans).
+        let sched_plans = self.parallel_plans.take().unwrap_or_default();
+        self.parallel_plans = Some(sched_plans.clone()); // keep a copy for build_job_from_plan
+
+        let workers = parallel::spawn_workers(num_workers, job_rx_shared, result_tx);
+
+        let mut scheduler = ParallelScheduler::new(
+            self.jobs,
+            sched_plans,
+            job_tx,
+            result_rx,
+            self.keep_going,
+            self.progname.clone(),
+        );
+
+        scheduler.find_initial_ready(targets);
+
+        // ------------------------------------------------------------------
+        // Phase 3: Scheduler main loop
+        // ------------------------------------------------------------------
+        loop {
+            // Launch jobs up to the slot limit.
+            while scheduler.should_launch() {
+                let target = match scheduler.pop_ready() {
+                    Some(t) => t,
+                    None => break,
+                };
+
+                let job = self.build_job_from_plan(
+                    &target,
+                    &env_ops,
+                    &shell,
+                    &shell_flags,
+                    &makelevel,
+                    gnumakeflags_was_set,
+                    one_shell,
+                    delete_on_error,
+                );
+
+                match job {
+                    Some(j) => {
+                        scheduler.states.insert(target.clone(), TargetState::Running);
+                        scheduler.running_count += 1;
+                        scheduler.send_job(j);
+                    }
+                    None => {
+                        // No recipe or not needed — complete immediately without
+                        // going through a worker thread.
+                        // We mark it done and propagate to dependents directly.
+                        // Do NOT call handle_completion (which does running_count -= 1).
+                        scheduler.states.insert(target.clone(), TargetState::Done(false));
+                        // Propagate to dependents.
+                        if let Some(deps) = scheduler.dependents_of.get(&target).cloned() {
+                            for dep in deps {
+                                if !scheduler.states.contains_key(dep.as_str()) {
+                                    if scheduler.all_prereqs_done_pub(&dep) {
+                                        scheduler.states.insert(dep.clone(), TargetState::Ready);
+                                        scheduler.ready_queue.push_back(dep);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If nothing is running and nothing is queued, we're done.
+            if !scheduler.has_work() {
+                break;
+            }
+
+            // Wait for a result from a worker.
+            match scheduler.recv_result() {
+                Some(result) => {
+                    scheduler.handle_completion(result);
+                }
+                None => break, // all workers exited unexpectedly
+            }
+        }
+
+        // Drain any in-flight jobs (handles error + remaining workers).
+        scheduler.drain_running();
+
+        // Close the job channel so worker threads can exit.
+        // The scheduler holds job_tx; dropping scheduler closes it.
+        // But we need to explicitly drop job_tx from the scheduler first.
+        // Actually, scheduler's job_tx will be dropped when scheduler goes out of scope.
+        // Force it now so workers see the closed channel:
+        {
+            let _ = scheduler.job_tx.clone(); // just to reference it; it's dropped with scheduler
+        }
+
+        // Wait for all worker threads to finish.
+        // First we must drop the scheduler (and its job_tx) to signal workers.
+        let any_recipe_ran = scheduler.any_recipe_ran;
+        let intermediate_built = scheduler.intermediate_built.clone();
+        let final_error = scheduler.final_error();
+        let target_states = scheduler.states.clone();
+
+        // Drop scheduler (closes job_tx, workers will exit their recv loop).
+        drop(scheduler);
+
+        for w in workers {
+            let _ = w.join();
+        }
+
+        // Clean up parallel plans.
+        self.parallel_plans = None;
+
+        // ------------------------------------------------------------------
+        // Phase 4: Post-build reporting
+        // ------------------------------------------------------------------
+
+        if let Some(e) = final_error {
+            self.delete_intermediate_files();
+            if e.is_empty() {
+                return Err(String::new());
+            }
+            return Err(e);
+        }
+
+        // Print "is up to date" / "Nothing to be done" for top-level targets.
+        for target in targets {
+            if let Some(TargetState::Done(rebuilt)) = target_states.get(target.as_str()) {
+                if !rebuilt && !self.silent && !self.question && !any_recipe_ran {
+                    let has_recipe = self.target_has_recipe(target);
+                    if has_recipe {
+                        println!("{}: '{}' is up to date.", self.progname, target);
+                    } else {
+                        println!("{}: Nothing to be done for '{}'.", self.progname, target);
+                    }
+                }
+            }
+        }
+
+        // Track intermediate targets for deletion.
+        for t in &intermediate_built {
+            if !self.intermediate_built.contains(t) {
+                self.intermediate_built.push(t.clone());
+            }
+        }
+        self.delete_intermediate_files();
+
+        Ok(())
+    }
+
+    /// Build the global environment ops list for worker threads.
+    /// Returns a Vec of (name, Some(value)) to set or (name, None) to remove.
+    fn build_env_ops_for_workers(&self) -> Vec<(String, Option<String>)> {
+        use crate::types::VarOrigin;
+        let mut ops: Vec<(String, Option<String>)> = Vec::new();
+        for (name, var) in &self.db.variables {
+            if name == "MAKELEVEL" { continue; } // set separately
+            let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
+            let was_from_env = self.db.env_var_names.contains(name.as_str());
+            let should_export = !var.is_private && (always_export || match var.export {
+                Some(true) => true,
+                Some(false) => false,
+                None => {
+                    if self.db.unexport_all {
+                        was_from_env && var.origin == VarOrigin::Environment
+                    } else {
+                        self.db.export_all || was_from_env
+                    }
+                }
+            });
+            if should_export {
+                let value = self.state.expand(&var.value);
+                ops.push((name.clone(), Some(value)));
+            } else {
+                ops.push((name.clone(), None));
+            }
+        }
+        ops
+    }
+
+    /// Build a Job from a TargetPlan for dispatch to a worker thread.
+    /// Returns None if the target doesn't need rebuilding (will be marked Done).
+    fn build_job_from_plan(
+        &self,
+        target: &str,
+        env_ops: &[(String, Option<String>)],
+        shell: &str,
+        shell_flags: &str,
+        makelevel: &str,
+        gnumakeflags_was_set: bool,
+        one_shell: bool,
+        delete_on_error: bool,
+    ) -> Option<parallel::Job> {
+        let plans = self.parallel_plans.as_ref()?;
+        let plan = plans.get(target)?;
+
+        if plan.recipe.is_empty() {
+            return None; // no recipe
+        }
+
+        // Determine effective shell/flags for this target.
+        // (target-specific SHELL vars were baked into auto_vars during resolve)
+        let eff_shell = plan.auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(shell);
+        let eff_flags = plan.auto_vars.get(".SHELLFLAGS").map(|s| s.as_str()).unwrap_or(shell_flags);
+
+        // Pre-expand recipe lines using the stored auto_vars.
+        // The recipe lines in TargetPlan are already expanded (done during collect_plans).
+        let pre_expanded: Vec<(usize, String, Vec<String>)> = plan.recipe.iter().map(|(ln, line)| {
+            let sub_lines = parallel::split_recipe_sub_lines_standalone(line);
+            (*ln, line.clone(), sub_lines)
+        }).collect();
+
+        Some(parallel::Job {
+            target: plan.target.clone(),
+            pre_expanded,
+            source_file: plan.source_file.clone(),
+            shell: eff_shell.to_string(),
+            shell_flags: eff_flags.to_string(),
+            is_silent_target: self.db.is_silent_target(target),
+            silent: self.silent,
+            ignore_errors: self.ignore_errors,
+            dry_run: self.dry_run,
+            touch: self.touch,
+            trace: self.trace,
+            one_shell,
+            delete_on_error,
+            is_precious: self.db.is_precious(target),
+            progname: self.progname.clone(),
+            makelevel: makelevel.to_string(),
+            env_ops: env_ops.to_vec(),
+            extra_exports: plan.extra_exports.clone(),
+            extra_unexports: plan.extra_unexports.clone(),
+            gnumakeflags_was_set,
+        })
+    }
+
+    /// Collect TargetPlans for all targets reachable from `roots` without executing recipes.
+    /// This is Phase 1 of the parallel build: sequential graph resolution.
+    ///
+    /// Strategy: we leverage the existing build_target() machinery, but in a "plan collection"
+    /// mode where execute_recipe() stores the plan instead of running shell commands.
+    /// We set `self.collect_plans_mode = true` and `self.pending_plans = Some(map)` before
+    /// calling build_targets_sequential(), then extract the collected plans.
+    fn collect_plans(
+        &mut self,
+        roots: &[String],
+    ) -> Result<HashMap<String, parallel::TargetPlan>, String> {
+        // Enable plan collection mode.
+        self.collect_plans_mode = true;
+        self.pending_plans = Some(HashMap::new());
+
+        // Run the sequential build in dry-run-like mode (it won't actually execute
+        // recipes because execute_recipe checks collect_plans_mode and stores plans).
+        // We need this to fully resolve dependencies, second expansion, pattern rules, etc.
+        let result = self.build_targets_sequential(roots);
+
+        // Disable plan collection mode and extract plans.
+        self.collect_plans_mode = false;
+        let plans = self.pending_plans.take().unwrap_or_default();
+
+        // Reset built/building state so the actual parallel execution starts fresh.
+        // (The sequential "dry run" marked targets as built — we need to undo that.)
+        self.built.clear();
+        self.building.clear();
+        self.building_stack.clear();
+        self.failed_targets.clear();
+        self.errors.clear();
+        self.any_recipe_ran = false;
+        self.grouped_covered.clear();
+        self.intermediate_built.clear();
+
+        // If the sequential pass failed (e.g., missing rule), propagate the error.
+        // But note: in collect_plans_mode, errors from missing recipes are soft
+        // (we still want to continue to collect what we can).
+        // For now, propagate hard errors (missing files with no rule).
+        match result {
+            Err(e) if !e.is_empty() => return Err(e),
+            _ => {}
+        }
+
+        Ok(plans)
     }
 
     /// Delete intermediate files that were built during this run.
@@ -385,6 +737,10 @@ impl<'a> Executor<'a> {
                 auto_vars.insert("*".to_string(), String::new());
                 self.target_extra_exports = self.compute_target_exports(target);
                 self.target_extra_unexports = self.compute_target_unexports(target);
+                if self.collect_plans_mode {
+                    self.pending_plan_prereqs = Vec::new();
+                    self.pending_plan_order_only = Vec::new();
+                }
                 let result = self.execute_recipe(target, &default_rule.recipe, &default_rule.source_file, &auto_vars, false);
                 self.target_extra_exports.clear();
                 self.target_extra_unexports.clear();
@@ -842,6 +1198,11 @@ impl<'a> Executor<'a> {
 
         self.target_extra_exports = self.compute_target_exports(target);
         self.target_extra_unexports = self.compute_target_unexports(target);
+        // In plan collection mode, record the prerequisites so execute_recipe can store them.
+        if self.collect_plans_mode {
+            self.pending_plan_prereqs = all_prereqs.clone();
+            self.pending_plan_order_only = all_order_only.clone();
+        }
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
@@ -1165,6 +1526,10 @@ impl<'a> Executor<'a> {
 
         self.target_extra_exports = self.compute_target_exports(target);
         self.target_extra_unexports = self.compute_target_unexports(target);
+        if self.collect_plans_mode {
+            self.pending_plan_prereqs = all_prereqs.clone();
+            self.pending_plan_order_only = all_order_only.clone();
+        }
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
@@ -1360,6 +1725,10 @@ impl<'a> Executor<'a> {
 
             self.target_extra_exports = self.compute_target_exports(target);
             self.target_extra_unexports = self.compute_target_unexports(target);
+            if self.collect_plans_mode {
+                self.pending_plan_prereqs = prereqs.clone();
+                self.pending_plan_order_only = order_only.clone();
+            }
             match self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony) {
                 Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
                 Err(e) => {
@@ -1581,6 +1950,10 @@ impl<'a> Executor<'a> {
 
         self.target_extra_exports = self.compute_target_exports(target);
         self.target_extra_unexports = self.compute_target_unexports(target);
+        if self.collect_plans_mode {
+            self.pending_plan_prereqs = prereqs.clone();
+            self.pending_plan_order_only = order_only.clone();
+        }
         let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
@@ -2620,6 +2993,53 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
+        // ------------------------------------------------------------------
+        // Plan collection mode: store a TargetPlan instead of running the recipe.
+        // This is used during parallel graph resolution (Phase 1 of -j N builds).
+        // ------------------------------------------------------------------
+        if self.collect_plans_mode {
+            // Expand recipe lines now (on main thread, with full state access).
+            // This is the ONLY place where expansion happens for the parallel path.
+            let expanded_recipe: Vec<(usize, String)> = recipe.iter().map(|(lineno, line)| {
+                *self.state.current_file.borrow_mut() = source_file.to_string();
+                *self.state.current_line.borrow_mut() = *lineno;
+                let preprocessed = preprocess_recipe_bsnl(line);
+                let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                // Join sub-lines into a single string; the worker will re-split them.
+                let sub_lines = split_recipe_sub_lines(&expanded);
+                let rejoined = sub_lines.join("\n");
+                (*lineno, rejoined)
+            }).collect();
+
+            // Capture prereqs (set by the caller via pending_plan_prereqs).
+            let prerequisites = std::mem::take(&mut self.pending_plan_prereqs);
+            let order_only = std::mem::take(&mut self.pending_plan_order_only);
+
+            let plan = parallel::TargetPlan {
+                target: target.to_string(),
+                prerequisites,
+                order_only,
+                recipe: expanded_recipe,
+                source_file: source_file.to_string(),
+                auto_vars: auto_vars.clone(),
+                is_phony: self.db.is_phony(target),
+                needs_rebuild: true, // was determined to need rebuild (we're here)
+                grouped_primary: None,
+                grouped_siblings: Vec::new(),
+                extra_exports: self.target_extra_exports.clone(),
+                extra_unexports: self.target_extra_unexports.iter().cloned().collect(),
+                is_intermediate: self.db.is_intermediate(target),
+            };
+
+            if let Some(ref mut plans) = self.pending_plans {
+                plans.insert(target.to_string(), plan);
+            }
+
+            // Mark as ran so the build graph continues correctly.
+            self.any_recipe_ran = true;
+            return Ok(true);
+        }
+
         // With --trace, print "file:line: update target 'X' due to: reason" before executing.
         if self.trace && !recipe.is_empty() {
             let (lineno, _) = &recipe[0];
@@ -2658,12 +3078,15 @@ impl<'a> Executor<'a> {
             // Execute all recipe lines as one shell script.
             // In .ONESHELL mode:
             //   - ALL recipe lines are joined and passed to a single shell invocation.
-            //   - Prefix chars (@, -, +) are stripped from ALL recipe lines when building
-            //     the script (so they don't appear as invalid shell commands).
+            //   - For Bourne-compatible shells: prefix chars (@, -, +) are stripped
+            //     from ALL recipe lines when building the script.
+            //   - For non-Bourne shells (perl, python, etc.): prefixes are NOT stripped
+            //     because they may be valid syntax in those languages.
             //   - Echo behaviour and error-ignore are controlled by the FIRST recipe
             //     line's prefix only; inner-line prefix chars don't affect behavior.
             //   - The last recipe lineno is used for error messages.
 
+            let bourne_shell = is_bourne_compatible_shell(self.shell);
             let mut script = String::new();
             let mut first_line_silent = false;
             let mut first_line_ignore = false;
@@ -2679,16 +3102,29 @@ impl<'a> Executor<'a> {
                 // Pre-process: collapse \<newline> inside $(…)/${…} references
                 let preprocessed = preprocess_recipe_bsnl(line);
                 let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                // Strip @-+ prefixes from ALL lines for the script.
-                // First line: also record behavioral flags (silent, ignore errors).
                 if is_first {
+                    // First line: record behavioral flags (silent, ignore errors).
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
                     is_first = false;
+                    // For Bourne shells, strip prefixes from script; non-Bourne: keep them.
+                    let cmd_line = if bourne_shell {
+                        strip_recipe_prefixes(&expanded)
+                    } else {
+                        expanded.clone()
+                    };
+                    script.push_str(&cmd_line);
+                } else {
+                    // Subsequent lines: for Bourne shells, strip @-+ prefixes.
+                    // For non-Bourne shells, leave them intact (they may be valid syntax).
+                    let cmd_line = if bourne_shell {
+                        strip_recipe_prefixes(&expanded)
+                    } else {
+                        expanded.clone()
+                    };
+                    script.push_str(&cmd_line);
                 }
-                let cmd_line = strip_recipe_prefixes(&expanded);
-                script.push_str(&cmd_line);
                 script.push('\n');
             }
 
@@ -2696,11 +3132,16 @@ impl<'a> Executor<'a> {
             let effective_ignore = first_line_ignore || self.ignore_errors;
 
             if !effective_silent {
-                // Echo lines with @-+ prefixes stripped from ALL lines.
+                // Echo lines. For Bourne shells, strip @-+ prefixes for display.
+                // For non-Bourne shells, leave them as-is.
                 for (_lineno, line) in recipe {
                     let preprocessed = preprocess_recipe_bsnl(line);
                     let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                    let display = strip_recipe_prefixes(&expanded);
+                    let display = if bourne_shell {
+                        strip_recipe_prefixes(&expanded)
+                    } else {
+                        expanded.clone()
+                    };
                     if !display.trim().is_empty() {
                         println!("{}", display.trim_end());
                     }
@@ -3413,6 +3854,21 @@ fn strip_recipe_prefixes(line: &str) -> String {
     }
 
     line[i..].to_string()
+}
+
+/// Check if the given shell path is a Bourne-compatible shell.
+/// This mirrors GNU Make's is_bourne_compatible_shell() check.
+/// Only strips @-+ recipe prefixes in ONESHELL mode for Bourne-compatible shells;
+/// for non-standard shells (perl, python, etc.) the prefixes are left in place
+/// because they may be valid syntax in those languages.
+fn is_bourne_compatible_shell(shell: &str) -> bool {
+    const UNIX_SHELLS: &[&str] = &["sh", "bash", "dash", "ksh", "rksh", "zsh", "ash"];
+    // Get the basename of the shell path
+    let basename = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    UNIX_SHELLS.contains(&basename)
 }
 
 /// Pre-process a recipe line before variable expansion.
