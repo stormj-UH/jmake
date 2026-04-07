@@ -1105,6 +1105,12 @@ impl MakeState {
                                             var.is_private = true;
                                         }
                                     }
+                                    // Drain any eval_pending items queued during value expansion.
+                                    loop {
+                                        let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
+                                        if pending.is_empty() { break; }
+                                        for s in pending { self.eval_string(&s)?; }
+                                    }
                                     continue;
                                 }
                                 self.expand(&line)
