@@ -73,6 +73,27 @@ pub struct MakeState {
     pub entering_directory_printed: bool,
 }
 
+/// Return the current working directory preferring the logical path from PWD env var.
+/// On macOS, getcwd() returns the canonical path (e.g. /private/tmp) but PWD holds
+/// the logical path (e.g. /tmp). GNU Make uses the logical path for display.
+pub fn logical_cwd() -> std::path::PathBuf {
+    if let Ok(pwd) = env::var("PWD") {
+        let pwd_path = std::path::PathBuf::from(&pwd);
+        // Validate that PWD actually points to the same directory as getcwd()
+        // (it could be stale if someone cd'd without setting PWD)
+        if let Ok(canonical_pwd) = pwd_path.canonicalize() {
+            if let Ok(actual) = env::current_dir() {
+                if let Ok(canonical_actual) = actual.canonicalize() {
+                    if canonical_pwd == canonical_actual {
+                        return pwd_path;
+                    }
+                }
+            }
+        }
+    }
+    env::current_dir().unwrap_or_default()
+}
+
 /// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
 /// The level is read from the MAKELEVEL environment variable (set by parent make).
 pub fn make_progname() -> String {
@@ -123,8 +144,32 @@ impl MakeState {
                 eprintln!("{}: *** {}: {}.  Stop.", progname, dir.display(), e);
                 std::process::exit(2);
             }
+            // Update PWD to the new directory using the logical path.
+            // We compute a new logical path by joining the old logical cwd with
+            // the -C argument and normalizing, so that symlinks in the parent path
+            // are preserved (matching shell `cd` behavior).
+            let new_logical = {
+                let old_pwd = env::var("PWD").map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| env::current_dir().unwrap_or_default());
+                let joined = if std::path::Path::new(dir).is_absolute() {
+                    std::path::PathBuf::from(dir)
+                } else {
+                    old_pwd.join(dir)
+                };
+                // Normalize (remove .. and . components) without resolving symlinks
+                let mut normalized = std::path::PathBuf::new();
+                for comp in joined.components() {
+                    match comp {
+                        std::path::Component::ParentDir => { normalized.pop(); }
+                        std::path::Component::CurDir => {}
+                        _ => normalized.push(comp),
+                    }
+                }
+                normalized
+            };
+            env::set_var("PWD", &new_logical);
             if should_print_directory(&state.args) {
-                let cwd = env::current_dir().unwrap_or_default();
+                let cwd = logical_cwd();
                 eprintln!("{}: Entering directory '{}'", progname, cwd.display());
                 state.entering_directory_printed = true;
             }
@@ -152,7 +197,7 @@ impl MakeState {
         let print_dir = should_print_directory(&self.args);
         if print_dir && !self.entering_directory_printed {
             // Already printed at startup for -C; print here for -w without -C
-            let cwd = env::current_dir().unwrap_or_default();
+            let cwd = logical_cwd();
             eprintln!("{}: Entering directory '{}'", progname, cwd.display());
             self.entering_directory_printed = true;
         }
@@ -260,7 +305,7 @@ impl MakeState {
         // Print leaving-directory if needed
         let print_dir = should_print_directory(&self.args);
         if print_dir {
-            let cwd = env::current_dir().unwrap_or_default();
+            let cwd = logical_cwd();
             eprintln!("{}: Leaving directory '{}'", progname, cwd.display());
         }
 
@@ -268,7 +313,7 @@ impl MakeState {
     }
 
     fn init_variables(&mut self) {
-        let cwd = env::current_dir().unwrap_or_default();
+        let cwd = logical_cwd();
 
         // Set up built-in variables
         self.db.variables.insert("MAKE_VERSION".into(),
@@ -326,6 +371,14 @@ impl MakeState {
             env::set_var("MAKEFLAGS", &mf);
             self.db.variables.insert("MAKEFLAGS".into(),
                 Variable::new(mf, VarFlavor::Recursive, VarOrigin::Default));
+        }
+        // MAKEOVERRIDES: command-line variable assignments portion of MAKEFLAGS.
+        {
+            let ov: Vec<String> = self.args.variables.iter()
+                .map(|(n, v)| format!("{}={}", n, v))
+                .collect();
+            self.db.variables.insert("MAKEOVERRIDES".into(),
+                Variable::new(ov.join(" "), VarFlavor::Recursive, VarOrigin::Default));
         }
         // MAKECMDGOALS: the list of targets specified on the command line.
         // Set before reading makefiles so it's available during makefile processing.
@@ -1587,10 +1640,30 @@ impl MakeState {
 
         // Special handling for MAKEFLAGS: when it's modified from a makefile,
         // parse the new value and apply any new flags to the runtime state.
-        // This allows things like `MAKEFLAGS += -Ibar` to actually add to include_dirs.
-        // (makeflags_protected covers the -e case where MAKEFLAGS is already protected above)
         if name == "MAKEFLAGS" && !is_override && !makeflags_protected {
             self.apply_makeflags_from_makefile();
+        }
+
+        // MAKEOVERRIDES: when set (especially to empty), it controls the variable
+        // assignments portion of MAKEFLAGS. Setting MAKEOVERRIDES= clears vars from MAKEFLAGS.
+        if name == "MAKEOVERRIDES" {
+            // Rebuild MAKEFLAGS with the new MAKEOVERRIDES value as the variable list
+            let overrides_val = value.to_string();
+            // Parse the MAKEOVERRIDES value into variable assignments
+            let mut new_vars: Vec<(String, String)> = Vec::new();
+            if !overrides_val.is_empty() {
+                for part in overrides_val.split_whitespace() {
+                    if let Some(eq) = part.find('=') {
+                        new_vars.push((part[..eq].to_string(), part[eq+1..].to_string()));
+                    }
+                }
+            }
+            self.args.variables = new_vars;
+            let new_mf = self.build_makeflags_from_args(&self.args.variables.clone());
+            if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
+                var.value = new_mf.clone();
+            }
+            env::set_var("MAKEFLAGS", &new_mf);
         }
 
         if is_export {
@@ -1654,7 +1727,7 @@ impl MakeState {
         let now_printing_dir = should_print_directory(&self.args);
         if now_printing_dir && !was_printing_dir && !self.entering_directory_printed {
             let progname = make_progname();
-            let cwd = env::current_dir().unwrap_or_default();
+            let cwd = logical_cwd();
             eprintln!("{}: Entering directory '{}'", progname, cwd.display());
             self.entering_directory_printed = true;
         }

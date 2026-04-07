@@ -476,7 +476,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     while i < tokens.len() {
         let token = tokens[i];
 
-        if past_dashdash {
+        if past_dashdash && !token.starts_with('-') {
             // Variable assignment: NAME=value or NAME:=value etc.
             // Add to variables so they're included in MAKEFLAGS output
             // and applied as command-line-level overrides in sub-makes.
