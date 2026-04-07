@@ -1049,17 +1049,25 @@ fn expand_static_pattern_rule(
         rule.static_stem = stem.clone();
 
         // Store raw SE texts for second expansion.
-        // We store the raw prereq text with only the FIRST `%` per word replaced by the stem,
-        // so that `$*` (not `%`) is used for stem references while `$$@`, `$$<` etc. still
-        // expand to the per-target automatic vars.  Subsequent `%` characters in a word are
-        // left unchanged (GNU Make rule: only the first `%` per word is the wildcard).
+        // We store the raw prereq text with:
+        //   1. The FIRST `%` per word replaced by the stem (pattern wildcard substitution).
+        //   2. `$$*` replaced by the literal stem (so each static pattern rule's own stem
+        //      is baked in at parse time, allowing correct `$*` expansion even when multiple
+        //      static pattern rules for the same target are merged by the evaluator).
+        // This ensures that `$$*` in each rule's SE text refers to THAT rule's stem,
+        // not the globally-last static stem stored on the merged rule.
+        // Other auto vars ($$@, $$<, etc.) are still expanded at build time.
         if raw_prereq_text.contains('$') {
             let raw_with_stem = subst_first_percent_per_word_in_se_text(&raw_prereq_text, &stem);
-            rule.second_expansion_prereqs = Some(raw_with_stem);
+            // Replace $$* with the literal stem so that per-rule stem is preserved
+            // after merging by the evaluator.
+            let raw_with_star = raw_with_stem.replace("$$*", &stem);
+            rule.second_expansion_prereqs = Some(raw_with_star);
         }
         if raw_order_only_text.contains('$') {
             let raw_oo_with_stem = subst_first_percent_per_word_in_se_text(&raw_order_only_text, &stem);
-            rule.second_expansion_order_only = Some(raw_oo_with_stem);
+            let raw_oo_with_star = raw_oo_with_stem.replace("$$*", &stem);
+            rule.second_expansion_order_only = Some(raw_oo_with_star);
         }
 
         // Inline recipe after `;` is propagated to every generated rule.
