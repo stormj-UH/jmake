@@ -122,14 +122,101 @@ fn fn_filter_out(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     results.join(" ")
 }
 
+/// Match a GNU Make filter pattern against a word.
+///
+/// In GNU Make filter patterns:
+///  - `\%` is an escaped literal `%` (not a wildcard).
+///  - `\\` is an escaped literal `\`.
+///  - A bare `%` (not preceded by `\`) is the wildcard (matches any string).
+///  - Only the FIRST unescaped `%` is treated as wildcard.
+///
+/// This function handles all three cases and correctly matches words against
+/// patterns that contain literal `%` characters.
 fn pattern_matches(pattern: &str, word: &str) -> bool {
-    if let Some(percent_pos) = pattern.find('%') {
-        let prefix = &pattern[..percent_pos];
-        let suffix = &pattern[percent_pos+1..];
-        word.starts_with(prefix) && word.ends_with(suffix) && word.len() >= prefix.len() + suffix.len()
-    } else {
-        pattern == word
+    // Parse the pattern to find the first unescaped `%` (the wildcard).
+    // Build a literal prefix and suffix (with backslash-escape processing).
+    let pbytes = pattern.as_bytes();
+    let mut prefix_lit = Vec::new(); // literal bytes before the wildcard (or the whole pattern)
+    let mut wildcard_pos: Option<usize> = None; // index IN pbytes where `%` wildcard is
+    let mut i = 0;
+    while i < pbytes.len() {
+        if pbytes[i] == b'\\' && i + 1 < pbytes.len() {
+            match pbytes[i + 1] {
+                b'%' => {
+                    // \% → literal %
+                    prefix_lit.push(b'%');
+                    i += 2;
+                }
+                b'\\' => {
+                    // \\ → literal \
+                    prefix_lit.push(b'\\');
+                    i += 2;
+                }
+                _ => {
+                    // \ followed by anything else: keep the backslash and advance one
+                    prefix_lit.push(b'\\');
+                    i += 1;
+                }
+            }
+        } else if pbytes[i] == b'%' {
+            // Unescaped `%`: this is the wildcard.
+            wildcard_pos = Some(i);
+            i += 1;
+            break;
+        } else {
+            prefix_lit.push(pbytes[i]);
+            i += 1;
+        }
     }
+
+    if wildcard_pos.is_none() {
+        // No wildcard: the pattern must match the word exactly (after unescape).
+        // Build the full unescaped pattern.
+        let mut full = prefix_lit;
+        while i < pbytes.len() {
+            if pbytes[i] == b'\\' && i + 1 < pbytes.len() {
+                match pbytes[i + 1] {
+                    b'%' => { full.push(b'%'); i += 2; }
+                    b'\\' => { full.push(b'\\'); i += 2; }
+                    _ => { full.push(b'\\'); i += 1; }
+                }
+            } else {
+                full.push(pbytes[i]);
+                i += 1;
+            }
+        }
+        return word.as_bytes() == full.as_slice();
+    }
+
+    // Build the literal suffix (the part after the `%` wildcard).
+    let mut suffix_lit = Vec::new();
+    while i < pbytes.len() {
+        if pbytes[i] == b'\\' && i + 1 < pbytes.len() {
+            match pbytes[i + 1] {
+                b'%' => { suffix_lit.push(b'%'); i += 2; }
+                b'\\' => { suffix_lit.push(b'\\'); i += 2; }
+                _ => { suffix_lit.push(b'\\'); i += 1; }
+            }
+        } else {
+            suffix_lit.push(pbytes[i]);
+            i += 1;
+        }
+    }
+
+    let wbytes = word.as_bytes();
+    let plen = prefix_lit.len();
+    let slen = suffix_lit.len();
+
+    if wbytes.len() < plen + slen {
+        return false;
+    }
+    if &wbytes[..plen] != prefix_lit.as_slice() {
+        return false;
+    }
+    if slen > 0 && &wbytes[wbytes.len() - slen..] != suffix_lit.as_slice() {
+        return false;
+    }
+    true
 }
 
 fn fn_sort(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {

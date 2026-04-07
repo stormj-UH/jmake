@@ -1637,6 +1637,17 @@ impl MakeState {
                     .and_then(|v| v.value.chars().next());
                 parser.recipe_prefix = if pfx == Some('\t') { None } else { pfx };
             }
+
+            // Process any $(eval) calls that were queued during this line's expansion.
+            // GNU Make processes $(eval) immediately, so effects (like undefine) are
+            // visible to subsequent lines in the same makefile.
+            loop {
+                let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
+                if pending.is_empty() { break; }
+                for s in pending {
+                    self.eval_string(&s)?;
+                }
+            }
         }
 
         // Check for unterminated define block (missing endef)
@@ -2479,6 +2490,11 @@ impl MakeState {
         ignore_missing: bool,
         visited: &mut HashSet<String>,
     ) -> Result<(), String> {
+        // Use keep-going semantics: when one prerequisite fails, continue building
+        // siblings so that parallel-like behavior is approximated (all siblings at
+        // the same level run even if one fails). Return the first error at the end.
+        let mut first_error: Option<String> = None;
+
         for prereq in prerequisites {
             let prereq_path = Path::new(prereq);
 
@@ -2512,24 +2528,34 @@ impl MakeState {
                 match explicit_rule {
                     None => {
                         if !ignore_missing {
-                            return Err(format!("No rule to make target '{}', needed by '{}'.  Stop.",
-                                prereq, include_target));
+                            // Collect error but continue to build siblings.
+                            if first_error.is_none() {
+                                first_error = Some(format!(
+                                    "No rule to make target '{}', needed by '{}'.  Stop.",
+                                    prereq, include_target));
+                            }
                         }
                         continue;
                     }
                     Some(rule) => {
                         visited.insert(prereq.clone());
                         if !rule.prerequisites.is_empty() {
-                            self.build_include_prerequisites(
+                            if let Err(e) = self.build_include_prerequisites(
                                 &rule.prerequisites.clone(), prereq,
                                 shell, shell_flags, silent, ignore_missing, visited,
-                            )?;
+                            ) {
+                                if first_error.is_none() { first_error = Some(e); }
+                                // Continue building siblings even on error.
+                            }
                         }
                         if !rule.recipe.is_empty() {
                             let src = rule.source_file.clone();
-                            self.run_include_recipe(
+                            if let Err(e) = self.run_include_recipe(
                                 prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
-                            )?;
+                            ) {
+                                if first_error.is_none() { first_error = Some(e); }
+                                // Continue building siblings.
+                            }
                         }
                     }
                 }
@@ -2539,10 +2565,12 @@ impl MakeState {
                 // Recursively build this prereq's prerequisites first
                 if !rule.prerequisites.is_empty() {
                     visited.insert(prereq.clone());
-                    self.build_include_prerequisites(
+                    if let Err(e) = self.build_include_prerequisites(
                         &rule.prerequisites.clone(), prereq,
                         shell, shell_flags, silent, ignore_missing, visited,
-                    )?;
+                    ) {
+                        if first_error.is_none() { first_error = Some(e); }
+                    }
                 }
                 // Check if any prereq is now newer than this target
                 let needs_rebuild = rule.prerequisites.iter().any(|p| {
@@ -2553,13 +2581,18 @@ impl MakeState {
                 });
                 if needs_rebuild && !rule.recipe.is_empty() {
                     let src = rule.source_file.clone();
-                    self.run_include_recipe(
+                    if let Err(e) = self.run_include_recipe(
                         prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
-                    )?;
+                    ) {
+                        if first_error.is_none() { first_error = Some(e); }
+                    }
                 }
             }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Information about a rule found for building an include file.
@@ -2969,8 +3002,17 @@ impl MakeState {
                     true
                 } else {
                     let target_time = target_mtime.unwrap();
-                    // A prereq triggers rebuild only if it now EXISTS and is newer than target.
+                    // A phony prerequisite always makes the target out of date.
+                    // A regular prereq triggers rebuild only if it now EXISTS and is newer.
+                    let phony_targets = self.db.special_targets
+                        .get(&SpecialTarget::Phony)
+                        .cloned()
+                        .unwrap_or_default();
                     rule_info.prerequisites.iter().any(|prereq| {
+                        if phony_targets.contains(prereq.as_str()) {
+                            // Phony prerequisite → always out of date
+                            return true;
+                        }
                         std::fs::metadata(prereq).ok()
                             .and_then(|m| m.modified().ok())
                             .map_or(false, |pt| pt > target_time)
@@ -3170,7 +3212,10 @@ impl MakeState {
                                     Err(recipe_err) => {
                                         if !pi.ignore_missing {
                                             if !pi.parent.is_empty() {
-                                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                                // When the recipe fails and the file still doesn't
+                                                // exist, GNU Make reports "No such file or directory"
+                                                // (not "Failed to remake makefile").
+                                                eprintln!("{}:{}: {}: No such file or directory",
                                                     pi.parent, pi.lineno, pi.file);
                                             }
                                             return Err(recipe_err);
