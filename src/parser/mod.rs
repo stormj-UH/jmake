@@ -33,6 +33,10 @@ pub struct Parser {
     pub conditional_stack: Vec<ConditionalState>,
     /// True when `.POSIX:` has been seen; affects backslash-newline collapsing.
     pub posix_mode: bool,
+    /// Current `.RECIPEPREFIX` character (None means tab is the prefix).
+    /// Used by `next_logical_line` to correctly handle backslash-newline continuation
+    /// in recipe lines that use a custom prefix character.
+    pub recipe_prefix: Option<char>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +64,7 @@ impl Parser {
             define_depth: 0,
             conditional_stack: Vec::new(),
             posix_mode: false,
+            recipe_prefix: None,
         }
     }
 
@@ -95,23 +100,34 @@ impl Parser {
         self.pos += 1;
 
         // Handle backslash line continuations
-        // For recipe lines (tab-prefixed), preserve the backslash-newline so the
-        // shell can handle continuation. For other lines, collapse to a single space.
+        // For recipe lines (tab-prefixed or custom-prefix), preserve the backslash-newline
+        // so the shell can handle continuation. For other lines, collapse to a single space.
         // EXCEPTION: For inline recipes (lines of the form "target:;recipe"), once
         // we have accumulated past the `;`, we must also preserve \<newline> so the
         // shell can handle multi-line inline recipes correctly (GNU Make 4.4 behavior).
         while line.ends_with('\\') && self.pos < self.lines.len() {
-            if line.starts_with('\t') {
+            // Check if this is a recipe line (tab prefix or custom .RECIPEPREFIX)
+            let is_recipe_line = line.starts_with('\t') || self.recipe_prefix
+                .map(|p| p != '\t' && line.starts_with(p))
+                .unwrap_or(false);
+            if is_recipe_line {
                 // Recipe line: preserve \<newline> for the shell.
-                // GNU Make strips at most ONE leading tab from the continuation
+                // GNU Make strips at most ONE leading prefix character from the continuation
                 // line (it is the recipe prefix character). Any other leading
                 // whitespace (spaces) must be preserved so the shell receives
                 // the correct text (e.g., "foo\<NL>    bar" should remain as
                 // "foo\<NL>    bar" so the shell can join them correctly).
                 line.push('\n');
                 let next = &self.lines[self.pos];
-                let stripped = if next.starts_with('\t') {
+                // Strip one leading recipe prefix character from continuation line
+                let stripped = if line.starts_with('\t') && next.starts_with('\t') {
                     &next[1..]
+                } else if let Some(p) = self.recipe_prefix {
+                    if p != '\t' && next.starts_with(p) {
+                        &next[p.len_utf8()..]
+                    } else {
+                        next
+                    }
                 } else {
                     next   // Preserve leading spaces; only strip one tab above
                 };

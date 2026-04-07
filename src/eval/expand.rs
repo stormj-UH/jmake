@@ -189,6 +189,12 @@ impl MakeState {
                 None => String::new(),
             };
         }
+        // .VARIABLES expands to a space-separated list of all currently defined variables.
+        if expanded_name == ".VARIABLES" {
+            let mut names: Vec<&str> = self.db.variables.keys().map(|k| k.as_str()).collect();
+            names.sort();
+            return names.join(" ");
+        }
         if let Some(var) = self.db.variables.get(&expanded_name) {
             return self.expand_var_value(var, auto_vars);
         }
