@@ -280,6 +280,10 @@ pub struct MakeDatabase {
     /// Number of built-in (default) pattern rules at the start of pattern_rules.
     /// When .SUFFIXES: clears all suffixes, these built-in rules are also removed.
     pub builtin_pattern_rules_count: usize,
+    /// True when .DEFAULT_GOAL was explicitly set to a non-empty value in the makefile.
+    /// When true, automatic updates of .DEFAULT_GOAL from rule registration are suppressed.
+    /// Reset to false when .DEFAULT_GOAL is explicitly cleared (set to empty).
+    pub default_goal_explicit: bool,
 }
 
 impl MakeDatabase {
@@ -317,6 +321,7 @@ impl MakeDatabase {
             builtin_pattern_rules_count: 0,
             explicitly_mentioned: HashSet::new(),
             explicit_dep_names: HashSet::new(),
+            default_goal_explicit: false,
         }
     }
 
@@ -334,9 +339,30 @@ impl MakeDatabase {
     }
 
     pub fn is_precious(&self, target: &str) -> bool {
-        self.special_targets
-            .get(&SpecialTarget::Precious)
-            .map_or(false, |set| set.contains(target))
+        let set = match self.special_targets.get(&SpecialTarget::Precious) {
+            Some(s) => s,
+            None => return false,
+        };
+        // .PRECIOUS with no prerequisites means ALL targets are precious.
+        if set.is_empty() {
+            return true;
+        }
+        // Check for exact match first.
+        if set.contains(target) {
+            return true;
+        }
+        // Check for pattern match (e.g. .PRECIOUS: %.bar matches foo.bar).
+        for pat in set {
+            if let Some(pct) = pat.find('%') {
+                let prefix = &pat[..pct];
+                let suffix = &pat[pct+1..];
+                if target.starts_with(prefix) && target.ends_with(suffix)
+                    && target.len() >= prefix.len() + suffix.len() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn is_intermediate(&self, target: &str) -> bool {

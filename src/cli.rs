@@ -58,6 +58,9 @@ pub struct MakeArgs {
     /// Path to temp file holding stdin content (from --temp-stdin=PATH on re-exec).
     /// When set, read this file instead of stdin for -f- makefiles.
     pub temp_stdin: Option<PathBuf>,
+    /// True if GNUMAKEFLAGS was set in the environment (even if empty).
+    /// When true, export GNUMAKEFLAGS= (empty) to recipe environments.
+    pub gnumakeflags_was_set: bool,
 }
 
 impl Default for MakeArgs {
@@ -106,6 +109,7 @@ impl Default for MakeArgs {
             keep_going_explicit: false,
             no_keep_going_explicit: false,
             temp_stdin: None,
+            gnumakeflags_was_set: false,
         }
     }
 }
@@ -125,6 +129,18 @@ pub fn parse_args() -> MakeArgs {
     let mut result = MakeArgs::default();
     let mut i = 1;
 
+    // Check GNUMAKEFLAGS environment variable (processed before MAKEFLAGS).
+    // Flags from GNUMAKEFLAGS are merged into the effective flags but GNUMAKEFLAGS
+    // itself is cleared in the environment so recursive makes don't see duplicates.
+    if let Ok(gnumakeflags) = env::var("GNUMAKEFLAGS") {
+        result.gnumakeflags_was_set = true;
+        if !gnumakeflags.trim().is_empty() {
+            parse_makeflags(&gnumakeflags, &mut result);
+        }
+        // Clear GNUMAKEFLAGS so it doesn't affect recursive makes (they get it
+        // via MAKEFLAGS which already merged the flags).
+        env::set_var("GNUMAKEFLAGS", "");
+    }
     // Check MAKEFLAGS environment variable
     if let Ok(makeflags) = env::var("MAKEFLAGS") {
         parse_makeflags(&makeflags, &mut result);

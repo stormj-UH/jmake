@@ -492,7 +492,7 @@ impl<'a> Executor<'a> {
                     if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
                         for p in &pat_rule.prerequisites {
                             if p != ".WAIT" {
-                                check_prereqs.push(p.replace('%', &stem));
+                                check_prereqs.push(subst_stem_in_prereq(p, &stem));
                             }
                         }
                     }
@@ -615,10 +615,10 @@ impl<'a> Executor<'a> {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
                 // Add the pattern rule's prerequisites/order-only to our lists and build them.
                 let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
-                    .map(|p| p.replace('%', &stem))
+                    .map(|p| subst_stem_in_prereq(p, &stem))
                     .collect();
                 let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
-                    .map(|p| p.replace('%', &stem))
+                    .map(|p| subst_stem_in_prereq(p, &stem))
                     .collect();
 
                 // Handle second expansion for the pattern rule.
@@ -632,13 +632,13 @@ impl<'a> Executor<'a> {
                     self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
-                        let stem_subst = text.replace('%', &stem);
+                        let stem_subst = subst_stem_in_se_text(text, &stem);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_prereqs.extend(normal);
                         pat_order_only.extend(oo);
                     }
                     if let Some(ref text) = pattern_rule.second_expansion_order_only {
-                        let stem_subst = text.replace('%', &stem);
+                        let stem_subst = subst_stem_in_se_text(text, &stem);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_order_only.extend(normal);
                         pat_order_only.extend(oo);
@@ -892,10 +892,10 @@ impl<'a> Executor<'a> {
         let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
                 let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
-                    .map(|p| p.replace('%', &stem))
+                    .map(|p| subst_stem_in_prereq(p, &stem))
                     .collect();
                 let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
-                    .map(|p| p.replace('%', &stem))
+                    .map(|p| subst_stem_in_prereq(p, &stem))
                     .collect();
 
                 if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
@@ -905,13 +905,13 @@ impl<'a> Executor<'a> {
                     self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
-                        let stem_subst = text.replace('%', &stem);
+                        let stem_subst = subst_stem_in_se_text(text, &stem);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_prereqs.extend(normal);
                         pat_order_only.extend(oo);
                     }
                     if let Some(ref text) = pattern_rule.second_expansion_order_only {
-                        let stem_subst = text.replace('%', &stem);
+                        let stem_subst = subst_stem_in_se_text(text, &stem);
                         let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_order_only.extend(normal);
                         pat_order_only.extend(oo);
@@ -1276,12 +1276,31 @@ impl<'a> Executor<'a> {
                     && !self.building.contains(s.as_str()))
             .collect();
 
+        // For multi-target pattern rules (e.g. `%.h %.c: %.in`): compute "also_make" targets.
+        // These are the concrete sibling targets (other target patterns with same stem).
+        // When the recipe runs for `target`, all also_make siblings are considered built too.
+        // This is different from grouped targets (&:): here there's no coordination,
+        // we just mark them as covered after the recipe runs.
+        // Only applies when there are multiple targets AND no grouped_siblings (not &:).
+        let also_make_siblings: Vec<String> = if rule.grouped_siblings.is_empty() && rule.targets.len() > 1 {
+            rule.targets.iter()
+                .filter(|pat| {
+                    // Only include patterns that match target (same stem)
+                    match_pattern(pat, target).is_none()
+                })
+                .map(|pat| replace_first_percent(pat, stem))
+                .filter(|s| s != target)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Expand pattern prerequisites using the stem.
         // For normal (non-SE) prerequisites, substitute % with the stem.
         // .WAIT markers are filtered since they are ordering hints, not real targets.
         let mut prereqs: Vec<String> = rule.prerequisites.iter()
             .filter(|p| p.as_str() != ".WAIT")
-            .map(|p| p.replace('%', stem))
+            .map(|p| subst_stem_in_prereq(p, stem))
             .collect();
 
         // Also expand any explicit prerequisites that came from `build_target_inner`
@@ -1291,7 +1310,7 @@ impl<'a> Executor<'a> {
         // Handle second-expansion prerequisites for pattern rules.
         let mut order_only: Vec<String> = rule.order_only_prerequisites.iter()
             .filter(|p| p.as_str() != ".WAIT")
-            .map(|p| p.replace('%', stem))
+            .map(|p| subst_stem_in_prereq(p, stem))
             .collect();
 
         if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some() {
@@ -1307,14 +1326,14 @@ impl<'a> Executor<'a> {
             *self.state.current_line.borrow_mut() = 0;
 
             if let Some(ref text) = rule.second_expansion_prereqs {
-                // Substitute % in the raw text for the stem before expanding
-                let stem_subst = text.replace('%', stem);
+                // Substitute first % per word in the raw text for the stem before SE expanding
+                let stem_subst = subst_stem_in_se_text(text, stem);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
                 prereqs.extend(normal);
                 order_only.extend(oo);
             }
             if let Some(ref text) = rule.second_expansion_order_only {
-                let stem_subst = text.replace('%', stem);
+                let stem_subst = subst_stem_in_se_text(text, stem);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
                 order_only.extend(normal);
                 order_only.extend(oo);
@@ -1380,6 +1399,11 @@ impl<'a> Executor<'a> {
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), false);
             }
+            // Mark also_make siblings as covered (up to date).
+            for sib in &also_make_siblings {
+                self.grouped_covered.insert(sib.clone());
+                self.built.insert(sib.clone(), false);
+            }
             return Ok(false);
         }
 
@@ -1434,7 +1458,58 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+
+            // For multi-target pattern rules: mark also_make siblings as built and
+            // potentially intermediate. These siblings were produced by the same recipe.
+            for sib in &also_make_siblings {
+                // Mark as built/covered so we don't run the recipe again for them.
+                self.grouped_covered.insert(sib.clone());
+                self.built.insert(sib.clone(), true);
+
+                // Track intermediate status for also_make siblings.
+                if self.db.is_intermediate(sib) {
+                    if !self.intermediate_built.contains(sib) {
+                        self.intermediate_built.push(sib.clone());
+                    }
+                } else if !self.db.is_precious(sib)
+                    && !self.db.is_notintermediate(sib)
+                    && !self.db.is_secondary(sib)
+                {
+                    let is_explicit = self.top_level_targets.contains(sib.as_str())
+                        || self.db.is_explicitly_mentioned(sib);
+                    if !is_explicit {
+                        if !self.intermediate_built.contains(sib) {
+                            self.intermediate_built.push(sib.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            // Even if recipe failed or didn't rebuild, mark also_make siblings as covered
+            // so we don't try to rebuild them separately.
+            for sib in &also_make_siblings {
+                self.grouped_covered.insert(sib.clone());
+                self.built.insert(sib.clone(), false);
+            }
         }
+
+        // Check if peer targets were actually updated (emit warning if not).
+        // Per GNU Make: if a multi-target pattern rule ran but a peer target wasn't updated
+        // (mtime didn't change), emit a warning.
+        if let Ok(true) = &result {
+            for sib in &also_make_siblings {
+                if !Path::new(sib.as_str()).exists() {
+                    // Peer target wasn't created: warn
+                    let loc = if !rule.source_file.is_empty() && rule.lineno > 0 {
+                        format!("{}:{}: ", rule.source_file, rule.lineno)
+                    } else {
+                        String::new()
+                    };
+                    eprintln!("{}warning: pattern recipe did not update peer target '{}'.", loc, sib);
+                }
+            }
+        }
+
         // Mark grouped pattern siblings as covered by this recipe run.
         for sib in &concrete_grouped_siblings {
             self.grouped_covered.insert(sib.clone());
@@ -1475,6 +1550,8 @@ impl<'a> Executor<'a> {
         let mut compat_rule: Option<(Rule, String)> = None;
 
         // Pass 1: all prereqs immediately satisfiable.
+        // Collect all matching candidates, then pick the one with the shortest stem.
+        let mut pass1_candidates: Vec<(Rule, String)> = Vec::new();
         for rule in &all_rules {
             // Skip rules with no recipe unless they have SE prereqs (which may produce
             // errors or provide prerequisites at build time) or are terminal rules.
@@ -1493,7 +1570,7 @@ impl<'a> Executor<'a> {
                         let mut all_ok = true;
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
-                            let resolved = p.replace('%', &stem);
+                            let resolved = subst_stem_in_prereq(p, &stem);
                             let ok = Path::new(&resolved).exists()
                                 || self.db.is_phony(&resolved)
                                 || self.db.rules.contains_key(&resolved)
@@ -1512,15 +1589,24 @@ impl<'a> Executor<'a> {
                         all_ok
                     };
                     if prereqs_ok {
-                        return Some(((**rule).clone(), stem));
+                        pass1_candidates.push(((**rule).clone(), stem));
+                        break; // Only take first matching pattern_target per rule
                     } else if found_compat && compat_rule.is_none() {
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
             }
         }
+        if !pass1_candidates.is_empty() {
+            // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
+            let best = pass1_candidates.into_iter()
+                .min_by_key(|(_, stem)| stem.len())
+                .unwrap();
+            return Some(best);
+        }
 
         // Pass 2: prereqs can be built via chaining. Terminal rules skipped.
+        let mut pass2_candidates: Vec<(Rule, String)> = Vec::new();
         for rule in &all_rules {
             if rule.recipe.is_empty()
                 && !rule.is_terminal
@@ -1538,7 +1624,7 @@ impl<'a> Executor<'a> {
                         let mut all_ok = true;
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
-                            let resolved = p.replace('%', &stem);
+                            let resolved = subst_stem_in_prereq(p, &stem);
                             let ok = Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
@@ -1558,12 +1644,20 @@ impl<'a> Executor<'a> {
                         all_ok
                     };
                     if prereqs_ok {
-                        return Some(((**rule).clone(), stem));
+                        pass2_candidates.push(((**rule).clone(), stem));
+                        break; // Only take first matching pattern_target per rule
                     } else if found_compat && compat_rule.is_none() {
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
             }
+        }
+        if !pass2_candidates.is_empty() {
+            // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
+            let best = pass2_candidates.into_iter()
+                .min_by_key(|(_, stem)| stem.len())
+                .unwrap();
+            return Some(best);
         }
 
         compat_rule
@@ -1592,7 +1686,7 @@ impl<'a> Executor<'a> {
                     } else {
                         rule.prerequisites.iter().all(|p| {
                             if p == ".WAIT" { return true; }
-                            let resolved = p.replace('%', &stem);
+                            let resolved = subst_stem_in_prereq(p, &stem);
                             Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
@@ -2037,7 +2131,7 @@ impl<'a> Executor<'a> {
         if let Some((rule, stem)) = self.find_pattern_rule(target) {
             let max_prereq_time = rule.prerequisites.iter()
                 .filter(|p| p.as_str() != ".WAIT")
-                .map(|p| p.replace('%', &stem))
+                .map(|p| subst_stem_in_prereq(p, &stem))
                 .filter_map(|p| self.effective_mtime(&p, depth + 1))
                 .max();
             return max_prereq_time;
@@ -2502,7 +2596,7 @@ impl<'a> Executor<'a> {
                             if !self.db.is_precious(target) && !self.db.is_phony(target) {
                                 // Delete target on error unless .PRECIOUS
                                 if Path::new(target).exists() {
-                                    eprintln!("{}: Deleting file '{}'", self.progname, target);
+                                    eprintln!("{}: *** Deleting file '{}'", self.progname, target);
                                     let _ = fs::remove_file(target);
                                 }
                             }
@@ -2612,6 +2706,11 @@ impl<'a> Executor<'a> {
         // Remove variables that are explicitly unexported for the current target.
         for name in &self.target_extra_unexports {
             cmd.env_remove(name);
+        }
+        // If GNUMAKEFLAGS was originally set in the environment, export it as empty
+        // so child processes see it (but cleared to prevent flag duplication).
+        if self.state.args.gnumakeflags_was_set {
+            cmd.env("GNUMAKEFLAGS", "");
         }
     }
 
@@ -2835,6 +2934,83 @@ fn match_pattern(pattern: &str, target: &str) -> Option<String> {
 /// Match a pattern (containing `%`) against a target and return the stem, or None.
 fn match_pattern_simple(pattern: &str, target: &str) -> Option<String> {
     match_pattern(pattern, target)
+}
+
+/// Substitute the stem for the FIRST `%` in a prerequisite word (GNU Make rule).
+/// Any subsequent `%` characters in the same word are left as-is.
+/// This follows GNU Make's behavior where only the first `%` in each word of a
+/// pattern rule prerequisite is replaced by the stem.
+fn replace_first_percent(word: &str, stem: &str) -> String {
+    if let Some(pos) = word.find('%') {
+        let mut result = String::with_capacity(word.len() + stem.len());
+        result.push_str(&word[..pos]);
+        result.push_str(stem);
+        result.push_str(&word[pos+1..]);
+        result
+    } else {
+        word.to_string()
+    }
+}
+
+/// Apply `%` → stem substitution to a prerequisite string, word by word.
+/// Only the first `%` in each whitespace-delimited word is replaced.
+/// For non-SE prerequisites (stored as already-split individual words),
+/// this simply calls `replace_first_percent`.
+fn subst_stem_in_prereq(prereq: &str, stem: &str) -> String {
+    replace_first_percent(prereq, stem)
+}
+
+/// Apply `%` → stem substitution to a raw SE prerequisite text.
+/// The text may contain function calls and spaces. We process it word-by-word
+/// (respecting nested parentheses) so that only the first `%` per word is replaced.
+fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
+    let mut result = String::with_capacity(text.len() + stem.len() * 4);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        // Skip leading whitespace
+        if chars[i].is_whitespace() {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Collect one "word" (may contain nested parens from function calls)
+        let word_start = i;
+        let mut depth = 0usize;
+        let mut word = String::new();
+        let mut first_percent_replaced = false;
+
+        while i < n {
+            let c = chars[i];
+            if c == '(' || c == '{' {
+                depth += 1;
+                word.push(c);
+                i += 1;
+            } else if (c == ')' || c == '}') && depth > 0 {
+                depth -= 1;
+                word.push(c);
+                i += 1;
+            } else if c.is_whitespace() && depth == 0 {
+                // End of word
+                break;
+            } else if c == '%' && !first_percent_replaced {
+                // Replace first % in this word
+                word.push_str(stem);
+                first_percent_replaced = true;
+                i += 1;
+            } else {
+                word.push(c);
+                i += 1;
+            }
+        }
+        let _ = word_start;
+        result.push_str(&word);
+    }
+
+    result
 }
 
 fn vpath_pattern_matches(pattern: &str, target: &str) -> bool {

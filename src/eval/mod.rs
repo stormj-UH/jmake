@@ -701,11 +701,11 @@ impl MakeState {
             if let Err(e) = self.read_makefile(mf) {
                 let mf_str = mf.to_string_lossy();
                 let is_stdin = mf_str == "-" || mf_str == "/dev/stdin";
-                // For non-stdin -f files that can't be read (e.g. don't exist),
+                // For non-stdin -f files that can't be read because they don't exist,
                 // GNU Make prints a warning without "***" and continues processing
                 // remaining makefiles. The missing file is then treated as a rebuild
                 // target; if no rule exists it will fail as "No rule to make target".
-                if !is_stdin && (e.contains("No such file or directory") || e.contains("Is a directory") || e.contains("Permission denied")) {
+                if !is_stdin && e.contains("No such file or directory") {
                     let progname = crate::eval::make_progname();
                     eprintln!("{}: {}", progname, e);
                     // Defer: add to pending so try_update_makefiles can attempt a rebuild
@@ -1754,6 +1754,12 @@ impl MakeState {
             let is_special_target = target.starts_with('.') && !target.contains('/');
             if self.db.default_target.is_none() && !is_special_target && !target.contains('%') {
                 self.db.default_target = Some(target.clone());
+                // Also update .DEFAULT_GOAL variable so it's readable at parse time,
+                // but only if it hasn't been explicitly set to a non-empty value.
+                if !self.db.default_goal_explicit {
+                    self.db.variables.insert(".DEFAULT_GOAL".into(),
+                        Variable::new(target.clone(), VarFlavor::Simple, VarOrigin::Default));
+                }
             }
         }
 
@@ -1771,7 +1777,14 @@ impl MakeState {
                     self.db.explicitly_mentioned.insert(prereq.clone());
                 }
             }
-            self.db.pattern_rules.push(rule.clone());
+            // A double-colon pattern rule (%:: ...) is "terminal" in GNU Make:
+            // it can be used directly (pass 1) but cannot be used for chaining
+            // intermediates (pass 2). Set is_terminal accordingly.
+            let mut pattern_rule = rule.clone();
+            if pattern_rule.is_double_colon {
+                pattern_rule.is_terminal = true;
+            }
+            self.db.pattern_rules.push(pattern_rule);
             return;
         }
 
@@ -2127,6 +2140,29 @@ impl MakeState {
                 var.export = Some(true);
             }
         }
+
+        // Special handling for .DEFAULT_GOAL: when explicitly set in a makefile,
+        // update the default_target accordingly so it is used when building.
+        if name == ".DEFAULT_GOAL" {
+            let expanded_goal = self.expand(value).trim().to_string();
+            if expanded_goal.is_empty() {
+                // Reset: next non-special rule will become the default again
+                self.db.default_target = None;
+                self.db.default_goal_explicit = false;
+                // Also update the .DEFAULT_GOAL variable value to empty
+                if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
+                    var.value = String::new();
+                }
+            } else {
+                // Set to specific goal; update default_target
+                self.db.default_target = Some(expanded_goal.clone());
+                self.db.default_goal_explicit = true;
+                // Update the .DEFAULT_GOAL variable value
+                if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
+                    var.value = expanded_goal;
+                }
+            }
+        }
     }
 
     /// Re-parse the current MAKEFLAGS value and apply any new settings to args/state.
@@ -2434,9 +2470,19 @@ impl MakeState {
                             .collect();
                         let src = rule.source_file.clone();
                         let ln = recipe.first().map(|(l, _)| *l).unwrap_or(0);
-                        // Expand prerequisites for the stem
+                        // Expand prerequisites for the stem (first % per word only)
                         let prereqs: Vec<String> = rule.prerequisites.iter()
-                            .map(|p| p.replace('%', &stem))
+                            .map(|p| {
+                                if let Some(pos) = p.find('%') {
+                                    let mut s = String::with_capacity(p.len() + stem.len());
+                                    s.push_str(&p[..pos]);
+                                    s.push_str(&stem);
+                                    s.push_str(&p[pos+1..]);
+                                    s
+                                } else {
+                                    p.clone()
+                                }
+                            })
                             .collect();
                         // Compute sibling targets: other patterns in the same rule
                         // that also match via the same stem (for grouped pattern rules).
@@ -2715,7 +2761,119 @@ impl MakeState {
 
         let mut any_really_rebuilt = false;
 
-        // First, handle pending includes (files that were missing when first read)
+        // First, check existing makefiles that may be out of date.
+        // Any makefile in makefile_list that has a rule and whose prerequisites
+        // are newer than it should be rebuilt.
+        // Skip stdin (-) since it can't be checked for staleness.
+        // NOTE: This must run BEFORE pending_includes so that regular makefile
+        // rebuilds (e.g. bye.mk) happen before we try to rebuild missing -f files.
+        {
+            let makefile_list_snap = self.makefile_list.clone();
+            for mf_path in &makefile_list_snap {
+                let mf_str = mf_path.to_string_lossy();
+                if mf_str == "-" {
+                    // Skip stdin makefiles
+                    continue;
+                }
+                let mf_name = mf_str.to_string();
+
+                // Check if this makefile has a rule to rebuild it
+                let rule_info = self.find_include_rule(&mf_name);
+                let rule_info = match rule_info {
+                    Some(ri) if !ri.skippable && !ri.imagined => ri,
+                    _ => continue, // no applicable rule
+                };
+
+                if self.include_recipe_ran.contains(&mf_name) {
+                    continue;
+                }
+
+                let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+
+                // Build prerequisites first (they may not exist yet but have their own rules).
+                // This must happen BEFORE the needs_rebuild check so that prereqs that don't
+                // yet exist (but have rules to create them) are built first, and we can then
+                // accurately check if any of them is newer than the target.
+                let prereqs = rule_info.prerequisites.clone();
+                let mut visited = HashSet::new();
+                visited.insert(mf_name.clone());
+                let prereq_result = self.build_include_prerequisites(
+                    &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
+                );
+
+                if let Err(e) = prereq_result {
+                    return Err(e);
+                }
+
+                // Now determine if the makefile is out of date (after prereqs were built).
+                let needs_rebuild = if target_mtime.is_none() {
+                    // File doesn't exist → needs rebuild
+                    true
+                } else {
+                    let target_time = target_mtime.unwrap();
+                    // Check if any prerequisite is now newer than the target.
+                    rule_info.prerequisites.iter().any(|prereq| {
+                        std::fs::metadata(prereq).ok()
+                            .and_then(|m| m.modified().ok())
+                            .map_or(false, |pt| pt > target_time)
+                    })
+                };
+
+                if !needs_rebuild {
+                    continue;
+                }
+
+                if rule_info.recipe.is_empty() {
+                    // Has prerequisites but no recipe - prereqs were built but no file update
+                    // sv 61226: imagined update, no re-exec
+                    continue;
+                }
+
+                // Mark as ran
+                self.include_recipe_ran.insert(mf_name.clone());
+                for sib in &rule_info.sibling_targets {
+                    self.include_recipe_ran.insert(sib.clone());
+                }
+
+                // Run the recipe
+                let built = self.run_include_recipe(
+                    &mf_name, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
+                    &rule_info.source_file.clone(),
+                );
+
+                match built {
+                    Ok(()) => {
+                        // Check if the file was actually updated (mtime changed or created)
+                        let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+                        let actually_updated = match (target_mtime, new_mtime) {
+                            (_, None) => false, // file still doesn't exist
+                            (None, Some(_)) => true, // file was created
+                            (Some(old_t), Some(new_t)) => new_t > old_t, // file was updated
+                        };
+                        if actually_updated {
+                            any_really_rebuilt = true;
+                        }
+                        // If file not updated (sv 61226): no re-exec, no error
+                    }
+                    Err(recipe_err) => {
+                        return Err(recipe_err);
+                    }
+                }
+            }
+        }
+
+        // If any regular makefile was really rebuilt, re-exec from scratch now
+        // (before processing pending includes, so that on re-exec we can try
+        // to rebuild missing makefiles with the updated rules).
+        if any_really_rebuilt {
+            let restart_val = env::var("MAKE_RESTARTS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            self.do_reinvoke(restart_val + 1);
+        }
+
+        // Second, handle pending includes (files that were missing when first read)
         let pending = std::mem::take(&mut self.pending_includes);
         for pi in pending {
             let file_path = Path::new(&pi.file);
@@ -2858,123 +3016,13 @@ impl MakeState {
             }
         }
 
-        // Second, check existing makefiles that may be out of date.
-        // Any makefile in makefile_list that has a rule and whose prerequisites
-        // are newer than it should be rebuilt.
-        // Skip stdin (-) since it can't be checked for staleness.
-        let makefile_list_snap = self.makefile_list.clone();
-        for mf_path in &makefile_list_snap {
-            let mf_str = mf_path.to_string_lossy();
-            if mf_str == "-" {
-                // Skip stdin makefiles
-                continue;
-            }
-            let mf_name = mf_str.to_string();
-
-            // Check if this makefile has a rule to rebuild it
-            let rule_info = self.find_include_rule(&mf_name);
-            let rule_info = match rule_info {
-                Some(ri) if !ri.skippable && !ri.imagined => ri,
-                _ => continue, // no applicable rule
-            };
-
-            if self.include_recipe_ran.contains(&mf_name) {
-                continue;
-            }
-
-            // Determine if the makefile is out of date BEFORE trying to build prereqs.
-            // A prerequisite that doesn't exist means the rule cannot fire (skip).
-            // Only if all prereqs exist and at least one is newer do we proceed.
-            // This mirrors GNU Make's behavior: if the implicit rule's prereq doesn't
-            // exist, the rule is simply skipped (not an error).
-            let target_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
-            let needs_rebuild = if target_mtime.is_none() {
-                // File doesn't exist → needs rebuild
-                true
-            } else {
-                let target_time = target_mtime.unwrap();
-                // Check if any prerequisite makes the target out of date.
-                // A prereq makes the target out of date ONLY if it exists AND is newer.
-                // If a prereq doesn't exist, the rule can't fire → skip (not outdated).
-                let any_prereq_newer = rule_info.prerequisites.iter().any(|prereq| {
-                    match std::fs::metadata(prereq) {
-                        Ok(m) => {
-                            // File exists: check if newer than target
-                            m.modified().ok().map_or(false, |pt| pt > target_time)
-                        }
-                        Err(_) => {
-                            // Prereq doesn't exist → rule cannot fire → not outdated
-                            false
-                        }
-                    }
-                });
-                any_prereq_newer
-            };
-
-            if !needs_rebuild {
-                continue;
-            }
-
-            // Build prerequisites first (they may themselves be out of date,
-            // which would make the makefile out of date after they're rebuilt).
-            let prereqs = rule_info.prerequisites.clone();
-            let mut visited = HashSet::new();
-            visited.insert(mf_name.clone());
-            let prereq_result = self.build_include_prerequisites(
-                &prereqs, &mf_name, &shell, &shell_flags, silent, false, &mut visited,
-            );
-
-            if let Err(e) = prereq_result {
-                return Err(e);
-            }
-
-            if rule_info.recipe.is_empty() {
-                // Has prerequisites but no recipe - prereqs were built but no file update
-                // sv 61226: imagined update, no re-exec
-                continue;
-            }
-
-            // Mark as ran
-            self.include_recipe_ran.insert(mf_name.clone());
-            for sib in &rule_info.sibling_targets {
-                self.include_recipe_ran.insert(sib.clone());
-            }
-
-            // Run the recipe
-            let built = self.run_include_recipe(
-                &mf_name, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
-                &rule_info.source_file.clone(),
-            );
-
-            match built {
-                Ok(()) => {
-                    // Check if the file was actually updated (mtime changed or created)
-                    let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
-                    let actually_updated = match (target_mtime, new_mtime) {
-                        (_, None) => false, // file still doesn't exist
-                        (None, Some(_)) => true, // file was created
-                        (Some(old_t), Some(new_t)) => new_t > old_t, // file was updated
-                    };
-                    if actually_updated {
-                        any_really_rebuilt = true;
-                    }
-                    // If file not updated (sv 61226): no re-exec, no error
-                }
-                Err(recipe_err) => {
-                    return Err(recipe_err);
-                }
-            }
-        }
-
-        // If any makefile was really rebuilt, re-exec from scratch
+        // If any pending include was really rebuilt, re-exec from scratch
         if any_really_rebuilt {
             let restart_val = env::var("MAKE_RESTARTS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
             self.do_reinvoke(restart_val + 1);
-            // do_reinvoke never returns normally - if it does, something went wrong
-            // (but it calls process::exit internally)
         }
 
         Ok(())
