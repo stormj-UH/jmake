@@ -705,6 +705,8 @@ impl<'a> Executor<'a> {
     fn build_target_inner(&mut self, target: &str) -> Result<bool, String> {
         // Handle -lname library prerequisites: search for libname.a or libname.so
         // in VPATH directories. If found, redirect the build to the resolved path.
+        // If not found on disk, fall through to check explicit/pattern rules (user may
+        // have defined -l% pattern rules to handle library building).
         if let Some(lib_name) = target.strip_prefix("-l") {
             if let Some(resolved) = self.find_library(lib_name) {
                 // Mark the resolved path as already built (it's a found file, no recipe).
@@ -718,7 +720,7 @@ impl<'a> Executor<'a> {
                 self.lib_search_results.insert(target.to_string(), resolved);
                 return Ok(false);
             }
-            return Err(format!("No rule to make target '{}'.  Stop.", target));
+            // Library not found on disk — fall through to check explicit/pattern rules.
         }
 
         // Find rule for this target
@@ -2036,7 +2038,8 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             self.pending_plan_prereqs = all_prereqs.clone();
             self.pending_plan_order_only = all_order_only.clone();
-            self.pending_plan_wait_groups = wait_groups.clone();
+            // Grouped targets don't support .WAIT groups; use empty.
+            self.pending_plan_wait_groups = Vec::new();
         }
         let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
@@ -2653,6 +2656,18 @@ impl<'a> Executor<'a> {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
                     if rebuilt { any_rebuilt = true; }
+                    // For terminal pattern rules (%::), prerequisites must ACTUALLY EXIST
+                    // on disk (or in VPATH) after being built — chaining through implicit
+                    // rules that produce no file is not allowed.
+                    if rule.is_terminal && !self.db.is_phony(&prereq) {
+                        let exists = std::path::Path::new(&prereq).exists()
+                            || self.find_in_vpath(&prereq).is_some();
+                        if !exists {
+                            let err = format!("No rule to make target '{}', needed by '{}'.  Stop.", prereq, target);
+                            self.inherited_vars_stack.pop();
+                            return Err(err);
+                        }
+                    }
                 }
                 Err(e) => {
                     if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() && !rule.is_compat {
@@ -2806,19 +2821,30 @@ impl<'a> Executor<'a> {
         // 4. Marked .NOTINTERMEDIATE
         // 5. Marked .SECONDARY
         if let Ok(true) = &result {
-            // For multi-target pattern rules: mark also_make siblings as built.
-            // GNU Make does NOT delete also_make siblings as intermediates — they are
-            // produced together with the primary target and treated as real outputs.
-            // Only mark them intermediate if explicitly declared via .INTERMEDIATE.
+            // For multi-target pattern rules: mark also_make siblings as built and
+            // potentially intermediate. These siblings were produced by the same recipe.
+            // GNU Make tracks also_make siblings BEFORE the primary target in the
+            // intermediate deletion list (so they are removed first).
             for sib in &also_make_siblings {
                 // Mark as built/covered so we don't run the recipe again for them.
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), true);
 
-                // Only track as intermediate if explicitly declared .INTERMEDIATE.
+                // Track intermediate status for also_make siblings.
                 if self.db.is_intermediate(sib) {
                     if !self.intermediate_built.contains(sib) {
                         self.intermediate_built.push(sib.clone());
+                    }
+                } else if !self.db.is_precious(sib)
+                    && !self.db.is_notintermediate(sib)
+                    && !self.db.is_secondary(sib)
+                {
+                    let is_explicit = self.top_level_targets.contains(sib.as_str())
+                        || self.is_explicitly_mentioned(sib);
+                    if !is_explicit {
+                        if !self.intermediate_built.contains(sib) {
+                            self.intermediate_built.push(sib.clone());
+                        }
                     }
                 }
             }
