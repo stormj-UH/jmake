@@ -99,6 +99,12 @@ pub struct Executor<'a> {
     /// had no '%' to substitute) are treated as explicitly mentioned (not intermediate).
     /// We can't write to db.explicitly_mentioned (immutable ref), so we track them here.
     se_explicitly_mentioned: HashSet<String>,
+    /// sv 62706: Extra SE prereq texts to expand for vpath-merged targets.
+    /// When a local target is merged with its vpath-resolved counterpart, the local
+    /// rule's SE prereq texts are stored here (keyed by vpath target name) so that
+    /// build_with_rules can process them alongside the vpath target's own SE texts.
+    /// These are the raw SE texts (same format as Rule::second_expansion_prereqs).
+    vpath_extra_se_texts: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Executor<'a> {
@@ -173,6 +179,7 @@ impl<'a> Executor<'a> {
             skip_extra_prereqs: false,
             lib_search_results: HashMap::new(),
             se_explicitly_mentioned: HashSet::new(),
+            vpath_extra_se_texts: HashMap::new(),
         }
     }
 
@@ -633,9 +640,9 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // Collect in prerequisite/encounter order (the order they were built), matching
-        // GNU Make's deletion output order.
-        let to_delete: Vec<String> = self.intermediate_built.iter()
+        // Collect in REVERSE build order: intermediates built last (closest to the final
+        // target) are deleted first, matching GNU Make's deletion output order.
+        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -822,7 +829,33 @@ impl<'a> Executor<'a> {
                                         eprintln!("{}:{}: Recipe for '{}' will be ignored in favor of the one for '{}'.",
                                             src, recipe_lineno, target, vpath_resolved);
                                     }
-                                    return self.build_target(&vpath_resolved);
+                                    // sv 62706: The local rule's recipe is ignored, but its
+                                    // SE prereq text must still be evaluated (for side-effects
+                                    // like $(info ...)).  Store the local SE texts keyed by
+                                    // the vpath target name so that build_with_rules will
+                                    // process them AFTER the vpath target's own SE texts,
+                                    // preserving the correct output order.
+                                    let local_se_texts: Vec<(String, String)> = rules.iter()
+                                        .filter(|r| !r.is_double_colon
+                                            && r.second_expansion_prereqs.is_some())
+                                        .filter_map(|r| r.second_expansion_prereqs.as_ref()
+                                            .map(|t| (t.clone(), r.static_stem.clone())))
+                                        .collect();
+                                    if !local_se_texts.is_empty() {
+                                        let vr = vpath_resolved.clone();
+                                        // Store (se_text, local_target, stem) for later use.
+                                        // Encode as "target\x00stem\x00text" to carry all context.
+                                        let encoded: Vec<String> = local_se_texts.iter()
+                                            .map(|(text, stem)| {
+                                                format!("{}\x00{}\x00{}", target, stem, text)
+                                            })
+                                            .collect();
+                                        self.vpath_extra_se_texts.entry(vr)
+                                            .or_default()
+                                            .extend(encoded);
+                                    }
+                                    let vr2 = vpath_resolved.clone();
+                                    return self.build_target(&vr2);
                                 }
                             }
                         }
@@ -1122,6 +1155,28 @@ impl<'a> Executor<'a> {
                 let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
                 se_expanded_order_only.extend(normal);
                 se_expanded_order_only.extend(oo);
+            }
+        }
+
+        // sv 62706: process extra SE texts from vpath-merged local rules.
+        // These carry side-effects (e.g. $(info ...)) and their prereq results are
+        // also appended, matching GNU Make's behaviour of second-expanding both rules.
+        if let Some(extra_encoded) = self.vpath_extra_se_texts.remove(target) {
+            for encoded in &extra_encoded {
+                // Each entry is "local_target\x00stem\x00se_text"
+                let mut parts = encoded.splitn(3, '\x00');
+                let local_target = parts.next().unwrap_or(target);
+                let stem = parts.next().unwrap_or("");
+                let text = parts.next().unwrap_or("");
+                if !text.is_empty() {
+                    let oo_refs: Vec<&str> = Vec::new();
+                    let empty_prereqs: Vec<String> = Vec::new();
+                    let mut av = self.make_auto_vars(local_target, &empty_prereqs, &oo_refs, stem);
+                    av.insert("?".to_string(), String::new());
+                    let (normal, oo) = self.second_expand_prereqs(text, &av, local_target);
+                    se_expanded_prereqs.extend(normal);
+                    se_expanded_order_only.extend(oo);
+                }
             }
         }
 
@@ -1488,6 +1543,36 @@ impl<'a> Executor<'a> {
             Vec::new()
         };
         // Build pattern-rule prereqs first (before explicit prereqs).
+        // Apply GNU Make prereq ordering: standalone-explicit (literal, non-pattern prereqs)
+        // come first, then intermediate (pattern-derived) prereqs, then shared-explicit.
+        // This ensures that `%.4: %.1 %.15 a.3` builds `a.3` before `a.1` and `a.15`.
+        // Must be computed before the mutable borrow in the loop below.
+        let pre_pat_prereqs: Vec<String> = if !pre_pat_prereqs.is_empty() && self.shuffle.is_none() {
+            let standalone: Vec<String> = pre_pat_prereqs.iter()
+                .filter(|p| {
+                    self.is_explicitly_mentioned(p)
+                        && !self.prereq_shares_rule_with_intermediate(p, &pre_pat_prereqs)
+                })
+                .cloned()
+                .collect();
+            let intermediates: Vec<String> = pre_pat_prereqs.iter()
+                .filter(|p| !self.is_explicitly_mentioned(p))
+                .cloned()
+                .collect();
+            let shared: Vec<String> = pre_pat_prereqs.iter()
+                .filter(|p| {
+                    self.is_explicitly_mentioned(p)
+                        && self.prereq_shares_rule_with_intermediate(p, &pre_pat_prereqs)
+                })
+                .cloned()
+                .collect();
+            let mut ordered = standalone;
+            ordered.extend(intermediates);
+            ordered.extend(shared);
+            ordered
+        } else {
+            pre_pat_prereqs
+        };
         // When shuffle is active, skip prereqs that are already in all_prereqs
         // (they will be built in the correct shuffled order by step 1 below).
         let mut pre_pat_built: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2982,6 +3067,37 @@ impl<'a> Executor<'a> {
 
             if let Some(ref text) = rule.second_expansion_prereqs.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
+                // sv 62706 ordering: before running the SE expansion (which fires $(info ...)
+                // and other side effects), pre-build any "non-deferred" words — i.e., top-level
+                // whitespace tokens in the substituted text that contain no '$'.  These come
+                // from prerequisite words that were NOT double-dollar-escaped in the source
+                // (e.g. `%.o` in `%.tsk: %.o $$(info ...)`).  Building them first ensures that
+                // their own SE expansions fire before the current target's SE side-effects.
+                // This matches GNU Make's implicit-rule-search ordering (sv 62706 test 27).
+                let pre_prereqs: Vec<String> = se_extract_non_dollar_words(&stem_subst);
+                for pre_prereq in &pre_prereqs {
+                    match self.build_target(pre_prereq) {
+                        Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+                        Err(e) => {
+                            if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() && !rule.is_compat {
+                                // Missing non-deferred prereq with no rule: treat as out of date
+                                // (same logic as the regular prereq loop above)
+                                any_rebuilt = true;
+                            } else {
+                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                    let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                                    format!("{}, needed by '{}'.  Stop.", base, target)
+                                } else {
+                                    e
+                                };
+                                *self.state.current_file.borrow_mut() = saved_file.clone();
+                                *self.state.current_line.borrow_mut() = saved_line;
+                                self.inherited_vars_stack.pop();
+                                return Err(propagated);
+                            }
+                        }
+                    }
+                }
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
                 // Mark SE prereqs as explicitly mentioned on a per-word basis.
                 // Words without '%' produce explicitly-mentioned (non-intermediate) files.
@@ -3306,18 +3422,18 @@ impl<'a> Executor<'a> {
                     // top-level target, OR if any LITERAL (non-%) prereq of the rule
                     // is explicitly mentioned (sv 60188: literal non-% prereqs of a
                     // pattern rule make the entire rule invocation "explicit").
-                    // Also: if any EXPANDED (stem-substituted) prereq is explicitly
-                    // mentioned AND is not marked .INTERMEDIATE, the rule invocation is
-                    // treated as "explicit" (e.g. `%.z %.q: %.x` with `unrelated: hello.x`
-                    // makes hello.x explicitly mentioned → hello.q is not intermediate).
                     let any_literal_prereq_explicit = literal_rule_prereqs.iter()
                         .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
-                    let any_expanded_prereq_not_intermediate = prereqs.iter()
+                    // Also check expanded (stem-substituted) prereqs: if any expanded prereq
+                    // is explicitly mentioned, the whole invocation is treated as explicit.
+                    // This handles `%.z %.q: %.x` with `unrelated: hello.x` → hello.x is
+                    // explicitly mentioned → hello.q is not intermediate.
+                    let any_expanded_prereq_explicit = prereqs.iter()
                         .any(|p| self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p));
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib)
                         || any_literal_prereq_explicit
-                        || any_expanded_prereq_not_intermediate;
+                        || any_expanded_prereq_explicit;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
@@ -5576,6 +5692,53 @@ fn se_text_has_percent(text: &str) -> bool {
     text.contains('%')
 }
 
+/// Extract "non-dollar" words from an SE text that has already had stem substituted.
+/// A "non-dollar" word is a top-level whitespace-delimited token that contains no `$`.
+/// These words correspond to prerequisites that were NOT double-dollar-escaped in the
+/// original source (e.g. `hello.o` from `%.tsk: %.o $$(info ...)` with stem `hello`).
+/// They should be built BEFORE the SE expansion runs, so their own SE side effects
+/// (like $(info ...) in their pattern rules) fire before the current target's SE.
+fn se_extract_non_dollar_words(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        // Skip leading whitespace.
+        while i < n && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= n { break; }
+        // Collect one top-level word, tracking nesting depth.
+        let word_start = i;
+        let mut depth: i32 = 0;
+        let mut has_dollar = false;
+        while i < n {
+            let b = bytes[i];
+            if (b == b' ' || b == b'\t') && depth == 0 { break; }
+            if b == b'$' {
+                has_dollar = true;
+                if i + 1 < n && (bytes[i+1] == b'(' || bytes[i+1] == b'{') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+            if (b == b')' || b == b'}') && depth > 0 {
+                depth -= 1;
+            }
+            i += 1;
+        }
+        if !has_dollar && i > word_start {
+            let word = &text[word_start..i];
+            if !word.is_empty() && word != "|" {
+                result.push(word.to_string());
+            }
+        }
+    }
+    result
+}
+
 /// Returns true if the SE text contains ANY word (top-level space-separated
 /// token, respecting `$(...)` groups) that does NOT contain `%`.
 /// Such words expand to files that are NOT stem-derived, i.e. "explicitly
@@ -6242,12 +6405,26 @@ fn run_cmd_with_error_handling(
     if (code == 127 || code == 126) && !recipe_cmd.trim().is_empty() {
         let cmd_name = extract_cmd_name(recipe_cmd);
         if !cmd_name.is_empty() {
-            let err_msg = if !Path::new(cmd_name).exists() {
-                // File doesn't exist → ENOENT
-                Some("No such file or directory")
+            // For commands with a path component (contain '/'), check the filesystem
+            // directly to distinguish ENOENT vs EACCES.
+            // For bare command names (no '/'), the shell searches PATH to find them.
+            // We cannot replicate that search here (PATH may have been changed by the
+            // makefile itself), so we rely on the shell exit code:
+            //   127 = command not found (ENOENT equivalent) → "No such file or directory"
+            //   126 = command found but not executable (EACCES)  → "Permission denied"
+            let err_msg = if cmd_name.contains('/') {
+                if !Path::new(cmd_name).exists() {
+                    Some("No such file or directory")
+                } else {
+                    Some("Permission denied")
+                }
             } else {
-                // File exists but not executable / wrong type (directory, etc.)
-                Some("Permission denied")
+                // Bare command name: use exit code to determine error message.
+                if code == 127 {
+                    Some("No such file or directory")
+                } else {
+                    Some("Permission denied")
+                }
             };
             if let Some(msg) = err_msg {
                 eprintln!("{}: {}: {}", progname, cmd_name, msg);

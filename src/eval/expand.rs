@@ -418,17 +418,32 @@ impl MakeState {
                             false
                         });
                         if looks_like_rule {
-                            // Use the outermost caller context when available (matches GNU Make behavior:
-                            // reports the file:line where the recipe's $(eval ...) appears).
-                            let (file_str, line_num) = {
-                                let stack = self.expansion_caller_stack.borrow();
-                                if let Some((f, l)) = stack.first() {
-                                    (f.clone(), *l)
-                                } else {
-                                    (self.current_file.borrow().clone(), *self.current_line.borrow())
-                                }
-                            };
-                            eprintln!("{}:{}: *** prerequisites cannot be defined in recipes.  Stop.", file_str, line_num);
+                            // When triggered from a recipe context, GNU Make prints
+                            //   "file:line: *** prerequisites cannot be defined in recipes."
+                            // When triggered from a second expansion context, GNU Make
+                            //   omits the file:line prefix.
+                            if in_recipe {
+                                // Use the outermost caller context when available (matches GNU Make behavior:
+                                // reports the file:line where the recipe's $(eval ...) appears).
+                                let (file_str, line_num) = {
+                                    let stack = self.expansion_caller_stack.borrow();
+                                    if let Some((f, l)) = stack.first() {
+                                        (f.clone(), *l)
+                                    } else {
+                                        (self.current_file.borrow().clone(), *self.current_line.borrow())
+                                    }
+                                };
+                                eprintln!("{}:{}: *** prerequisites cannot be defined in recipes.  Stop.", file_str, line_num);
+                            } else {
+                                // Second expansion context: no file:line prefix.
+                                let progname = std::env::args().next().unwrap_or_else(|| "jmake".to_string());
+                                let progname = std::path::Path::new(&progname)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("jmake")
+                                    .to_string();
+                                eprintln!("{}: *** prerequisites cannot be defined in recipes.  Stop.", progname);
+                            }
                             std::process::exit(2);
                         }
                     }
