@@ -4500,6 +4500,13 @@ impl<'a> Executor<'a> {
             if should_export {
                 let value = self.state.expand(&var.value);
                 cmd.env(name, &value);
+            } else if shell_blocks_auto_export {
+                // POSIX SHELL special case: the makefile overrode SHELL without explicit export.
+                // Do NOT call cmd.env_remove here — let the child inherit the original SHELL
+                // value from the parent process's own environment.  The makefile's SHELL value
+                // is used by jmake to invoke the recipe shell, but the child process's $SHELL
+                // env variable must remain whatever it was in the invoking environment.
+                // (If we called env_remove, the child would see an empty SHELL.)
             } else {
                 // Ensure the child does not see this variable from the inherited
                 // environment. This covers:
@@ -4658,7 +4665,13 @@ impl<'a> Executor<'a> {
             // Check if the var should be exported (either explicitly or via global setting).
             // Check for explicit target-specific export (also covers inherited export status).
             let target_explicitly_exported = explicit_exports.contains(var_name.as_str());
-            if target_explicitly_exported || global_should_export(var_name) {
+            // POSIX special case for SHELL: target-specific SHELL without explicit export
+            // must NOT be exported to the child's environment.  Only an explicit `export`
+            // declaration causes the target-specific SHELL value to be exported.
+            let target_shell_blocks_export = var_name == "SHELL"
+                && !target_explicitly_exported
+                && !self.db.export_all;
+            if !target_shell_blocks_export && (target_explicitly_exported || global_should_export(var_name)) {
                 exports.insert(var_name.clone(), value.clone());
             }
         }
