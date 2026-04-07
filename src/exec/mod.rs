@@ -292,6 +292,11 @@ impl<'a> Executor<'a> {
         // ------------------------------------------------------------------
         let plans = self.collect_plans(targets)?;
 
+        // DEBUG: print all plans and their prerequisites
+        for (name, plan) in &plans {
+            eprintln!("PLAN[{}]: needs_rebuild={} prereqs={:?} intermediate={}", name, plan.needs_rebuild, plan.prerequisites, plan.is_intermediate);
+        }
+
         // Store plans so build_job_from_plan can look them up.
         self.parallel_plans = Some(plans);
 
@@ -753,7 +758,8 @@ impl<'a> Executor<'a> {
                 // sv 62650: If VPATH resolves this target to a path that also has rules
                 // with a recipe, AND the local target also has a recipe, then the VPATH
                 // version takes precedence. Warn and redirect to the VPATH path.
-                let local_has_recipe = rules.iter().any(|r| !r.recipe.is_empty());
+                // Only applies to non-double-colon rules (single-colon, explicit target rules).
+                let local_has_recipe = rules.iter().any(|r| !r.recipe.is_empty() && !r.is_double_colon);
                 if local_has_recipe {
                     if let Some(vpath_resolved) = self.find_in_vpath(target) {
                         if vpath_resolved != target {
@@ -762,7 +768,7 @@ impl<'a> Executor<'a> {
                                 if vpath_has_recipe {
                                     // Find source info for the local rule with a recipe
                                     let local_rule_with_recipe = rules.iter()
-                                        .find(|r| !r.recipe.is_empty());
+                                        .find(|r| !r.recipe.is_empty() && !r.is_double_colon);
                                     if let Some(local_rule) = local_rule_with_recipe {
                                         let src = &local_rule.source_file;
                                         let recipe_lineno = local_rule.recipe.first()
