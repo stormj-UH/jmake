@@ -3786,6 +3786,18 @@ impl<'a> Executor<'a> {
         None
     }
 
+    /// Get the mtime for a file, respecting the -L/--check-symlink-times flag.
+    /// When check_symlink_times is true, returns the symlink's own mtime (lstat),
+    /// which allows dangling symlinks to return Some() with their own mtime.
+    /// When false (default), follows symlinks (stat), returning None for dangling symlinks.
+    fn file_mtime(&self, path: &str) -> Option<SystemTime> {
+        if self.state.args.check_symlink_times {
+            get_mtime_symlink(path)
+        } else {
+            get_mtime(path)
+        }
+    }
+
     fn needs_rebuild(&self, target: &str, prereqs: &[String], any_prereq_rebuilt: bool) -> bool {
         if any_prereq_rebuilt {
             return true;
@@ -3805,7 +3817,7 @@ impl<'a> Executor<'a> {
             }
         }
 
-        let target_time = match get_mtime(target) {
+        let target_time = match self.file_mtime(target) {
             Some(t) => t,
             None => return true, // Target doesn't exist
         };
@@ -3814,12 +3826,12 @@ impl<'a> Executor<'a> {
             // Skip .WAIT markers (should already be filtered, but be safe)
             if prereq == ".WAIT" { continue; }
 
-            let prereq_time = match get_mtime(prereq) {
+            let prereq_time = match self.file_mtime(prereq) {
                 Some(t) => t,
                 None => {
                     // Check VPATH
                     if let Some(found) = self.find_in_vpath(prereq) {
-                        match get_mtime(&found) {
+                        match self.file_mtime(&found) {
                             Some(t) => t,
                             None => continue,
                         }
@@ -4007,12 +4019,12 @@ impl<'a> Executor<'a> {
         //   - exist on disk AND are newer than the target
         //   - target doesn't exist but prereq exists on disk
         //   - prereq doesn't exist on disk but was visited/built this make run and target doesn't exist
-        let target_time = get_mtime(target);
+        let target_time = self.file_mtime(target);
         let newer: Vec<String> = prereqs.iter()
             .filter(|p| {
                 let resolved = resolve_prereq(p);
-                let prereq_mtime = get_mtime(&resolved).or_else(|| {
-                    self.find_in_vpath(p).and_then(|found| get_mtime(&found))
+                let prereq_mtime = self.file_mtime(&resolved).or_else(|| {
+                    self.find_in_vpath(p).and_then(|found| self.file_mtime(&found))
                 });
                 match (target_time, prereq_mtime) {
                     (None, Some(_)) => true,       // target doesn't exist, prereq does: newer
@@ -4074,7 +4086,11 @@ impl<'a> Executor<'a> {
     /// Used in question mode to determine if the target is "out of date".
     fn recipe_has_real_commands(&mut self, recipe: &[(usize, String)], auto_vars: &HashMap<String, String>) -> bool {
         for (_lineno, line) in recipe {
-            let expanded = self.state.expand_with_auto_vars(line, auto_vars);
+            // Collapse backslash-newline continuations before expanding, so that
+            // a recipe like `\<newline> $(.XY)` (where $(.XY) is empty) is correctly
+            // seen as an empty command rather than a non-empty `\`.
+            let preprocessed = preprocess_recipe_bsnl(line);
+            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
             let cmd = strip_recipe_prefixes(&expanded);
             if !cmd.trim().is_empty() {
                 return true;
@@ -5243,6 +5259,16 @@ fn vpath_pattern_matches(pattern: &str, target: &str) -> bool {
 
 fn get_mtime(path: &str) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Get mtime for symlink checking: if check_symlink_times is true, use the
+/// symlink's own modification time (lstat) rather than following the symlink.
+/// When the symlink points to a non-existent target (dangling symlink), returns
+/// the symlink's own mtime so the target can still be built.
+fn get_mtime_symlink(path: &str) -> Option<SystemTime> {
+    // Use symlink_metadata (lstat equivalent) to get the symlink's own mtime.
+    // This returns Some() even for dangling symlinks (symlink exists but target doesn't).
+    fs::symlink_metadata(path).ok()?.modified().ok()
 }
 
 fn touch_file(path: &str) {
