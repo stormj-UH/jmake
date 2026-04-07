@@ -762,7 +762,29 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
     // (the target-pattern) contains a `%`.
     // Example:  "foo.o bar.o: %.o: %.c"
     //           rest = " %.o: %.c"  →  second colon found at "%.o"
-    let rest_trimmed = rest.trim();
+    let rest_trimmed_raw = rest.trim();
+    // Strip inline comments from the prerequisites portion (before any `;`).
+    // For example "target: # comment ; cmd" or "target: dep # comment" should
+    // have their comments stripped so `#` is not treated as a prerequisite name.
+    // The inline recipe (after `;`) is NOT comment-stripped here — it is passed
+    // to the shell verbatim.
+    let rest_trimmed_owned;
+    let rest_trimmed = {
+        // Find the semicolon position in the RAW rest (before comment-stripping)
+        // so we can preserve the inline recipe exactly.
+        let semi_in_raw = find_semicolon(rest_trimmed_raw);
+        if let Some(semi) = semi_in_raw {
+            // Strip comments only from the prereq part; keep recipe verbatim.
+            let prereq_stripped = strip_comment(&rest_trimmed_raw[..semi]);
+            rest_trimmed_owned = format!("{};{}", prereq_stripped, &rest_trimmed_raw[semi+1..]);
+            rest_trimmed_owned.as_str()
+        } else {
+            // No inline recipe: strip comments from the whole rest.
+            rest_trimmed_owned = strip_comment(rest_trimmed_raw);
+            rest_trimmed_owned.as_str()
+        }
+    };
+    let rest_trimmed = rest_trimmed.trim();
     // Only search for the static-pattern-rule colon in the part before any
     // inline recipe (`;`).  Otherwise "%.elf: %.c ; :" would incorrectly
     // treat the `:` from the inline recipe as a static-pattern-rule separator.
@@ -841,7 +863,8 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
 
     // Split prerequisites and order-only prerequisites (after |), and extract
     // any inline recipe that appears after a bare `;`.
-    let rest_trimmed2 = rest.trim();
+    // Use the comment-stripped version of rest for actual prereq splitting.
+    let rest_trimmed2 = rest_trimmed;
     let (prereqs, order_only, inline_recipe) = split_prerequisites(rest_trimmed2);
     let is_pattern = targets.iter().any(|t| t.contains('%'));
 
