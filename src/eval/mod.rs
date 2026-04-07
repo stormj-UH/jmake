@@ -1384,7 +1384,23 @@ impl MakeState {
                 false
             } else {
                 let trimmed_raw = line.trim();
+                // Skip the rule-colon heuristic for define directives (e.g. `define simple :=`).
+                // `find_rule_colon` incorrectly returns Some for lines like `define name :=`
+                // because it sees the `:` in `:=` as a rule colon.  These lines are already
+                // handled by `try_expand_define_name` above and must go through `parse_line`
+                // directly so they are recognised as define directive starters.
+                let is_define_directive_line = {
+                    let mut w = trimmed_raw;
+                    // Strip optional override/export prefixes
+                    loop {
+                        if w.starts_with("override ") { w = w["override ".len()..].trim_start(); }
+                        else if w.starts_with("export ") { w = w["export ".len()..].trim_start(); }
+                        else { break; }
+                    }
+                    w.starts_with("define ") || w.starts_with("define\t") || w == "define"
+                };
                 !trimmed_raw.starts_with('#')
+                    && !is_define_directive_line
                     && parser::try_parse_variable_assignment(trimmed_raw).is_none()
                     && parser::find_rule_colon_pub(trimmed_raw).is_some()
             };
@@ -3386,6 +3402,10 @@ impl MakeState {
                     let target_time = target_mtime.unwrap();
                     // A phony prerequisite always makes the target out of date.
                     // A regular prereq triggers rebuild only if it now EXISTS and is newer.
+                    // A prereq that has ANY rule but doesn't exist (e.g. `force:` with no
+                    // recipe and no prereqs) acts as an "always satisfied" forcing target:
+                    // it was effectively "built" by its empty rule and makes the parent
+                    // out of date.
                     let phony_targets = self.db.special_targets
                         .get(&SpecialTarget::Phony)
                         .cloned()
@@ -3393,6 +3413,13 @@ impl MakeState {
                     rule_info.prerequisites.iter().any(|prereq| {
                         if phony_targets.contains(prereq.as_str()) {
                             // Phony prerequisite → always out of date
+                            return true;
+                        }
+                        // A prereq that has a rule but no file → was "built" (via empty rule
+                        // or recipe that produced no file) → forces parent rebuild.
+                        if !Path::new(prereq).exists()
+                            && self.db.rules.get(prereq).map_or(false, |r| !r.is_empty())
+                        {
                             return true;
                         }
                         std::fs::metadata(prereq).ok()

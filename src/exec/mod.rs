@@ -1229,10 +1229,10 @@ impl<'a> Executor<'a> {
                 let mut skipped_intermediates: Vec<String> = Vec::new();
                 let any_prereq_newer = check_prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
-                    if self.what_if.iter().any(|w| w == p) { return true; }
+                    if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(p)) { return true; }
                     // Also check VPATH-resolved path against what-if list
                     if let Some(ref vp) = self.find_in_vpath(p) {
-                        if self.what_if.iter().any(|w| w == vp) { return true; }
+                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) { return true; }
                     }
                     if self.db.is_phony(p) { return true; }
                     // Use effective_mtime to handle deleted intermediates
@@ -2741,9 +2741,9 @@ impl<'a> Executor<'a> {
             }) {
                 let any_prereq_newer = prereqs.iter().any(|p| {
                     if p == ".WAIT" { return false; }
-                    if self.what_if.iter().any(|w| w == p) { return true; }
+                    if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(p)) { return true; }
                     if let Some(ref vp) = self.find_in_vpath(p) {
-                        if self.what_if.iter().any(|w| w == vp) { return true; }
+                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) { return true; }
                     }
                     if self.db.is_phony(p) { return true; }
                     // Check if the file actually exists on disk.
@@ -2947,9 +2947,23 @@ impl<'a> Executor<'a> {
             if let Some(ref text) = rule.second_expansion_prereqs.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                // Mark SE prereqs as explicitly mentioned if their source text had no '%'
-                // (meaning they're not derived from the stem).
-                if !se_text_has_percent(text) {
+                // Mark SE prereqs as explicitly mentioned on a per-word basis:
+                // words without '%' are not stem-derived and produce explicitly-mentioned files.
+                // Words with '%' produce stem-derived (intermediate) files.
+                // If ALL words have '%', nothing is explicitly mentioned.
+                // If ANY word lacks '%', expand just those words to find explicitly-mentioned prereqs.
+                if se_text_has_non_pattern_word(text) {
+                    // Expand only the non-pattern words to get explicitly-mentioned prereqs.
+                    let non_pat_text = se_non_pattern_words(text).join(" ");
+                    if !non_pat_text.is_empty() {
+                        let non_pat_subst = subst_stem_in_se_text_dir(&non_pat_text, stem, matched_pattern_target);
+                        let (np_normal, _np_oo) = self.second_expand_prereqs(&non_pat_subst, &base_auto_vars, target);
+                        for p in &np_normal {
+                            self.se_explicitly_mentioned.insert(p.clone());
+                        }
+                    }
+                } else if !se_text_has_percent(text) {
+                    // No '%' at all: every prereq is explicitly mentioned.
                     for p in &normal {
                         self.se_explicitly_mentioned.insert(p.clone());
                     }
@@ -2960,7 +2974,16 @@ impl<'a> Executor<'a> {
             if let Some(ref text) = rule.second_expansion_order_only.clone() {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
-                if !se_text_has_percent(text) {
+                if se_text_has_non_pattern_word(text) {
+                    let non_pat_text = se_non_pattern_words(text).join(" ");
+                    if !non_pat_text.is_empty() {
+                        let non_pat_subst = subst_stem_in_se_text_dir(&non_pat_text, stem, matched_pattern_target);
+                        let (np_normal, _np_oo) = self.second_expand_prereqs(&non_pat_subst, &base_auto_vars, target);
+                        for p in &np_normal {
+                            self.se_explicitly_mentioned.insert(p.clone());
+                        }
+                    }
+                } else if !se_text_has_percent(text) {
                     for p in &normal {
                         self.se_explicitly_mentioned.insert(p.clone());
                     }
@@ -3216,9 +3239,14 @@ impl<'a> Executor<'a> {
                     // A sibling is intermediate independently of the primary target.
                     // It escapes intermediate status if it is explicitly mentioned
                     // in the makefile (as target or prereq of any rule) OR is a
-                    // top-level target.
+                    // top-level target, OR if any of the rule's concrete prerequisites
+                    // is explicitly mentioned (sv 60188: literal non-% prereqs of a
+                    // pattern rule make the entire rule invocation "explicit").
+                    let any_prereq_explicit = prereqs.iter()
+                        .any(|p| self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p));
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
-                        || self.is_explicitly_mentioned(sib);
+                        || self.is_explicitly_mentioned(sib)
+                        || any_prereq_explicit;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
@@ -4102,16 +4130,45 @@ impl<'a> Executor<'a> {
                 for rule in rules {
                     for prereq in &rule.prerequisites {
                         // If a prereq is what-if (or its VPATH-resolved path is), target would rebuild
-                        if self.what_if.iter().any(|w| w == prereq) {
+                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(prereq)) {
                             return Some(SystemTime::now());
                         }
                         if let Some(ref vp) = self.find_in_vpath(prereq) {
-                            if self.what_if.iter().any(|w| w == vp) {
+                            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
                                 return Some(SystemTime::now());
                             }
                         }
                         // If a prereq's effective mtime is newer than target, target would rebuild
                         if let Some(pt) = self.effective_mtime(prereq, depth + 1) {
+                            if pt > t {
+                                return Some(SystemTime::now());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No explicit rules: also check pattern rules so that a file found via
+                // VPATH is considered out of date when its pattern-rule prerequisites are
+                // newer.  Example: foo.b exists in VPATH but foo.c (its %.b:%.c source)
+                // is newer — without this check effective_mtime would return the stale
+                // mtime of foo.b and the parent would never be rebuilt.
+                if let Some((rule, stem)) = self.find_pattern_rule(target) {
+                    let matched_pt_em: String = rule.targets.iter()
+                        .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| "%".to_string());
+                    for prereq_pat in &rule.prerequisites {
+                        if prereq_pat.as_str() == ".WAIT" { continue; }
+                        let prereq = subst_stem_in_prereq_dir(prereq_pat, &stem, &matched_pt_em);
+                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(&prereq)) {
+                            return Some(SystemTime::now());
+                        }
+                        if let Some(ref vp) = self.find_in_vpath(&prereq) {
+                            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
+                                return Some(SystemTime::now());
+                            }
+                        }
+                        if let Some(pt) = self.effective_mtime(&prereq, depth + 1) {
                             if pt > t {
                                 return Some(SystemTime::now());
                             }
@@ -4171,11 +4228,11 @@ impl<'a> Executor<'a> {
         // Also check the VPATH-resolved path (e.g., prereq "x" found as "x-dir/x" via VPATH,
         // and "-W x-dir/x" was given).
         for prereq in prereqs {
-            if self.what_if.iter().any(|w| w == prereq) {
+            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(prereq)) {
                 return true;
             }
             if let Some(ref vp) = self.find_in_vpath(prereq) {
-                if self.what_if.iter().any(|w| w == vp) {
+                if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
                     return true;
                 }
             }
@@ -4348,14 +4405,22 @@ impl<'a> Executor<'a> {
         // Helper: resolve a prerequisite to its actual path, checking:
         //   1. lib_search_results for -lname prerequisites
         //   2. Direct existence
-        //   3. VPATH lookup
+        //   3. Whether the prereq was built this run (in which case use its local name,
+        //      not the VPATH copy — the build may have created it locally or attempted to)
+        //   4. VPATH lookup
         let resolve_prereq = |p: &str| -> String {
             if let Some(resolved) = self.lib_search_results.get(p) {
                 return resolved.clone();
             }
             if Path::new(p).exists() {
-                p.to_string()
-            } else if let Some(found) = self.find_in_vpath(p) {
+                return p.to_string();
+            }
+            // If the prereq was visited/built this run, use its original name rather than
+            // resolving to a VPATH copy (the build targeted the local name).
+            if self.built.contains_key(p) {
+                return p.to_string();
+            }
+            if let Some(found) = self.find_in_vpath(p) {
                 found
             } else {
                 p.to_string()
@@ -5252,6 +5317,13 @@ impl<'a> Executor<'a> {
 /// If source_file is empty or lineno is 0, returns an empty string.
 /// Extract ".WAIT groups" from a prerequisite list that may contain ".WAIT" markers.
 ///
+/// Normalize a file path for what-if comparison by stripping a leading `./`.
+/// This allows `-W ./foo` to match `foo` and vice versa.
+#[inline]
+fn normalize_path(p: &str) -> &str {
+    p.strip_prefix("./").unwrap_or(p)
+}
+
 /// Returns a Vec of groups, where each group is the list of prereqs between two consecutive
 /// .WAIT markers (or between a .WAIT and the start/end of the list).  An empty Vec is
 /// returned when there are no .WAIT markers (the caller should treat the list as a single
@@ -5431,6 +5503,84 @@ fn se_text_has_non_pattern_word(text: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Collects all top-level words from the SE text that do NOT contain `%`.
+/// These are words that are NOT stem-derived, i.e. they will expand to
+/// explicitly-mentioned files regardless of what the stem is.
+///
+/// Used to mark the right subset of SE-expanded prerequisites as
+/// "explicitly mentioned" (i.e. non-intermediate) in the database.
+fn se_non_pattern_words(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut word_start = 0;
+    let mut in_word = false;
+    let mut word_has_percent = false;
+
+    let mut flush_word = |start: usize, end: usize, has_pct: bool, result: &mut Vec<String>| {
+        if !has_pct && end > start {
+            result.push(text[start..end].to_string());
+        }
+    };
+
+    while i < n {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' => {
+                if in_word {
+                    flush_word(word_start, i, word_has_percent, &mut result);
+                }
+                in_word = false;
+                word_has_percent = false;
+                i += 1;
+            }
+            b'$' => {
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
+                if i + 1 < n {
+                    match bytes[i + 1] {
+                        b'(' | b'{' => {
+                            let open = bytes[i + 1];
+                            let close = if open == b'(' { b')' } else { b'}' };
+                            let mut depth = 1;
+                            i += 2;
+                            while i < n && depth > 0 {
+                                if bytes[i] == open { depth += 1; }
+                                else if bytes[i] == close { depth -= 1; }
+                                i += 1;
+                            }
+                        }
+                        _ => { i += 2; }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b'%' => {
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
+                word_has_percent = true;
+                i += 1;
+            }
+            _ => {
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    if in_word {
+        flush_word(word_start, n, word_has_percent, &mut result);
+    }
+    result
 }
 
 /// Apply `%` → stem substitution to a prerequisite string, word by word.
