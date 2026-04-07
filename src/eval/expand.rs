@@ -254,6 +254,24 @@ impl MakeState {
     fn expand_var_value(&self, var: &Variable, auto_vars: &HashMap<String, String>) -> String {
         match var.flavor {
             VarFlavor::Recursive => {
+                // Guard against infinite recursion: if this variable is already being expanded
+                // (e.g. VARIABLE = $(eval VARIABLE := foo)$(VARIABLE) where eval hasn't run yet),
+                // return empty string instead of recursing infinitely.
+                // We key on (source_file, source_line, value) to uniquely identify the var instance.
+                let recursion_key = if !var.source_file.is_empty() && var.source_line != 0 {
+                    format!("{}:{}", var.source_file, var.source_line)
+                } else {
+                    var.value.clone()
+                };
+                {
+                    let mut being_expanded = self.vars_being_expanded.borrow_mut();
+                    if being_expanded.contains(&recursion_key) {
+                        // Circular expansion detected — return empty to break the cycle.
+                        return String::new();
+                    }
+                    being_expanded.insert(recursion_key.clone());
+                }
+
                 // For lazily-expanded variables, temporarily set current_file/current_line
                 // to the variable's definition site so that errors (e.g. from $(word ...) or
                 // $(wordlist ...)) report the location where the function was written, not
@@ -262,23 +280,33 @@ impl MakeState {
                 // We push the caller's (file, line) onto the expansion_caller_stack so that
                 // functions like $(error) and $(warning) — which should report the callsite
                 // rather than the definition — can restore the outer context.
-                if !var.source_file.is_empty() && var.source_line != 0 {
+                let result = if !var.source_file.is_empty() && var.source_line != 0 {
                     let saved_file = self.current_file.borrow().clone();
                     let saved_line = *self.current_line.borrow();
                     self.expansion_caller_stack.borrow_mut().push((saved_file.clone(), saved_line));
                     *self.current_file.borrow_mut() = var.source_file.clone();
                     *self.current_line.borrow_mut() = var.source_line;
-                    let result = self.expand_with_auto_vars(&var.value, auto_vars);
+                    // Clone the value so we don't hold a reference into self.db.variables
+                    // while expanding (eval may modify the variable database).
+                    let value = var.value.clone();
+                    let r = self.expand_with_auto_vars(&value, auto_vars);
                     self.expansion_caller_stack.borrow_mut().pop();
                     *self.current_file.borrow_mut() = saved_file;
                     *self.current_line.borrow_mut() = saved_line;
-                    result
+                    r
                 } else {
-                    self.expand_with_auto_vars(&var.value, auto_vars)
-                }
+                    let value = var.value.clone();
+                    self.expand_with_auto_vars(&value, auto_vars)
+                };
+
+                self.vars_being_expanded.borrow_mut().remove(&recursion_key);
+                result
             }
             VarFlavor::Simple | VarFlavor::PosixSimple => var.value.clone(),
-            _ => self.expand_with_auto_vars(&var.value, auto_vars),
+            _ => {
+                let value = var.value.clone();
+                self.expand_with_auto_vars(&value, auto_vars)
+            }
         }
     }
 
@@ -322,32 +350,59 @@ impl MakeState {
         match name {
             "eval" => {
                 // GNU Make does not allow eval to define prerequisites from within
-                // a second expansion prereq context (it would modify the rule database
-                // while iterating). Detect this and emit the matching error.
-                if *self.in_second_expansion.borrow() {
+                // a second expansion prereq context or from within a recipe (Savannah #12124).
+                // It would modify the rule database in an unsafe context.
+                let in_se = *self.in_second_expansion.borrow();
+                let in_recipe = *self.in_recipe_execution.borrow();
+                if in_se || in_recipe {
                     let expanded = self.expand_with_auto_vars(args_str, auto_vars);
-                    // Check if the expanded text tries to define rules (contains ':').
-                    // More specifically: GNU Make's check is whether any rule is added.
-                    // We replicate by detecting the pattern here.
-                    // GNU Make always emits the error when eval is used in SE prereqs
-                    // and the content would create rules/prereqs.
-                    // Simplest: always emit error when eval in SE prereq context creates
-                    // any rule. We detect by checking if the expanded text contains ':'
-                    // (which would be a rule separator).
-                    // Actually GNU Make's check is simpler: it errors if eval creates
-                    // any new deps. We mimic this by flagging any eval in SE prereqs.
                     if !expanded.is_empty() {
-                        // Check if it looks like a rule definition (contains ':')
-                        // by trying to see if parse would create rules.
-                        // For accuracy, check if the content has lines with ':' that
-                        // look like rule definitions.
+                        // Check if it looks like a rule/prerequisite definition.
+                        // Variable assignments containing ':=' or '::=' are NOT rules.
+                        // Only flag lines where ':' appears as a rule separator (not `:=`).
                         let looks_like_rule = expanded.lines().any(|line| {
                             let t = line.trim();
-                            !t.is_empty() && !t.starts_with('#')
-                                && t.contains(':')
-                                && !t.starts_with("override ")
-                                && !t.starts_with("export ")
-                                && !t.starts_with("vpath ")
+                            if t.is_empty() || t.starts_with('#') {
+                                return false;
+                            }
+                            // Skip known non-rule directives
+                            if t.starts_with("override ")
+                                || t.starts_with("export ")
+                                || t.starts_with("unexport ")
+                                || t.starts_with("vpath ")
+                                || t.starts_with("include ")
+                                || t.starts_with("-include ")
+                                || t.starts_with("sinclude ")
+                                || t.starts_with("define ")
+                                || t.starts_with("undefine ")
+                            {
+                                return false;
+                            }
+                            // Skip variable assignments: foo := ..., foo ?= ..., foo += ..., etc.
+                            // A simple heuristic: if the first ':' in the line is immediately
+                            // followed by '=' or ':', it's an assignment or double-colon rule
+                            // being defined (double-colon rules ARE allowed in eval in recipes?).
+                            // The real check: does this line define NEW prerequisites?
+                            // We detect that by finding a ':' not followed by '=' or ':'.
+                            if let Some(colon_pos) = t.find(':') {
+                                let after = &t[colon_pos + 1..];
+                                // :=, ::=, := are assignment operators — not rules
+                                if after.starts_with('=') {
+                                    return false;
+                                }
+                                // Check for simple assignment operators before the colon
+                                // e.g. "VAR ?= val", "VAR += val", "VAR != cmd"
+                                let before_colon = t[..colon_pos].trim_end();
+                                if before_colon.ends_with('?')
+                                    || before_colon.ends_with('+')
+                                    || before_colon.ends_with('!')
+                                {
+                                    return false;
+                                }
+                                // ':' that is not part of an assignment → looks like a rule
+                                return true;
+                            }
+                            false
                         });
                         if looks_like_rule {
                             let progname = crate::eval::make_progname();
@@ -355,10 +410,21 @@ impl MakeState {
                             std::process::exit(2);
                         }
                     }
-                    self.eval_pending.borrow_mut().push(expanded);
+                    // When inside a recipe or second-expansion context, execute the eval
+                    // immediately via the same unsafe path as the normal case (below).
+                    // Variable assignments (the common case here) are safe to execute immediately.
+                    let result = unsafe {
+                        let self_ptr: *mut Self = self as *const Self as *mut Self;
+                        (*self_ptr).eval_string(&expanded)
+                    };
+                    if let Err(e) = result {
+                        if !e.is_empty() {
+                            eprintln!("{}", e);
+                        }
+                    }
                 } else {
                     let expanded = self.expand_with_auto_vars(args_str, auto_vars);
-                    // Push to eval_pending (processed after expansion via RefCell).
+                    // Apply a second expansion pass for $(call)/$(foreach)/$(let) context vars.
                     // If we're inside a $(call), auto_vars contains $1, $2, etc.
                     // After the first expansion pass, `$$1` → `$1` (literal dollar-one).
                     // GNU Make resolves `$1` in the eval content using the call context.
@@ -402,7 +468,29 @@ impl MakeState {
                     } else {
                         expanded
                     };
-                    self.eval_pending.borrow_mut().push(final_content);
+                    // GNU Make executes $(eval ...) immediately during expansion.
+                    // We use an unsafe raw pointer to call eval_string() with &mut self,
+                    // bypassing the borrow checker.  This is safe here because:
+                    //  - eval_string() only inserts/modifies entries in self.db.variables
+                    //    (via IndexMap); it does NOT remove entries nor reallocate while
+                    //    we hold a live &-reference into the map.
+                    //  - The value string we are currently expanding was cloned before
+                    //    calling expand_with_auto_vars(), so we hold no live reference
+                    //    into self.db.variables at this point.
+                    // SAFETY: we have exclusive logical access to self at this call site;
+                    // no other thread is mutating self, and no live &-borrows into
+                    // self.db.variables exist from the caller's stack frame.
+                    // We call through a raw pointer (not &mut Self ref) to avoid the
+                    // UB lint for &T → &mut T casts.
+                    let result = unsafe {
+                        let self_ptr: *mut Self = self as *const Self as *mut Self;
+                        (*self_ptr).eval_string(&final_content)
+                    };
+                    if let Err(e) = result {
+                        if !e.is_empty() {
+                            eprintln!("{}", e);
+                        }
+                    }
                 }
                 return String::new();
             }

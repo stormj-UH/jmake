@@ -466,6 +466,11 @@ impl<'a> Executor<'a> {
         let mut ops: Vec<(String, Option<String>)> = Vec::new();
         for (name, var) in &self.db.variables {
             if name == "MAKELEVEL" { continue; } // set separately
+            // MAKE_RESTARTS must not be exported to child makes (only relevant for re-exec).
+            if name == "MAKE_RESTARTS" {
+                ops.push((name.clone(), None));
+                continue;
+            }
             let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
             let was_from_env = self.db.env_var_names.contains(name.as_str());
             let should_export = !var.is_private && (always_export || match var.export {
@@ -4175,6 +4180,7 @@ impl<'a> Executor<'a> {
             let mut is_first = true;
             let mut last_lineno: usize = 0;
 
+            *self.state.in_recipe_execution.borrow_mut() = true;
             for (lineno, line) in recipe {
                 last_lineno = *lineno;
                 // Update current_file/current_line so that errors during expansion
@@ -4196,6 +4202,7 @@ impl<'a> Executor<'a> {
                 script.push_str(&cmd_line);
                 script.push('\n');
             }
+            *self.state.in_recipe_execution.borrow_mut() = false;
 
             let effective_silent = first_line_silent || self.silent || is_silent_target;
             let effective_ignore = first_line_ignore || self.ignore_errors;
@@ -4273,6 +4280,9 @@ impl<'a> Executor<'a> {
         // if recipe line 2 has $(shell bad-cmd) and recipe line 1 has echo hi,
         // the error from $(shell bad-cmd) appears BEFORE "hi" is printed.
         // Pre-expand all recipe lines first.
+        // Signal that we are inside recipe expansion so $(eval) can detect
+        // and reject new prerequisite definitions (GNU Make bug #12124).
+        *self.state.in_recipe_execution.borrow_mut() = true;
         let pre_expanded: Vec<(usize, String, Vec<String>)> = recipe.iter().map(|(lineno, line)| {
             *self.state.current_file.borrow_mut() = source_file.to_string();
             *self.state.current_line.borrow_mut() = *lineno;
@@ -4281,6 +4291,7 @@ impl<'a> Executor<'a> {
             let sub_lines = split_recipe_sub_lines(&expanded);
             (*lineno, line.clone(), sub_lines)
         }).collect();
+        *self.state.in_recipe_execution.borrow_mut() = false;
 
         // Execute each recipe line separately.
         // Track whether any actual shell commands were executed.
@@ -4454,6 +4465,13 @@ impl<'a> Executor<'a> {
         for (name, var) in &self.db.variables {
             // MAKELEVEL is handled separately (incremented), skip it here
             if name == "MAKELEVEL" {
+                continue;
+            }
+            // MAKE_RESTARTS must NOT be exported to child makes.
+            // It is only meaningful to the current process (counting re-execs).
+            // Child makes start fresh with MAKE_RESTARTS=0 (unset).
+            if name == "MAKE_RESTARTS" {
+                cmd.env_remove(name);
                 continue;
             }
             // These special make variables are always exported to sub-makes
@@ -5314,20 +5332,12 @@ fn run_cmd_with_error_handling(
     recipe_cmd: &str,
     progname: &str,
 ) -> std::io::Result<i32> {
-    use std::io::Read;
-    cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let stderr_pipe = child.stderr.take();
-    let status = child.wait()?;
+    // Run the child with inherited stderr so that all output (stdout and stderr)
+    // appears in real-time and in the correct order.  Piping stderr would cause
+    // all stderr output from the child to arrive after all stdout, breaking the
+    // expected "Entering/Leaving directory" ordering for recursive makes.
+    let status = cmd.status()?;
     let code = status.code().unwrap_or(1);
-
-    let stderr_bytes = if let Some(mut pipe) = stderr_pipe {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    } else {
-        Vec::new()
-    };
 
     // If exit code is 127 (command not found) or 126 (permission/exec error),
     // check if the first word of the command exists and print our own GNU Make-style error.
@@ -5344,15 +5354,9 @@ fn run_cmd_with_error_handling(
             };
             if let Some(msg) = err_msg {
                 eprintln!("{}: {}: {}", progname, cmd_name, msg);
-                // Suppress the shell's error output and normalize to exit 127
                 return Ok(127);
             }
         }
-    }
-
-    // Pass through any stderr from the shell that we didn't suppress
-    if !stderr_bytes.is_empty() {
-        let _ = std::io::stderr().lock().write_all(&stderr_bytes);
     }
 
     Ok(code)

@@ -77,6 +77,11 @@ pub struct MakeState {
     /// When eval() is called in this context, it must not create new rules
     /// (GNU Make error: "prerequisites cannot be defined in recipes").
     pub in_second_expansion: RefCell<bool>,
+    /// Set to true while executing a recipe (expanding recipe lines for a shell).
+    /// When eval() is called in this context and the content defines new
+    /// prerequisites, it must produce the "prerequisites cannot be defined in
+    /// recipes" error (GNU Make Savannah bug #12124).
+    pub in_recipe_execution: RefCell<bool>,
     /// Pending includes that couldn't be found during initial read
     pub pending_includes: Vec<PendingInclude>,
     /// Set of include file names for which a rebuild recipe has already been
@@ -109,6 +114,11 @@ pub struct MakeState {
     /// (deepest stack) entry so that "Error found!" in a lazy var reports the recipe
     /// line where the variable was referenced, not the variable's definition line.
     pub expansion_caller_stack: RefCell<Vec<(String, usize)>>,
+    /// Set of variable names currently being expanded (used to detect/prevent infinite
+    /// recursion when a recursive variable references itself, e.g. via $(eval ...)).
+    /// When expansion of a recursive variable is requested and the variable is already
+    /// in this set, the expansion returns empty string instead of recursing infinitely.
+    pub vars_being_expanded: RefCell<std::collections::HashSet<String>>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -242,6 +252,7 @@ impl MakeState {
             current_line: RefCell::new(0),
             last_shell_status: RefCell::new(None),
             in_second_expansion: RefCell::new(false),
+            in_recipe_execution: RefCell::new(false),
             pending_includes: Vec::new(),
             include_recipe_ran: HashSet::new(),
             entering_directory_printed: false,
@@ -250,6 +261,7 @@ impl MakeState {
             include_imagined: HashSet::new(),
             call_context_stack: RefCell::new(Vec::new()),
             expansion_caller_stack: RefCell::new(Vec::new()),
+            vars_being_expanded: RefCell::new(std::collections::HashSet::new()),
         };
 
         // Change directory if requested
@@ -288,7 +300,7 @@ impl MakeState {
             let entering_already_printed = env::var("JMAKE_ENTERING_PRINTED").as_deref() == Ok("1");
             if should_print_directory(&state.args) && !entering_already_printed {
                 let cwd = logical_cwd();
-                eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+                println!("{}: Entering directory '{}'", progname, cwd.display());
                 state.entering_directory_printed = true;
             } else if entering_already_printed {
                 state.entering_directory_printed = true;
@@ -321,7 +333,7 @@ impl MakeState {
         if print_dir && !self.entering_directory_printed && !entering_already_printed {
             // Already printed at startup for -C; print here for -w without -C
             let cwd = logical_cwd();
-            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+            println!("{}: Entering directory '{}'", progname, cwd.display());
             self.entering_directory_printed = true;
         } else if entering_already_printed {
             self.entering_directory_printed = true;
@@ -444,7 +456,7 @@ impl MakeState {
         let print_dir = should_print_directory(&self.args);
         if print_dir {
             let cwd = logical_cwd();
-            eprintln!("{}: Leaving directory '{}'", progname, cwd.display());
+            println!("{}: Leaving directory '{}'", progname, cwd.display());
         }
 
         result
@@ -779,6 +791,11 @@ impl MakeState {
             .or_else(|| env::var("MAKEFILES").ok())
             .unwrap_or_default();
         if !makefiles_val.is_empty() {
+            // GNU Make: files listed in MAKEFILES must not affect the default goal.
+            // Save the default goal state and restore it after processing MAKEFILES
+            // files, so that the first rule from the main makefile becomes the default.
+            let saved_default_target = self.db.default_target.clone();
+            let saved_default_goal_explicit = self.db.default_goal_explicit;
             for file in makefiles_val.split_whitespace() {
                 // Each entry is treated as an optional include (ignore if missing,
                 // but still try to build if there is a rule).
@@ -797,6 +814,14 @@ impl MakeState {
                         });
                     }
                 }
+            }
+            // Restore default goal state — MAKEFILES files don't set the default goal.
+            self.db.default_target = saved_default_target;
+            self.db.default_goal_explicit = saved_default_goal_explicit;
+            // Also reset .DEFAULT_GOAL variable to empty (since MAKEFILES files
+            // may have set it to their first target).
+            if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
+                var.value = String::new();
             }
         }
 
@@ -891,9 +916,16 @@ impl MakeState {
     }
 
     pub fn read_makefile(&mut self, path: &Path) -> Result<(), String> {
+        self.read_makefile_display(path, None)
+    }
+
+    /// Like read_makefile but uses `display_name` as the filename shown in error messages.
+    /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
+    pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
         let path_str = path.to_string_lossy();
         let is_stdin = path_str == "-" || path_str == "/dev/stdin";
 
+        // Always use the actual path for load_file(), so the file is found correctly.
         let mut parser = Parser::new(if is_stdin {
             PathBuf::from("-")
         } else {
@@ -943,6 +975,14 @@ impl MakeState {
                 msg
             };
             return Err(format!("{}: {}", path.display(), clean_msg));
+        }
+
+        // Override parser.filename with display_name after loading so error messages use
+        // the original include argument (without the -I directory prefix), matching GNU Make.
+        if let Some(dn) = display_name {
+            if !is_stdin {
+                parser.filename = PathBuf::from(dn);
+            }
         }
 
         self.makefile_list.push(if is_stdin {
@@ -1660,7 +1700,15 @@ impl MakeState {
                             let file_path = self.find_include_file(&file);
                             match file_path {
                                 Some(p) => {
-                                    if let Err(_e) = self.read_makefile(&p) {
+                                    // Use the original `file` name as the display name for error
+                                    // messages. GNU Make reports the name from the include directive
+                                    // (without the -I directory prefix), not the resolved path.
+                                    let display = if p.to_string_lossy() != file.as_str() {
+                                        Some(file.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(_e) = self.read_makefile_display(&p, display) {
                                         // File exists but failed to parse (e.g. unreadable).
                                         // Defer to pending includes to decide what to do.
                                         self.pending_includes.push(PendingInclude {
@@ -1838,6 +1886,40 @@ impl MakeState {
             // Process any $(eval) calls that were queued during this line's expansion.
             // GNU Make processes $(eval) immediately, so effects (like undefine) are
             // visible to subsequent lines in the same makefile.
+            //
+            // Before draining eval_pending, flush any current_rule that was accumulated
+            // before the eval call.  This is needed when the $(eval) appears in a
+            // non-recipe context (e.g., a variable assignment line or a define block).
+            // Without flushing, an eval'd rule that references the same target as an
+            // already-parsed rule would be registered first, reversing the order of
+            // double-colon rules.
+            //
+            // The decision to flush is based on whether the CURRENT SOURCE LINE is a
+            // recipe line (starts with TAB or the custom recipe prefix).  If the current
+            // line is NOT a recipe line, $(eval) appearing in it is a top-level directive
+            // and any pending current_rule must be registered before the eval'd content.
+            // We cannot rely on parser.in_recipe here because that flag persists from a
+            // previous rule definition even when subsequent non-recipe lines are processed
+            // (blank lines and `$(eval ...)` lines that expand to empty keep in_recipe=true).
+            let current_line_is_recipe = {
+                let custom_pfx: Option<char> = self.db.variables.get(".RECIPEPREFIX")
+                    .and_then(|v| v.value.chars().next())
+                    .filter(|&c| c != '\t');
+                line.starts_with('\t')
+                    || custom_pfx.map(|c| line.starts_with(c)).unwrap_or(false)
+            };
+            if !self.eval_pending.borrow().is_empty() && !current_line_is_recipe {
+                if let Some(prev) = current_rule.take() {
+                    for sib in &mut static_rule_siblings {
+                        sib.recipe = prev.recipe.clone();
+                    }
+                    for sib in static_rule_siblings.drain(..) {
+                        self.register_rule(sib);
+                    }
+                    self.register_rule(prev);
+                    parser.in_recipe = false;
+                }
+            }
             loop {
                 let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
                 if pending.is_empty() { break; }
@@ -2615,7 +2697,7 @@ impl MakeState {
         if now_printing_dir && !was_printing_dir && !self.entering_directory_printed {
             let progname = make_progname();
             let cwd = logical_cwd();
-            eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+            println!("{}: Entering directory '{}'", progname, cwd.display());
             self.entering_directory_printed = true;
         }
 
