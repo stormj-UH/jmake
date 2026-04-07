@@ -325,8 +325,11 @@ pub fn parse_args() -> MakeArgs {
                         let rest: String = chars[j+1..].iter().collect();
                         if !rest.is_empty() {
                             if rest == "-" {
+                                // -I- resets the include search path.  Keep "-" as a
+                                // sentinel in include_dirs so build_makeflags can emit
+                                // it and .INCLUDE_DIRS computation can detect the reset.
                                 result.clear_include_dirs = true;
-                                result.include_dirs.clear();
+                                result.include_dirs.push(PathBuf::from("-"));
                             } else {
                                 result.include_dirs.push(PathBuf::from(rest));
                             }
@@ -335,7 +338,7 @@ pub fn parse_args() -> MakeArgs {
                             if i < args.len() {
                                 if args[i] == "-" {
                                     result.clear_include_dirs = true;
-                                    result.include_dirs.clear();
+                                    result.include_dirs.push(PathBuf::from("-"));
                                 } else {
                                     result.include_dirs.push(PathBuf::from(&args[i]));
                                 }

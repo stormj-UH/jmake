@@ -442,9 +442,20 @@ fn fn_flavor(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 /// stdout is processed per GNU Make rules: internal newlines replaced with spaces,
 /// trailing whitespace stripped.
 pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
+    // GNU Make increments MAKELEVEL for all child processes, including $(shell).
+    // Read the current level from the process environment and pass level+1 to
+    // the child so that recursive make invocations inside $(shell ...) display
+    // the correct "make[N]" label.
+    let child_makelevel = std::env::var("MAKELEVEL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|l| (l + 1).to_string())
+        .unwrap_or_else(|| "1".to_string());
+
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
+        .env("MAKELEVEL", &child_makelevel)
         .output();
 
     match output {

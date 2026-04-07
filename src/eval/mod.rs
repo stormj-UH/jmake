@@ -211,6 +211,17 @@ impl MakeState {
             }
         }
 
+        // --debug=b (basic debug) output: announce that makefiles have been read
+        // and we are about to update/build targets.  GNU Make prints this just before
+        // it attempts to re-read any out-of-date makefiles.  We print it here so that
+        // the string "Updating makefiles" appears in the output whenever --debug=b is
+        // active (from any source: cmdline, env, or makefile assignment).
+        let debug_basic = self.args.debug_short
+            || self.args.debug.iter().any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
+        if debug_basic {
+            println!("Updating makefiles....");
+        }
+
         // Build targets
         let mut executor = exec::Executor::new(
             &self.db,

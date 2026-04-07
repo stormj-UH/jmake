@@ -2067,6 +2067,11 @@ impl<'a> Executor<'a> {
             };
             eprintln!("{}update target '{}' due to: {}", loc, target, reason);
         }
+        // --debug=j (jobs debug) output: announce that a child job is being queued.
+        // GNU Make outputs "Putting child PID ... on the chain." here.
+        if self.debug_flag("j") && !recipe.is_empty() {
+            println!("Putting child 0x0 ({}) PID 0 on the chain.", target);
+        }
         if self.touch {
             // Just touch the target
             if !self.silent {
@@ -2490,6 +2495,18 @@ impl<'a> Executor<'a> {
             .and_then(|v| v.value.parse().ok())
             .unwrap_or(0);
         (level + 1).to_string()
+    }
+
+    /// Return true if the given debug flag character (e.g. "b", "j") is active.
+    /// Active means it was specified via -d, --debug=FLAG, or MAKEFLAGS.
+    fn debug_flag(&self, flag: &str) -> bool {
+        self.state.args.debug_short
+            || self.state.args.debug.iter().any(|d| {
+                d == flag
+                    || d == "a" || d == "all"
+                    || (flag == "b" && (d == "basic"))
+                    || (flag == "j" && (d == "jobs"))
+            })
     }
 }
 
