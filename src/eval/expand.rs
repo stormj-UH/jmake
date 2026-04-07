@@ -316,14 +316,16 @@ impl MakeState {
                 } else {
                     let expanded = self.expand_with_auto_vars(args_str, auto_vars);
                     // Push to eval_pending (processed after expansion via RefCell).
-                    // Note: if we're inside a $(call), auto_vars contains $1, $2, etc.
+                    // If we're inside a $(call), auto_vars contains $1, $2, etc.
                     // After the first expansion pass, `$$1` → `$1` (literal dollar-one).
                     // GNU Make resolves `$1` in the eval content using the call context.
-                    // We replicate this by doing a second expansion of the eval content
-                    // with the same auto_vars, which resolves any remaining `$N` references
-                    // that were produced by `$$N` in the original body.
-                    let has_call_params = auto_vars.keys().any(|k| k.parse::<u32>().is_ok());
-                    let final_content = if has_call_params && expanded.contains('$') {
+                    // Similarly, if we're inside a $(foreach x,...), auto_vars contains
+                    // `x` → current value, and any $(x) in the eval content (from
+                    // $(value VAR) which returns unexpanded text) must be resolved with
+                    // the foreach-iteration value, not the post-foreach global value.
+                    // We do a second expansion pass whenever auto_vars is non-empty and
+                    // the expanded content still has `$` references.
+                    let final_content = if !auto_vars.is_empty() && expanded.contains('$') {
                         self.expand_with_auto_vars(&expanded, auto_vars)
                     } else {
                         expanded

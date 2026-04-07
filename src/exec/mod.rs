@@ -91,6 +91,11 @@ pub struct Executor<'a> {
     /// Maps -lname prerequisites to their resolved library paths (e.g., -l1 → a1/lib1.a).
     /// Used to substitute the resolved path in $^ and $< auto-variable expansion.
     lib_search_results: HashMap<String, String>,
+    /// Extra "explicitly mentioned" targets discovered during SE expansion at build time.
+    /// SE-expanded prerequisites that are NOT derived from the stem (i.e., the SE text
+    /// had no '%' to substitute) are treated as explicitly mentioned (not intermediate).
+    /// We can't write to db.explicitly_mentioned (immutable ref), so we track them here.
+    se_explicitly_mentioned: HashSet<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -163,7 +168,14 @@ impl<'a> Executor<'a> {
             pending_plan_order_only: Vec::new(),
             skip_extra_prereqs: false,
             lib_search_results: HashMap::new(),
+            se_explicitly_mentioned: HashSet::new(),
         }
+    }
+
+    /// Check if a target/file is "explicitly mentioned" — either in the static database
+    /// or in SE-expanded prerequisites discovered at build time.
+    fn is_explicitly_mentioned(&self, name: &str) -> bool {
+        self.db.is_explicitly_mentioned(name) || self.se_explicitly_mentioned.contains(name)
     }
 
     pub fn build_targets(&mut self, targets: &[String]) -> Result<(), String> {
@@ -1397,6 +1409,14 @@ impl<'a> Executor<'a> {
                 if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
                     if let Some((cached_normal, cached_oo)) = pre_pat_se_expansion.take() {
                         // Use cached expansion from Step 0.5 - already built, just add to lists.
+                        // Also mark non-stem-derived prereqs as explicitly mentioned.
+                        if let Some(ref text) = pattern_rule.second_expansion_prereqs {
+                            if !se_text_has_percent(text) {
+                                for p in &cached_normal {
+                                    self.se_explicitly_mentioned.insert(p.clone());
+                                }
+                            }
+                        }
                         pat_prereqs.extend(cached_normal);
                         pat_order_only.extend(cached_oo);
                     } else {
@@ -1413,12 +1433,23 @@ impl<'a> Executor<'a> {
                         if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                             let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
                             let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            // Mark non-stem-derived SE prereqs as explicitly mentioned.
+                            if !se_text_has_percent(text) {
+                                for p in &normal {
+                                    self.se_explicitly_mentioned.insert(p.clone());
+                                }
+                            }
                             pat_prereqs.extend(normal);
                             pat_order_only.extend(oo);
                         }
                         if let Some(ref text) = pattern_rule.second_expansion_order_only {
                             let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
                             let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            if !se_text_has_percent(text) {
+                                for p in &normal {
+                                    self.se_explicitly_mentioned.insert(p.clone());
+                                }
+                            }
                             pat_order_only.extend(normal);
                             pat_order_only.extend(oo);
                         }
@@ -1437,18 +1468,18 @@ impl<'a> Executor<'a> {
                 let pat_prereqs_build_order: Vec<String> = {
                     let standalone: Vec<String> = pat_prereqs.iter()
                         .filter(|p| {
-                            self.db.is_explicitly_mentioned(p)
+                            self.is_explicitly_mentioned(p)
                                 && !self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
                         })
                         .cloned()
                         .collect();
                     let intermediates_list: Vec<String> = pat_prereqs.iter()
-                        .filter(|p| !self.db.is_explicitly_mentioned(p))
+                        .filter(|p| !self.is_explicitly_mentioned(p))
                         .cloned()
                         .collect();
                     let shared_explicit: Vec<String> = pat_prereqs.iter()
                         .filter(|p| {
-                            self.db.is_explicitly_mentioned(p)
+                            self.is_explicitly_mentioned(p)
                                 && self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
                         })
                         .cloned()
@@ -2405,12 +2436,27 @@ impl<'a> Executor<'a> {
                 // using dir-aware substitution.
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                // Mark SE prereqs as explicitly mentioned if their source text had no '%'
+                // (meaning they're not derived from the stem, so they're "explicitly mentioned"
+                // files that should not be treated as intermediate).
+                // This matches GNU Make's behavior: files that expand to fixed values
+                // regardless of the stem are explicitly mentioned.
+                if !se_text_has_percent(text) {
+                    for p in &normal {
+                        self.se_explicitly_mentioned.insert(p.clone());
+                    }
+                }
                 prereqs.extend(normal);
                 order_only.extend(oo);
             }
             if let Some(ref text) = rule.second_expansion_order_only {
                 let stem_subst = subst_stem_in_se_text_dir(text, stem, matched_pattern_target);
                 let (normal, oo) = self.second_expand_prereqs(&stem_subst, &base_auto_vars, target);
+                if !se_text_has_percent(text) {
+                    for p in &normal {
+                        self.se_explicitly_mentioned.insert(p.clone());
+                    }
+                }
                 order_only.extend(normal);
                 order_only.extend(oo);
             }
@@ -2461,7 +2507,7 @@ impl<'a> Executor<'a> {
                             return false; // secondary missing file: skip
                         }
                         // Explicitly-mentioned (non-intermediate) non-existent files MUST be built.
-                        if self.db.is_explicitly_mentioned(p) || self.db.is_notintermediate(p) {
+                        if self.is_explicitly_mentioned(p) || self.db.is_notintermediate(p) {
                             return true;
                         }
                         // Intermediate file: use effective mtime of its sources.
@@ -2514,18 +2560,18 @@ impl<'a> Executor<'a> {
             //     intermediate and can be skipped.
             let standalone: Vec<String> = prereqs.iter()
                 .filter(|p| {
-                    self.db.is_explicitly_mentioned(p)
+                    self.is_explicitly_mentioned(p)
                         && !self.prereq_shares_rule_with_intermediate(p, &prereqs)
                 })
                 .cloned()
                 .collect();
             let intermediates: Vec<String> = prereqs.iter()
-                .filter(|p| !self.db.is_explicitly_mentioned(p))
+                .filter(|p| !self.is_explicitly_mentioned(p))
                 .cloned()
                 .collect();
             let shared_explicit: Vec<String> = prereqs.iter()
                 .filter(|p| {
-                    self.db.is_explicitly_mentioned(p)
+                    self.is_explicitly_mentioned(p)
                         && self.prereq_shares_rule_with_intermediate(p, &prereqs)
                 })
                 .cloned()
@@ -2756,7 +2802,7 @@ impl<'a> Executor<'a> {
                     && !self.db.is_secondary(sib)
                 {
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
-                        || self.db.is_explicitly_mentioned(sib);
+                        || self.is_explicitly_mentioned(sib);
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
                             self.intermediate_built.push(sib.clone());
@@ -2778,7 +2824,7 @@ impl<'a> Executor<'a> {
                 // Only mark as intermediate if the target is NOT explicitly mentioned
                 // in the makefile and NOT a top-level target.
                 let is_explicit = self.top_level_targets.contains(target)
-                    || self.db.is_explicitly_mentioned(target);
+                    || self.is_explicitly_mentioned(target);
                 if !is_explicit {
                     if !self.intermediate_built.contains(&target.to_string()) {
                         self.intermediate_built.push(target.to_string());
@@ -2997,16 +3043,21 @@ impl<'a> Executor<'a> {
     /// Check if `target` can be built by any pattern rule (recursive/intermediate context).
     /// Non-terminal match-anything rules (%) are skipped: they cannot create intermediates.
     fn find_pattern_rule_exists(&self, target: &str) -> bool {
-        self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new())
+        self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new(), 0)
     }
 
-    fn find_pattern_rule_exists_inner(&self, target: &str, visited: &mut HashSet<String>) -> bool {
+    fn find_pattern_rule_exists_inner(&self, target: &str, visited: &mut HashSet<String>, depth: usize) -> bool {
         // If this target is currently being built, treat it as available (cycle case).
         if self.building.contains(target) {
             return true;
         }
         // Prevent infinite recursion from circular dependencies.
         if visited.contains(target) {
+            return false;
+        }
+        // Limit recursion depth to prevent infinite expansion when pattern rules
+        // create unboundedly long target names (e.g. p%: p%1 → pre1 → pre11 → pre111 ...).
+        if depth > 32 {
             return false;
         }
         visited.insert(target.to_string());
@@ -3067,7 +3118,7 @@ impl<'a> Executor<'a> {
             for other in all_prereqs {
                 if other == explicit_prereq { continue; }
                 // Only consider non-explicitly-mentioned prereqs (intermediates)
-                if self.db.is_explicitly_mentioned(other) { continue; }
+                if self.is_explicitly_mentioned(other) { continue; }
                 // Check if `other` matches any target pattern in the SAME rule with the SAME stem
                 for pat in &rule.targets {
                     if match_pattern(pat, other).as_deref() == Some(stem.as_str()) {
@@ -3729,7 +3780,7 @@ impl<'a> Executor<'a> {
                         // If the prereq is explicitly mentioned (not intermediate), a
                         // missing file is treated as infinitely new: always rebuild.
                         // Intermediate files that are absent use effective_mtime instead.
-                        if self.db.is_explicitly_mentioned(prereq) {
+                        if self.is_explicitly_mentioned(prereq) {
                             return true;
                         }
                         // For non-existent non-phony prereqs (potentially intermediate files
@@ -4784,6 +4835,13 @@ fn replace_first_percent(word: &str, stem: &str) -> String {
     } else {
         word.to_string()
     }
+}
+
+/// Returns true if the SE text (before stem substitution) contains any `%` character
+/// that would be replaced by stem substitution.  Used to determine if SE-expanded
+/// prerequisites are "stem-derived" (intermediate) or not (explicitly mentioned).
+fn se_text_has_percent(text: &str) -> bool {
+    text.contains('%')
 }
 
 /// Apply `%` → stem substitution to a prerequisite string, word by word.
