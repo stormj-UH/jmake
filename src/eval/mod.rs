@@ -104,6 +104,11 @@ pub struct MakeState {
     /// the top of this stack is checked. This allows $(eval) inside $(call) to
     /// correctly expand `$1` to the call argument.
     pub call_context_stack: RefCell<Vec<HashMap<String, String>>>,
+    /// Stack of (file, line) pairs saved before each recursive-variable context override
+    /// in expand_var_value.  The $(error) and $(warning) functions use the outermost
+    /// (deepest stack) entry so that "Error found!" in a lazy var reports the recipe
+    /// line where the variable was referenced, not the variable's definition line.
+    pub expansion_caller_stack: RefCell<Vec<(String, usize)>>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -244,6 +249,7 @@ impl MakeState {
             stdin_temp_path: None,
             include_imagined: HashSet::new(),
             call_context_stack: RefCell::new(Vec::new()),
+            expansion_caller_stack: RefCell::new(Vec::new()),
         };
 
         // Change directory if requested
@@ -1287,18 +1293,32 @@ impl MakeState {
                     && parser::try_parse_variable_assignment(trimmed_raw).is_none()
                     && parser::find_rule_colon_pub(trimmed_raw).is_some()
             };
+            if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
+                eprintln!("DEBUG parse: raw={:?} expanded={:?} raw_has_rule_colon={}", line.trim(), expanded, raw_has_rule_colon_no_assignment);
+            }
             let parsed = if raw_has_rule_colon_no_assignment {
                 // Try rule parse with TSV detection DISABLED.  The original line
                 // had no literal `=`, so any `=` in `expanded` came from variable
                 // expansion (e.g. `ten: one $(EQ) two` → `ten: one = two`).
                 // We must not treat the expanded `=` as a target-specific variable.
                 if let Some(rule_result) = parser::try_parse_rule_force(&expanded) {
+                    if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
+                        eprintln!("DEBUG parse: -> try_parse_rule_force returned rule {:?}", rule_result);
+                    }
                     rule_result
                 } else {
-                    parser.parse_line(&expanded, self)
+                    let r = parser.parse_line(&expanded, self);
+                    if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
+                        eprintln!("DEBUG parse: -> parse_line returned {:?}", r);
+                    }
+                    r
                 }
             } else {
-                parser.parse_line(&expanded, self)
+                let r = parser.parse_line(&expanded, self);
+                if std::env::var("JMAKE_DEBUG_PARSE").is_ok() {
+                    eprintln!("DEBUG parse: -> parse_line (no rule colon) returned {:?}", r);
+                }
+                r
             };
 
             // Handle conditionals
@@ -2044,9 +2064,13 @@ impl MakeState {
                         i += 1;
                     }
                 }
-                // A cancellation-only rule (no recipe AND no prereqs) is done.
-                // A rule with no recipe BUT with prereqs is added as-is (provides prereqs).
-                if rule.prerequisites.is_empty() && rule.order_only_prerequisites.is_empty() {
+                // A cancellation-only rule (no recipe AND no prereqs, including SE prereqs) is done.
+                // A rule with no recipe BUT with prereqs (including SE prereqs) is added as-is.
+                if rule.prerequisites.is_empty()
+                    && rule.order_only_prerequisites.is_empty()
+                    && rule.second_expansion_prereqs.is_none()
+                    && rule.second_expansion_order_only.is_none()
+                {
                     return;
                 }
             }
@@ -3277,145 +3301,294 @@ impl MakeState {
             }
         }
 
-        // Second, handle pending includes (files that were missing when first read)
-        let pending = std::mem::take(&mut self.pending_includes);
-        for pi in pending {
-            let file_path = Path::new(&pi.file);
+        // Second, handle pending includes (files that were missing when first read).
+        //
+        // Three-phase approach to support parallel recipe execution:
+        //   Phase A (sequential): build prerequisites, expand recipes, collect work items.
+        //   Phase B (parallel):   run recipes in parallel threads when jobs > 1.
+        //   Phase C (sequential): process results, read rebuilt makefiles.
+        //
+        // This is needed for tests like parallelism diff.3/diff.4 where two included
+        // files use thelp synchronisation to verify they are built concurrently.
 
-            // If the file now exists, just read it
+        // Outcome of Phase A for a single pending include.
+        enum PendingOutcome {
+            AlreadyExists,
+            Error(String),    // empty string = silent error (just return Err(""))
+            Imagined,
+            SiblingAlreadyRan,
+            PrereqsOnlyNoRecipe,
+            RunRecipe {
+                expanded: Vec<(usize, String, bool, bool)>,
+                source_file: String,
+            },
+        }
+
+        struct PendingWork {
+            pi_file: String,
+            pi_ignore_missing: bool,
+            pi_parent: String,
+            pi_lineno: usize,
+            outcome: PendingOutcome,
+        }
+
+        let pending = std::mem::take(&mut self.pending_includes);
+        let parallel_jobs = self.args.jobs;
+
+        // ── Phase A ─────────────────────────────────────────────────────────────
+        let mut work_items: Vec<PendingWork> = Vec::new();
+
+        for pi in pending {
+            let file_path_buf = std::path::PathBuf::from(&pi.file);
+            let file_path = file_path_buf.as_path();
+
             if file_path.exists() {
-                if let Err(e) = self.read_makefile(file_path) {
-                    if !pi.ignore_missing {
-                        return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
-                    }
-                }
-                any_really_rebuilt = true;
+                work_items.push(PendingWork {
+                    pi_file: pi.file,
+                    pi_ignore_missing: pi.ignore_missing,
+                    pi_parent: pi.parent,
+                    pi_lineno: pi.lineno,
+                    outcome: PendingOutcome::AlreadyExists,
+                });
                 continue;
             }
 
-            // Check for phony - phony targets can't be used for include rebuilding
             let is_phony = self.db.special_targets
                 .get(&SpecialTarget::Phony)
                 .map_or(false, |set| set.contains(&pi.file));
             if is_phony {
-                if !pi.ignore_missing {
-                    if !pi.parent.is_empty() {
-                        eprintln!("{}:{}: {}: No such file or directory",
-                            pi.parent, pi.lineno, pi.file);
-                    }
-                    return Err(String::new());
+                if !pi.ignore_missing && !pi.parent.is_empty() {
+                    eprintln!("{}:{}: {}: No such file or directory",
+                        pi.parent, pi.lineno, pi.file);
                 }
+                work_items.push(PendingWork {
+                    pi_file: pi.file,
+                    pi_ignore_missing: pi.ignore_missing,
+                    pi_parent: pi.parent,
+                    pi_lineno: pi.lineno,
+                    outcome: if pi.ignore_missing {
+                        PendingOutcome::Imagined
+                    } else {
+                        PendingOutcome::Error(String::new())
+                    },
+                });
                 continue;
             }
 
-            // Find rule to build this file
             let rule_info = self.find_include_rule(&pi.file);
-            match rule_info {
+            let outcome = match rule_info {
                 None => {
-                    if !pi.ignore_missing {
-                        if !pi.parent.is_empty() {
-                            eprintln!("{}:{}: {}: No such file or directory",
-                                pi.parent, pi.lineno, pi.file);
-                        }
-                        return Err(format!("No rule to make target '{}'.  Stop.", pi.file));
+                    if !pi.ignore_missing && !pi.parent.is_empty() {
+                        eprintln!("{}:{}: {}: No such file or directory",
+                            pi.parent, pi.lineno, pi.file);
+                    }
+                    if pi.ignore_missing {
+                        PendingOutcome::Imagined
+                    } else {
+                        PendingOutcome::Error(
+                            format!("No rule to make target '{}'.  Stop.", pi.file)
+                        )
                     }
                 }
                 Some(IncludeRuleInfo { skippable: true, .. }) => {
-                    if !pi.ignore_missing {
-                        if !pi.parent.is_empty() {
-                            eprintln!("{}:{}: {}: No such file or directory",
-                                pi.parent, pi.lineno, pi.file);
-                        }
-                        return Err(String::new());
+                    if !pi.ignore_missing && !pi.parent.is_empty() {
+                        eprintln!("{}:{}: {}: No such file or directory",
+                            pi.parent, pi.lineno, pi.file);
+                    }
+                    if pi.ignore_missing {
+                        PendingOutcome::Imagined
+                    } else {
+                        PendingOutcome::Error(String::new())
                     }
                 }
                 Some(IncludeRuleInfo { imagined: true, .. }) => {
-                    // sv 61226: rule with no recipe and no prereqs → "imagined update"
-                    // Treat as if file was updated but don't actually create it,
-                    // don't re-exec, and don't error. Just silently continue.
-                    // Mark as imagined so the main build phase doesn't try to build it.
-                    self.include_imagined.insert(pi.file.clone());
+                    PendingOutcome::Imagined
                 }
                 Some(IncludeRuleInfo { recipe, source_file, prerequisites, sibling_targets, stem, .. }) => {
                     if self.include_recipe_ran.contains(&pi.file) {
-                        // Recipe already ran (sibling pattern target)
-                        if !pi.ignore_missing {
-                            if !pi.parent.is_empty() {
-                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                    pi.parent, pi.lineno, pi.file);
-                            }
-                            return Err(String::new());
+                        if !pi.ignore_missing && !pi.parent.is_empty() {
+                            eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                pi.parent, pi.lineno, pi.file);
                         }
-                        continue;
-                    }
-
-                    // Build prerequisites first
-                    let mut visited = HashSet::new();
-                    visited.insert(pi.file.clone());
-                    let prereq_result = self.build_include_prerequisites(
-                        &prerequisites, &pi.file, &shell, &shell_flags, silent,
-                        pi.ignore_missing, &mut visited,
-                    );
-
-                    match prereq_result {
-                        Err(prereq_err) => {
-                            if !pi.ignore_missing {
-                                if !pi.parent.is_empty() {
+                        if pi.ignore_missing {
+                            PendingOutcome::SiblingAlreadyRan
+                        } else {
+                            PendingOutcome::Error(String::new())
+                        }
+                    } else {
+                        // Build prerequisites (sequential — requires &mut self)
+                        let mut visited = HashSet::new();
+                        visited.insert(pi.file.clone());
+                        let prereq_result = self.build_include_prerequisites(
+                            &prerequisites, &pi.file, &shell, &shell_flags, silent,
+                            pi.ignore_missing, &mut visited,
+                        );
+                        match prereq_result {
+                            Err(prereq_err) => {
+                                if !pi.ignore_missing && !pi.parent.is_empty() {
                                     eprintln!("{}:{}: {}: No such file or directory",
                                         pi.parent, pi.lineno, pi.file);
                                 }
-                                return Err(prereq_err);
+                                if pi.ignore_missing {
+                                    PendingOutcome::Imagined
+                                } else {
+                                    PendingOutcome::Error(prereq_err)
+                                }
+                            }
+                            Ok(()) => {
+                                if recipe.is_empty() {
+                                    PendingOutcome::PrereqsOnlyNoRecipe
+                                } else {
+                                    // Mark siblings now so sibling check above works
+                                    self.include_recipe_ran.insert(pi.file.clone());
+                                    for sib in &sibling_targets {
+                                        self.include_recipe_ran.insert(sib.clone());
+                                    }
+                                    let expanded = self.expand_include_recipe_lines(
+                                        &pi.file, &stem, &recipe
+                                    );
+                                    PendingOutcome::RunRecipe {
+                                        expanded,
+                                        source_file: source_file.clone(),
+                                    }
+                                }
                             }
                         }
+                    }
+                }
+            };
+
+            work_items.push(PendingWork {
+                pi_file: pi.file,
+                pi_ignore_missing: pi.ignore_missing,
+                pi_parent: pi.parent,
+                pi_lineno: pi.lineno,
+                outcome,
+            });
+        }
+
+        // ── Phase B ─────────────────────────────────────────────────────────────
+        // Run recipes. When jobs > 1 and multiple items need recipes, run them in
+        // parallel threads; otherwise run sequentially.
+
+        let mut recipe_results: Vec<Option<Result<(), String>>> =
+            vec![None; work_items.len()];
+
+        let recipe_indices: Vec<usize> = work_items.iter().enumerate()
+            .filter_map(|(i, w)| {
+                if matches!(w.outcome, PendingOutcome::RunRecipe { .. }) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if parallel_jobs > 1 && recipe_indices.len() > 1 {
+            // Parallel execution via scoped threads (no lifetime issues)
+            struct ThreadWork {
+                idx: usize,
+                expanded: Vec<(usize, String, bool, bool)>,
+                target: String,
+                source_file: String,
+            }
+            let thread_work: Vec<ThreadWork> = recipe_indices.iter().map(|&i| {
+                if let PendingOutcome::RunRecipe { ref expanded, ref source_file } = work_items[i].outcome {
+                    ThreadWork {
+                        idx: i,
+                        expanded: expanded.clone(),
+                        target: work_items[i].pi_file.clone(),
+                        source_file: source_file.clone(),
+                    }
+                } else {
+                    unreachable!()
+                }
+            }).collect();
+
+            let results: Vec<(usize, Result<(), String>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = thread_work.into_iter().map(|tw| {
+                        let sh = shell.as_str();
+                        let shf = shell_flags.as_str();
+                        s.spawn(move || {
+                            let r = execute_include_recipe_expanded(
+                                &tw.expanded, &tw.target, sh, shf, silent, &tw.source_file,
+                            );
+                            (tw.idx, r)
+                        })
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            for (idx, result) in results {
+                recipe_results[idx] = Some(result);
+            }
+        } else {
+            // Sequential execution
+            for &i in &recipe_indices {
+                if let PendingOutcome::RunRecipe { ref expanded, ref source_file } = work_items[i].outcome {
+                    let target = work_items[i].pi_file.clone();
+                    let r = execute_include_recipe_expanded(
+                        expanded, &target, &shell, &shell_flags, silent, source_file,
+                    );
+                    recipe_results[i] = Some(r);
+                }
+            }
+        }
+
+        // ── Phase C ─────────────────────────────────────────────────────────────
+        // Process all outcomes sequentially.
+
+        for (i, work) in work_items.into_iter().enumerate() {
+            let file_path = std::path::PathBuf::from(&work.pi_file);
+            match work.outcome {
+                PendingOutcome::AlreadyExists => {
+                    if let Err(e) = self.read_makefile(file_path.as_path()) {
+                        if !work.pi_ignore_missing {
+                            return Err(format!("{}:{}: {}", work.pi_parent, work.pi_lineno, e));
+                        }
+                    }
+                    any_really_rebuilt = true;
+                }
+                PendingOutcome::Error(msg) => {
+                    if !work.pi_ignore_missing {
+                        return Err(msg);
+                    }
+                }
+                PendingOutcome::Imagined => {
+                    self.include_imagined.insert(work.pi_file.clone());
+                }
+                PendingOutcome::SiblingAlreadyRan => {
+                    // Already handled / printed in Phase A; nothing more needed.
+                }
+                PendingOutcome::PrereqsOnlyNoRecipe => {
+                    if !file_path.exists() {
+                        self.include_imagined.insert(work.pi_file.clone());
+                    }
+                }
+                PendingOutcome::RunRecipe { .. } => {
+                    let result = recipe_results[i].take().unwrap();
+                    match result {
                         Ok(()) => {
-                            if recipe.is_empty() {
-                                // Has prerequisites but no recipe: just check if file exists
-                                // (sv 61226: "imagined" if prereqs exist but file doesn't)
-                                // Don't error, don't re-exec - treat as imagined update
-                                // Mark as imagined so main build phase doesn't try to rebuild.
-                                if !file_path.exists() {
-                                    self.include_imagined.insert(pi.file.clone());
+                            if file_path.exists() {
+                                if let Err(e) = self.read_makefile(file_path.as_path()) {
+                                    if !work.pi_ignore_missing {
+                                        return Err(format!("{}:{}: {}", work.pi_parent, work.pi_lineno, e));
+                                    }
                                 }
+                                any_really_rebuilt = true;
                             } else {
-                                // Mark siblings as ran
-                                self.include_recipe_ran.insert(pi.file.clone());
-                                for sib in &sibling_targets {
-                                    self.include_recipe_ran.insert(sib.clone());
+                                // sv 61226: recipe ran but file not created → imagined
+                                self.include_imagined.insert(work.pi_file.clone());
+                            }
+                        }
+                        Err(recipe_err) => {
+                            if !work.pi_ignore_missing {
+                                if !work.pi_parent.is_empty() {
+                                    eprintln!("{}:{}: {}: No such file or directory",
+                                        work.pi_parent, work.pi_lineno, work.pi_file);
                                 }
-                                // Run the recipe
-                                let built = self.run_include_recipe(
-                                    &pi.file, &stem, &recipe, &shell, &shell_flags, silent, &source_file,
-                                );
-                                match built {
-                                    Ok(()) => {
-                                        if file_path.exists() {
-                                            if let Err(e) = self.read_makefile(file_path) {
-                                                if !pi.ignore_missing {
-                                                    return Err(format!("{}:{}: {}", pi.parent, pi.lineno, e));
-                                                }
-                                            }
-                                            any_really_rebuilt = true;
-                                        } else {
-                                            // sv 61226: recipe ran but file not created
-                                            // → "imagined update", no error, no re-exec
-                                            // Mark as imagined so the main build phase
-                                            // doesn't re-run the recipe.
-                                            self.include_imagined.insert(pi.file.clone());
-                                        }
-                                    }
-                                    Err(recipe_err) => {
-                                        if !pi.ignore_missing {
-                                            if !pi.parent.is_empty() {
-                                                // When the recipe fails and the file still doesn't
-                                                // exist, GNU Make reports "No such file or directory"
-                                                // (not "Failed to remake makefile").
-                                                eprintln!("{}:{}: {}: No such file or directory",
-                                                    pi.parent, pi.lineno, pi.file);
-                                            }
-                                            return Err(recipe_err);
-                                        }
-                                    }
-                                }
+                                return Err(recipe_err);
                             }
                         }
                     }

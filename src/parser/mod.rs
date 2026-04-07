@@ -261,6 +261,8 @@ impl Parser {
         // undefine directive (must be checked before define)
         // BUT: `undefine:` or `undefine : recipe` is a RULE target named "undefine",
         // not the undefine directive. Check that this is not a rule.
+        // Also: `undefine = value` is a variable assignment where `undefine` is the
+        // variable name, NOT the undefine directive.
         if effective.starts_with("undefine ") || effective.starts_with("override undefine ") {
             let is_override = effective.starts_with("override ");
             let rest = if is_override {
@@ -271,7 +273,16 @@ impl Parser {
             let name = rest.strip_prefix("undefine").unwrap().trim().to_string();
             // If the name starts with `:` (including `::` for double-colon rules),
             // this is actually a rule like `undefine: ;recipe`, not a directive.
-            if !name.starts_with(':') {
+            // If the name starts with an assignment operator (`=`, `:=`, `+=`, etc.),
+            // this is a variable assignment like `undefine = value`, not a directive.
+            let starts_with_assign_op = name.starts_with('=')
+                || name.starts_with(":=")
+                || name.starts_with("::=")
+                || name.starts_with(":::=")
+                || name.starts_with("+=")
+                || name.starts_with("?=")
+                || name.starts_with("!=");
+            if !name.starts_with(':') && !starts_with_assign_op {
                 return ParsedLine::Undefine { name, is_override };
             }
             // Fall through to rule/assignment parsing
@@ -403,6 +414,7 @@ fn find_inline_recipe_semi_pos(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut depth = 0i32;
     let mut found_colon = false;
+    let mut in_assignment = false;  // true once we've seen an assignment op after the colon
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
@@ -414,7 +426,7 @@ fn find_inline_recipe_semi_pos(line: &str) -> Option<usize> {
             }
             b'(' | b'{' if depth > 0 => depth += 1,
             b')' | b'}' if depth > 0 => depth -= 1,
-            b':' if depth == 0 => {
+            b':' if depth == 0 && !in_assignment => {
                 // Skip \: (escaped colon)
                 if i > 0 && bytes[i - 1] == b'\\' {
                     i += 1;
@@ -429,7 +441,18 @@ fn find_inline_recipe_semi_pos(line: &str) -> Option<usize> {
                 }
                 found_colon = true;
             }
-            b';' if depth == 0 && found_colon => return Some(i),
+            b'=' if depth == 0 && found_colon && !in_assignment => {
+                // We've seen an assignment operator after the rule colon.
+                // This means the `;` is part of the value, not an inline recipe.
+                in_assignment = true;
+            }
+            b'+' | b'?' | b'!' if depth == 0 && found_colon && !in_assignment => {
+                // Check for +=, ?=, !=
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    in_assignment = true;
+                }
+            }
+            b';' if depth == 0 && found_colon && !in_assignment => return Some(i),
             _ => {}
         }
         i += 1;

@@ -1211,6 +1211,53 @@ impl<'a> Executor<'a> {
             self.skip_extra_prereqs = prev_skip;
         }
 
+        // Step 0.5: if there is no recipe from explicit rules, peek at the matching
+        // pattern rule to get its (non-SE) prereqs and build them BEFORE explicit
+        // prereqs.  GNU Make always builds pattern-rule prereqs first, then explicit
+        // prereqs, regardless of rule declaration order.
+        // We only do this pre-build step; the full pattern-rule logic (SE expansion,
+        // recipe selection, all_prereqs reordering) happens later at the pattern rule block.
+        let pre_pat_prereqs: Vec<String> = if recipe.is_empty() {
+            if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
+                let matched_pt: String = pat_rule.targets.iter()
+                    .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| "%".to_string());
+                pat_rule.prerequisites.iter()
+                    .filter(|p| p.as_str() != ".WAIT")
+                    .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        // Build pattern-rule prereqs first (before explicit prereqs).
+        let mut pre_pat_built: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for prereq in &pre_pat_prereqs {
+            if !pre_pat_built.contains(prereq) {
+                match self.build_target(prereq) {
+                    Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
+                    Err(e) => {
+                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let propagated = if is_new {
+                            let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
+                            format!("{}, needed by '{}'.  Stop.", base, target)
+                        } else { e };
+                        if self.keep_going {
+                            if is_new { self.print_error_keep_going(&propagated); }
+                            prereq_errors.push(propagated);
+                        } else {
+                            self.inherited_vars_stack.pop();
+                            return Err(propagated);
+                        }
+                    }
+                }
+                pre_pat_built.insert(prereq.clone());
+            }
+        }
+
         // Step 1: build non-SE normal prereqs
         for prereq in all_prereqs.clone() {
             match self.build_target(&prereq) {
@@ -1337,6 +1384,30 @@ impl<'a> Executor<'a> {
                 // Build each unique pattern-rule prereq once, but add ALL occurrences
                 // (including duplicates) to all_prereqs so that $+ is computed correctly.
                 // The pattern rule's prereqs are prepended so they come first in $^/$+.
+
+                // Apply GNU Make prereq ordering: standalone-explicit prereqs first,
+                // then intermediates / explicit prereqs sharing a rule with an intermediate.
+                // Must compute before the mutable borrow loop below.
+                let pat_prereqs_build_order: Vec<String> = {
+                    let standalone: Vec<String> = pat_prereqs.iter()
+                        .filter(|p| {
+                            self.db.is_explicitly_mentioned(p)
+                                && !self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
+                        })
+                        .cloned()
+                        .collect();
+                    let rest: Vec<String> = pat_prereqs.iter()
+                        .filter(|p| {
+                            !(self.db.is_explicitly_mentioned(p)
+                                && !self.prereq_shares_rule_with_intermediate(p, &pat_prereqs))
+                        })
+                        .cloned()
+                        .collect();
+                    let mut ordered = standalone;
+                    ordered.extend(rest);
+                    ordered
+                };
+
                 let mut already_built: std::collections::HashSet<String> = std::collections::HashSet::new();
                 // Also collect which prereqs were already in all_prereqs before pattern rule.
                 for p in &all_prereqs {
@@ -1345,7 +1416,8 @@ impl<'a> Executor<'a> {
                 // Prepend pattern rule prereqs: they come first (pattern rule is primary).
                 let orig_explicit_prereqs = all_prereqs.clone();
                 all_prereqs.clear();
-                for prereq in &pat_prereqs {
+                // Build prereqs in ordered sequence (standalone-explicit first).
+                for prereq in &pat_prereqs_build_order {
                     if !already_built.contains(prereq) {
                         match self.build_target(prereq) {
                             Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
@@ -1365,6 +1437,9 @@ impl<'a> Executor<'a> {
                         }
                         already_built.insert(prereq.clone());
                     }
+                }
+                // all_prereqs must remain in DECLARATION ORDER for $^/$+ auto vars.
+                for prereq in &pat_prereqs {
                     all_prereqs.push(prereq.clone());
                 }
                 // Append original explicit rule prereqs after pattern rule prereqs.
@@ -2364,6 +2439,34 @@ impl<'a> Executor<'a> {
         }
 
         // Build prerequisites
+        // GNU Make order: "standalone explicit" prereqs (explicitly mentioned but NOT
+        // sharing a pattern rule with any intermediate prereq) are built FIRST.
+        // Intermediate prereqs (and explicit ones that share a rule with intermediates,
+        // so they will be built as "also-make" siblings of the intermediate) come after.
+        //
+        // This must be computed before the mutable borrow below (inherited_vars_stack.push).
+        let prereqs_ordered: Vec<String> = {
+            // Partition: standalone-explicit vs rest, preserving relative order within each group.
+            let standalone: Vec<String> = prereqs.iter()
+                .filter(|p| {
+                    self.db.is_explicitly_mentioned(p)
+                        && !self.prereq_shares_rule_with_intermediate(p, &prereqs)
+                })
+                .cloned()
+                .collect();
+            let rest: Vec<String> = prereqs.iter()
+                .filter(|p| {
+                    !(self.db.is_explicitly_mentioned(p)
+                        && !self.prereq_shares_rule_with_intermediate(p, &prereqs))
+                })
+                .cloned()
+                .collect();
+            // standalone first, then rest (intermediates + shared-explicit in original order)
+            let mut ordered = standalone;
+            ordered.extend(rest);
+            ordered
+        };
+
         // Push target vars onto stack for inheritance by prerequisites.
         let my_target_vars = self.collect_target_vars(target);
         self.inherited_vars_stack.push(my_target_vars.1);
@@ -2409,7 +2512,7 @@ impl<'a> Executor<'a> {
             self.skip_extra_prereqs = prev_skip;
         }
 
-        for prereq in prereqs.clone() {
+        for prereq in prereqs_ordered {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
                     if rebuilt { any_rebuilt = true; }
@@ -2704,7 +2807,13 @@ impl<'a> Executor<'a> {
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
                             let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
-                            let ok = Path::new(&resolved).exists()
+                            // If the resolved prereq contains glob chars, check if any matching files exist.
+                            let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
+                                ::glob::glob(&resolved)
+                                    .ok()
+                                    .map_or(false, |mut it| it.next().is_some())
+                            } else {
+                                Path::new(&resolved).exists()
                                 || self.db.is_phony(&resolved)
                                 || self.db.rules.contains_key(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
@@ -2712,7 +2821,8 @@ impl<'a> Executor<'a> {
                                 // A prerequisite currently being built (cycle) counts as
                                 // available in pass 1; the cycle will be detected and dropped
                                 // gracefully when we actually try to build it.
-                                || self.building.contains(&resolved);
+                                || self.building.contains(&resolved)
+                            };
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
@@ -2728,9 +2838,9 @@ impl<'a> Executor<'a> {
                     if prereqs_ok {
                         pass1_candidates.push(((**rule).clone(), stem));
                         break; // Only take first matching pattern_target per rule
-                    } else if found_compat && compat_rule.is_none() && !rule.is_terminal {
-                        // Terminal rules require prereqs to already exist — do not use them
-                        // as compat candidates (compat is for implicit/non-existent deps).
+                    } else if found_compat && compat_rule.is_none() {
+                        // Use as compat (last-resort) candidate. Terminal rules can also
+                        // be compat candidates when their prereq is explicitly mentioned.
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
@@ -2764,13 +2874,20 @@ impl<'a> Executor<'a> {
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
                             let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
-                            let ok = Path::new(&resolved).exists()
+                            // If the resolved prereq contains glob chars, check if any matching files exist.
+                            let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
+                                ::glob::glob(&resolved)
+                                    .ok()
+                                    .map_or(false, |mut it| it.next().is_some())
+                            } else {
+                                Path::new(&resolved).exists()
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
                                 || self.find_pattern_rule_exists(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
-                                || self.building.contains(&resolved);
+                                || self.building.contains(&resolved)
+                            };
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
                                     && !self.db.rules.contains_key(&resolved)
@@ -2851,10 +2968,42 @@ impl<'a> Executor<'a> {
                                 || self.db.is_phony(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
                                 || self.building.contains(&resolved)
-                                || self.find_pattern_rule_exists_inner(&resolved, visited)
+                                // For terminal rules (%::), prerequisites cannot be
+                                // further built via chaining - only on-disk/explicit.
+                                // Allowing recursion here causes infinite expansion when
+                                // a terminal rule's prereq pattern resolves to a longer name
+                                // that re-matches the same terminal rule (e.g. %:: %.c → hello.c → hello.c.c → ...).
+                                || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited))
                         })
                     };
                     if prereqs_ok { return true; }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if `explicit_prereq` shares a pattern rule (same rule instance, same stem)
+    /// with any non-explicitly-mentioned prereq in `all_prereqs`.
+    ///
+    /// Used to decide prereq build order in `build_with_pattern_rule`: if an explicitly-
+    /// mentioned prereq shares a pattern rule with an intermediate (non-explicit) prereq,
+    /// then the intermediate should be built first (as the primary trigger of the shared
+    /// rule), and the explicit one will be built as an "also-make" sibling.
+    ///
+    /// If the explicit prereq does NOT share a rule with any intermediate, it is a
+    /// "standalone explicit" prereq and should be built before the intermediates.
+    fn prereq_shares_rule_with_intermediate(&self, explicit_prereq: &str, all_prereqs: &[String]) -> bool {
+        if let Some((rule, stem)) = self.find_pattern_rule(explicit_prereq) {
+            for other in all_prereqs {
+                if other == explicit_prereq { continue; }
+                // Only consider non-explicitly-mentioned prereqs (intermediates)
+                if self.db.is_explicitly_mentioned(other) { continue; }
+                // Check if `other` matches any target pattern in the SAME rule with the SAME stem
+                for pat in &rule.targets {
+                    if match_pattern(pat, other).as_deref() == Some(stem.as_str()) {
+                        return true;
+                    }
                 }
             }
         }
@@ -4488,6 +4637,13 @@ fn subst_stem_in_prereq(prereq: &str, stem: &str) -> String {
 /// so `%.1` and `%.2` are treated as separate words even though they are
 /// arguments to the same function.
 fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
+    // When substituting the stem into SE text, escape any '$' in the stem so
+    // that subsequent expansion doesn't interpret them as variable references
+    // (GNU Make "triple-expansion prevention": stems like "oo$ba" must survive
+    // second expansion as literal "oo$ba", not become "oo" + expand("$ba")).
+    let escaped_stem: String = stem.replace('$', "$$");
+    let stem_to_use = escaped_stem.as_str();
+
     let mut result = String::with_capacity(text.len() + stem.len() * 4);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -4501,16 +4657,39 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
             continue;
         }
 
-        // Collect one word (any non-whitespace run) and replace only the first %.
+        // Collect one top-level word, respecting $(...)/${...} groups so that
+        // whitespace inside function calls doesn't split words.
+        // Within a word, replace only the first bare (top-level) '%'.
+        let mut depth: i32 = 0;
         let mut first_percent_replaced = false;
-        while i < n && !chars[i].is_whitespace() {
+        while i < n {
             let c = chars[i];
-            if c == '%' && !first_percent_replaced {
-                result.push_str(stem);
-                first_percent_replaced = true;
-            } else {
+            // Whitespace at top level ends the word.
+            if c.is_whitespace() && depth == 0 { break; }
+            // Track $(  and ${  depth.
+            if c == '$' && i + 1 < n && (chars[i + 1] == '(' || chars[i + 1] == '{') {
+                depth += 1;
                 result.push(c);
+                i += 1;
+                result.push(chars[i]);
+                i += 1;
+                continue;
             }
+            // Closing ) or } at depth > 0.
+            if (c == ')' || c == '}') && depth > 0 {
+                depth -= 1;
+                result.push(c);
+                i += 1;
+                continue;
+            }
+            // Bare % at top level: substitute stem (only once per word).
+            if c == '%' && depth == 0 && !first_percent_replaced {
+                result.push_str(stem_to_use);
+                first_percent_replaced = true;
+                i += 1;
+                continue;
+            }
+            result.push(c);
             i += 1;
         }
     }
@@ -4566,11 +4745,18 @@ fn subst_stem_in_prereq_dir(prereq: &str, full_stem: &str, pattern_target: &str)
 
 /// Dir-aware version of `subst_stem_in_se_text`.  Applies the same "stem directory"
 /// treatment as `subst_stem_in_prereq_dir` but processes a multi-word raw SE text.
+/// Respects $(...)/${...} grouping so whitespace inside function calls doesn't
+/// split words.  The `dir` is added via $(addprefix ...) wrapping so that it
+/// applies to ALL words produced by a function call, not just the raw token.
 fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) -> String {
     let (dir, base) = stem_dir_parts(pattern_target, full_stem);
     if dir.is_empty() {
         return subst_stem_in_se_text(text, full_stem);
     }
+    // Escape '$' in stems to prevent triple-expansion.
+    let escaped_full: String = full_stem.replace('$', "$$");
+    let escaped_base: String = base.replace('$', "$$");
+
     let mut result = String::with_capacity(text.len() + full_stem.len() * 4);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -4581,38 +4767,75 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
             i += 1;
             continue;
         }
+        // Collect one top-level word (respecting $(...)/${...} nesting depth).
         let word_start = i;
-        let mut pct_in_word: Option<usize> = None;
+        let mut depth: i32 = 0;
+        let mut pct_rel: Option<usize> = None; // position of first bare '%' relative to word_start
         let mut j = i;
-        while j < n && !chars[j].is_whitespace() {
-            if chars[j] == '%' && pct_in_word.is_none() {
-                pct_in_word = Some(j - word_start);
+        while j < n {
+            let c = chars[j];
+            if c.is_whitespace() && depth == 0 { break; }
+            if c == '$' && j + 1 < n && (chars[j + 1] == '(' || chars[j + 1] == '{') {
+                depth += 1;
+                j += 2;
+                continue;
+            }
+            if (c == ')' || c == '}') && depth > 0 {
+                depth -= 1;
+                j += 1;
+                continue;
+            }
+            if c == '%' && depth == 0 && pct_rel.is_none() {
+                pct_rel = Some(j - word_start);
             }
             j += 1;
         }
-        if let Some(rel_pct) = pct_in_word {
+        // The word is chars[word_start..j].
+        if let Some(rel_pct) = pct_rel {
+            // Word contains '%'.
+            // Determine whether to use full stem or base stem.
+            // rel_pct == 0 means '%' is the very first character of the word: use full stem.
+            // rel_pct > 0: use base stem.  For function calls (word starts with '$'),
+            // we wrap with $(addprefix dir,...) so all result words get dir prepended.
             let use_full = rel_pct == 0;
-            let replace_with = if use_full { full_stem } else { base };
-            if !use_full {
+            let stem_for_subst = if use_full { escaped_full.as_str() } else { escaped_base.as_str() };
+            // Determine if wrapping with addprefix is needed.
+            // Wrapping is needed when: !use_full AND the word looks like a function call
+            // (starts with '$(' or '${'), because dir-prepend must apply to each expanded word.
+            let needs_addprefix = !use_full && word_start < n
+                && chars[word_start] == '$'
+                && word_start + 1 < n
+                && (chars[word_start + 1] == '(' || chars[word_start + 1] == '{');
+            if needs_addprefix {
+                result.push_str("$(addprefix ");
+                result.push_str(dir);
+                result.push(',');
+            } else if !use_full {
                 result.push_str(dir);
             }
+            // Copy word chars, substituting '%' with the chosen stem (first occurrence only).
             let mut replaced = false;
-            while i < n && !chars[i].is_whitespace() {
-                let c = chars[i];
+            let mut k = word_start;
+            while k < j {
+                let c = chars[k];
                 if c == '%' && !replaced {
-                    result.push_str(replace_with);
+                    result.push_str(stem_for_subst);
                     replaced = true;
                 } else {
                     result.push(c);
                 }
-                i += 1;
+                k += 1;
+            }
+            if needs_addprefix {
+                result.push(')');
             }
         } else {
-            while i < n && !chars[i].is_whitespace() {
-                result.push(chars[i]);
-                i += 1;
+            // No '%' in word: copy as-is (no dir prepend).
+            for k in word_start..j {
+                result.push(chars[k]);
             }
         }
+        i = j;
     }
     result
 }

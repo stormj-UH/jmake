@@ -597,7 +597,9 @@ pub fn fn_shell_exec_with_status_env(
                 for line in stderr_str.lines() {
                     // Strip the shell prefix (e.g. "sh: " or "/bin/sh: ")
                     let msg = strip_shell_prefix(line);
-                    eprintln!("{}: {}", progname, msg);
+                    // Normalize non-standard error message wording
+                    let normalized = normalize_shell_error_msg(msg);
+                    eprintln!("{}: {}", progname, normalized);
                 }
             }
             let exit_code = out.status.code().unwrap_or_else(|| {
@@ -644,6 +646,16 @@ fn strip_shell_prefix(line: &str) -> &str {
         }
     }
     line
+}
+
+/// Normalize shell error message text to use standard POSIX wording.
+/// Some shells (e.g. mksh) use non-standard messages like "inaccessible or not found"
+/// instead of the standard "No such file or directory".  GNU Make's test suite expects
+/// the standard phrasing.
+fn normalize_shell_error_msg(msg: &str) -> String {
+    // Replace mksh's "inaccessible or not found" with "No such file or directory".
+    // The pattern is "cmd: inaccessible or not found" → "cmd: No such file or directory"
+    msg.replace(": inaccessible or not found", ": No such file or directory")
 }
 
 /// Execute a shell command, returning (stdout_processed, exit_code).

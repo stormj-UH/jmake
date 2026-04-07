@@ -2,6 +2,7 @@
 // Variable expansion engine
 
 use crate::eval::MakeState;
+use crate::eval::make_progname;
 use crate::functions;
 use crate::types::*;
 use std::collections::HashMap;
@@ -66,12 +67,12 @@ impl MakeState {
                                 if let Some(loc) = location {
                                     eprintln!("{}: *** {}.  Stop.", loc, msg.trim_end_matches('.'));
                                 } else {
-                                    eprintln!("*** {}.  Stop.", msg.trim_end_matches('.'));
+                                    eprintln!("{}: *** {}.  Stop.", make_progname(), msg.trim_end_matches('.'));
                                 }
                             } else if let Some(loc) = location {
                                 eprintln!("{}: *** unterminated variable reference.  Stop.", loc);
                             } else {
-                                eprintln!("*** unterminated variable reference.  Stop.");
+                                eprintln!("{}: *** unterminated variable reference.  Stop.", make_progname());
                             }
                             std::process::exit(2);
                         }
@@ -214,12 +215,18 @@ impl MakeState {
                 // to the variable's definition site so that errors (e.g. from $(word ...) or
                 // $(wordlist ...)) report the location where the function was written, not
                 // where the variable was referenced from.
+                //
+                // We push the caller's (file, line) onto the expansion_caller_stack so that
+                // functions like $(error) and $(warning) — which should report the callsite
+                // rather than the definition — can restore the outer context.
                 if !var.source_file.is_empty() && var.source_line != 0 {
                     let saved_file = self.current_file.borrow().clone();
                     let saved_line = *self.current_line.borrow();
+                    self.expansion_caller_stack.borrow_mut().push((saved_file.clone(), saved_line));
                     *self.current_file.borrow_mut() = var.source_file.clone();
                     *self.current_line.borrow_mut() = var.source_line;
                     let result = self.expand_with_auto_vars(&var.value, auto_vars);
+                    self.expansion_caller_stack.borrow_mut().pop();
                     *self.current_file.borrow_mut() = saved_file;
                     *self.current_line.borrow_mut() = saved_line;
                     result
@@ -332,23 +339,41 @@ impl MakeState {
             }
             "warning" => {
                 let text = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
-                let file = self.current_file.borrow();
-                let line = *self.current_line.borrow();
-                if file.is_empty() {
+                // Use the outermost caller context (from expansion_caller_stack) when available,
+                // so that $(warning) in a lazy variable reports the callsite (e.g. recipe line),
+                // not the variable's definition line.
+                let (file_str, line_num) = {
+                    let stack = self.expansion_caller_stack.borrow();
+                    if let Some((f, l)) = stack.first() {
+                        (f.clone(), *l)
+                    } else {
+                        (self.current_file.borrow().clone(), *self.current_line.borrow())
+                    }
+                };
+                if file_str.is_empty() {
                     eprintln!("{}", text);
                 } else {
-                    eprintln!("{}:{}: {}", file, line, text);
+                    eprintln!("{}:{}: {}", file_str, line_num, text);
                 }
                 return String::new();
             }
             "error" => {
                 let text = self.expand_with_auto_vars(args_str.trim_start(), auto_vars);
-                let file = self.current_file.borrow();
-                let line = *self.current_line.borrow();
-                if file.is_empty() {
+                // Use the outermost caller context (from expansion_caller_stack) when available,
+                // so that $(error) in a lazy variable reports the callsite (e.g. recipe line),
+                // not the variable's definition line.
+                let (file_str, line_num) = {
+                    let stack = self.expansion_caller_stack.borrow();
+                    if let Some((f, l)) = stack.first() {
+                        (f.clone(), *l)
+                    } else {
+                        (self.current_file.borrow().clone(), *self.current_line.borrow())
+                    }
+                };
+                if file_str.is_empty() {
                     eprintln!("*** {}.  Stop.", text);
                 } else {
-                    eprintln!("{}:{}: *** {}.  Stop.", file, line, text);
+                    eprintln!("{}:{}: *** {}.  Stop.", file_str, line_num, text);
                 }
                 std::process::exit(2);
             }
