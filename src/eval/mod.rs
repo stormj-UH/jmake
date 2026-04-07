@@ -71,6 +71,10 @@ pub struct MakeState {
     pub include_recipe_ran: HashSet<String>,
     /// True once "Entering directory" has been printed, to avoid printing it twice.
     pub entering_directory_printed: bool,
+    /// Set to true when MAKEOVERRIDES= (empty) has been assigned from a makefile.
+    /// Causes the `-- ` separator to be shown immediately (with empty vars), but
+    /// MAKEFLAGS is rebuilt cleanly (without `-- `) before executing recipes.
+    pub makeoverrides_cleared: bool,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -134,6 +138,7 @@ impl MakeState {
             pending_includes: Vec::new(),
             include_recipe_ran: HashSet::new(),
             entering_directory_printed: false,
+            makeoverrides_cleared: false,
         };
 
         // Change directory if requested
@@ -255,6 +260,17 @@ impl MakeState {
         if self.args.no_builtin_variables && !self.args.no_builtin_rules {
             self.args.no_builtin_rules = true;
             // Rebuild MAKEFLAGS so the recipe-level $(info $(MAKEFLAGS)) includes 'r'.
+            let new_makeflags = self.build_makeflags();
+            if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
+                var.value = new_makeflags.clone();
+            }
+            env::set_var("MAKEFLAGS", &new_makeflags);
+        }
+
+        // MAKEOVERRIDES= was set to empty during makefile parsing, which caused MAKEFLAGS
+        // to be set to "rR -- " (with trailing -- separator). Before running recipes,
+        // rebuild MAKEFLAGS in canonical form (without the trailing -- since there are no vars).
+        if self.makeoverrides_cleared {
             let new_makeflags = self.build_makeflags();
             if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
                 var.value = new_makeflags.clone();
@@ -1664,6 +1680,9 @@ impl MakeState {
             // to indicate the variable section was present but cleared.
             if overrides_val.is_empty() && !new_mf.contains("--") {
                 new_mf.push_str(" -- ");
+                self.makeoverrides_cleared = true;
+            } else {
+                self.makeoverrides_cleared = false;
             }
             if let Some(var) = self.db.variables.get_mut("MAKEFLAGS") {
                 var.value = new_mf.clone();
