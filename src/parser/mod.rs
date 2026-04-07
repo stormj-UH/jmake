@@ -847,6 +847,11 @@ fn expand_static_pattern_rule(
 }
 
 fn find_rule_colon(line: &str) -> Option<usize> {
+    // If the line has an inline recipe (bare `;`), it must be a rule, so `=` in
+    // the targets portion should not cause an early bail-out.  Pre-check for a
+    // bare semicolon so we know whether to honour the `=`-exit optimisation.
+    let has_inline_recipe = find_semicolon(line).is_some();
+
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut paren_depth = 0i32;
@@ -884,8 +889,13 @@ fn find_rule_colon(line: &str) -> Option<usize> {
                 return Some(i);
             }
             b'=' if paren_depth == 0 => {
-                // If we hit = before :, this is likely a variable assignment
-                return None;
+                // If we hit = before :, this is likely a variable assignment.
+                // However, when an inline recipe (`;`) is present the whole line
+                // must be a rule – targets can legitimately contain `=` after
+                // variable expansion (e.g. `one=two =:;@echo $@`).
+                if !has_inline_recipe {
+                    return None;
+                }
             }
             _ => {}
         }
