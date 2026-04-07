@@ -3411,13 +3411,22 @@ impl MakeState {
                         .cloned()
                         .unwrap_or_default();
                     let what_if = self.args.what_if.clone();
+                    // When already restarted (MAKE_RESTARTS > 0), do NOT apply -W/--what-if
+                    // to the include-rebuild check.  On restart 1+, what-if has already
+                    // triggered the necessary rebuild (in the previous invocation); applying
+                    // it again would cause infinite re-exec loops.
+                    let make_restarts = env::var("MAKE_RESTARTS")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(0);
                     rule_info.prerequisites.iter().any(|prereq| {
                         if phony_targets.contains(prereq.as_str()) {
                             // Phony prerequisite → always out of date
                             return true;
                         }
                         // -W/--what-if: if the prereq is what-if, it appears infinitely new.
-                        if what_if.iter().any(|w| w == prereq) {
+                        // Only apply on the first invocation; skip on restarts to prevent loops.
+                        if make_restarts == 0 && what_if.iter().any(|w| w == prereq) {
                             return true;
                         }
                         // A prereq that has a rule but no file → was "built" (via empty rule
