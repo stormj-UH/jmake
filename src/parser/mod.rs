@@ -413,11 +413,25 @@ pub fn strip_comment(line: &str) -> String {
     while i < bytes.len() {
         let ch = bytes[i];
         if ch == b'\\' && i + 1 < bytes.len() {
-            // Escaped character - push both and skip
-            result.push(ch as char);
-            result.push(bytes[i + 1] as char);
-            i += 2;
-            continue;
+            if depth == 0 {
+                // At top level: \# means a literal '#' (backslash is consumed).
+                // Any other \X: push both characters (backslash kept for shell/recipe use).
+                if bytes[i + 1] == b'#' {
+                    result.push('#');
+                    i += 2;
+                    continue;
+                }
+                result.push(ch as char);
+                result.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            } else {
+                // Inside $(...) / ${...}: push both characters verbatim.
+                result.push(ch as char);
+                result.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
         }
         if ch == b'$' && i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') {
             depth += 1;

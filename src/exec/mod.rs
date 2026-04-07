@@ -2563,6 +2563,9 @@ impl<'a> Executor<'a> {
                     }
                 }
             });
+            if name == "FOO" {
+                eprintln!("DEBUG setup_exports: FOO is_private={} export={:?} should_export={}", var.is_private, var.export, should_export);
+            }
             if should_export {
                 let value = self.state.expand(&var.value);
                 cmd.env(name, &value);

@@ -944,7 +944,7 @@ impl MakeState {
                 if let Some(define_expanded) = try_expand_define_name(&trimmed, self) {
                     define_expanded
                 } else if let Some(raw_parsed) = parser::try_parse_variable_assignment(trimmed) {
-                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: _, is_private: raw_is_private, target: raw_target } = raw_parsed {
+                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: raw_is_unexport, is_private: raw_is_private, target: raw_target } = raw_parsed {
                         match raw_flavor {
                             VarFlavor::Simple => {
                                 // For :=, expand and set directly. Strip comments from the value
@@ -961,6 +961,17 @@ impl MakeState {
                                 let expanded_value = self.expand(&stripped_value);
                                 if raw_target.is_none() {
                                     self.set_variable(&expanded_name, &expanded_value, &VarFlavor::Simple, raw_is_override, raw_is_export);
+                                    // Handle unexport and private flags (not passed through set_variable).
+                                    if raw_is_unexport {
+                                        if let Some(var) = self.db.variables.get_mut(&expanded_name) {
+                                            var.export = Some(false);
+                                        }
+                                    }
+                                    if raw_is_private {
+                                        if let Some(var) = self.db.variables.get_mut(&expanded_name) {
+                                            var.is_private = true;
+                                        }
+                                    }
                                     continue;
                                 }
                                 self.expand(&line)
