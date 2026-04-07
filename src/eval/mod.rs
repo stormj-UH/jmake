@@ -284,9 +284,13 @@ impl MakeState {
                 normalized
             };
             env::set_var("PWD", &new_logical);
-            if should_print_directory(&state.args) {
+            // Check if we already printed "Entering directory" in a parent re-exec invocation.
+            let entering_already_printed = env::var("JMAKE_ENTERING_PRINTED").as_deref() == Ok("1");
+            if should_print_directory(&state.args) && !entering_already_printed {
                 let cwd = logical_cwd();
                 eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+                state.entering_directory_printed = true;
+            } else if entering_already_printed {
                 state.entering_directory_printed = true;
             }
         }
@@ -309,12 +313,17 @@ impl MakeState {
 
         // Print entering-directory if needed (for -w without -C)
         // Must be BEFORE read_makefiles so $(info ...) at parse time appears after the header.
+        // When re-exec'ing after a makefile rebuild, JMAKE_ENTERING_PRINTED=1 suppresses the
+        // duplicate "Entering directory" message (the outer invocation already printed it).
         let progname = make_progname();
         let print_dir = should_print_directory(&self.args);
-        if print_dir && !self.entering_directory_printed {
+        let entering_already_printed = env::var("JMAKE_ENTERING_PRINTED").as_deref() == Ok("1");
+        if print_dir && !self.entering_directory_printed && !entering_already_printed {
             // Already printed at startup for -C; print here for -w without -C
             let cwd = logical_cwd();
             eprintln!("{}: Entering directory '{}'", progname, cwd.display());
+            self.entering_directory_printed = true;
+        } else if entering_already_printed {
             self.entering_directory_printed = true;
         }
 
@@ -3133,6 +3142,14 @@ impl MakeState {
 
         // Set MAKE_RESTARTS in the environment for the re-exec'd process
         cmd.env("MAKE_RESTARTS", restart_count.to_string());
+
+        // If "Entering directory" was already printed by this invocation, suppress it
+        // in the re-exec'd process to avoid printing it twice.
+        if self.entering_directory_printed {
+            cmd.env("JMAKE_ENTERING_PRINTED", "1");
+        } else {
+            cmd.env_remove("JMAKE_ENTERING_PRINTED");
+        }
 
         if debug_basic {
             // Build the full command string for debug output

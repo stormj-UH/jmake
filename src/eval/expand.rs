@@ -200,8 +200,25 @@ impl MakeState {
             return self.expand_var_value(var, auto_vars);
         }
 
-        // Warn if requested
-        if self.args.warn_undefined_variables {
+        // Warn if requested — but suppress warnings for GNU Make's special/auto-set
+        // variables that are always "defined" (even if empty) in GNU Make.  Users should
+        // not get warnings for referencing these standard variables.
+        const BUILTIN_VARS: &[&str] = &[
+            // Automatic variables (always set by make)
+            ".VARIABLES", "MAKECMDGOALS", "MAKE_RESTARTS", "CURDIR",
+            "GNUMAKEFLAGS", "MAKEFLAGS", "MFLAGS", "MAKE_COMMAND", "MAKE",
+            "MAKEFILE_LIST", "MAKEOVERRIDES", "-*-command-variables-*-",
+            ".RECIPEPREFIX", ".LOADED", ".FEATURES",
+            "SHELL", ".SHELLFLAGS", "MAKE_TERMOUT", "MAKE_TERMERR",
+            ".DEFAULT", ".DEFAULT_GOAL", "-*-eval-flags-*-", "SUFFIXES",
+            "VPATH", "GPATH",
+            // Additional special variables
+            "MAKELEVEL", "MAKEFILES", "MAKEFILE", "MAKEINFO",
+            ".LIBPATTERNS", ".DEFAULT_GOAL", "MAKE_VERSION",
+            "MAKELEVEL", "MAKEFILE_LIST",
+        ];
+        let is_builtin = BUILTIN_VARS.contains(&expanded_name.as_str());
+        if self.args.warn_undefined_variables && !is_builtin {
             // Use the outermost caller context (expansion_caller_stack) when available,
             // as it reflects the location in the user's makefile where the expansion
             // was triggered (not the variable's definition site).
