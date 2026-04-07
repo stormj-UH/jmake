@@ -665,12 +665,17 @@ pub fn fn_shell_exec_with_status(cmd: &str) -> (String, i32) {
     fn_shell_exec_with_status_env(cmd, &HashMap::new(), &[], "make")
 }
 
-/// Process shell output: replace newlines with spaces, trim trailing whitespace.
+/// Process shell output per GNU Make rules:
+/// 1. Strip trailing newlines from the raw output.
+/// 2. Replace remaining (internal) newlines with spaces.
+/// Trailing non-newline whitespace (e.g. a trailing space) is preserved.
 fn process_shell_output(raw: &str) -> String {
-    // Replace all newlines with spaces
-    let with_spaces = raw.replace('\n', " ");
-    // Trim trailing whitespace (spaces that came from newlines or actual trailing spaces)
-    with_spaces.trim_end().to_string()
+    // Strip trailing newlines only (not spaces or other whitespace)
+    let stripped = raw.trim_end_matches('\n');
+    // Also handle \r\n line endings: strip trailing \r after removing \n
+    let stripped = stripped.trim_end_matches('\r');
+    // Replace remaining internal newlines (and \r\n) with spaces
+    stripped.replace("\r\n", " ").replace('\n', " ")
 }
 
 pub fn fn_shell_exec(cmd: &str) -> String {
