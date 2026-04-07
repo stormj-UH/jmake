@@ -983,6 +983,31 @@ fn find_bare_colon(s: &str) -> Option<usize> {
     None
 }
 
+/// Unescape `\%` → `%` in a target name (file path) string.
+/// In GNU Make, `\%` in a target name or static pattern rule target list
+/// represents a literal `%` character.  This function converts stored
+/// `\%` sequences back to plain `%` so the target can be looked up in the
+/// rule database by its canonical (unescaped) name.
+pub fn unescape_percent_in_target(s: &str) -> String {
+    if !s.contains("\\%") {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+            // \% → % (unescape)
+            result.push('%');
+            i += 2;
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// Find the position of the first UNESCAPED `%` in a pattern string.
 /// An unescaped `%` is one not preceded by an odd number of backslashes.
 /// Returns `None` if no unescaped `%` exists.
@@ -1184,20 +1209,29 @@ fn expand_static_pattern_rule(
         // GNU Make filters out empty-string prerequisites that result from an
         // empty stem (e.g. `foo: foo%: %` with stem `` gives empty prereq `""`
         // which is silently discarded).
+        // Also unescape \% → % in the resulting prerequisite names: patterns
+        // like `the\%weird\_..._pattern%\.1` have \% for a literal % in the
+        // prerequisite file name, which must be unescaped after stem substitution.
         let prereqs: Vec<String> = prereq_patterns
             .iter()
-            .map(|p| apply_stem(p, &stem))
+            .map(|p| unescape_percent_in_target(&apply_stem(p, &stem)))
             .filter(|p| !p.is_empty())
             .collect();
 
         let order_only: Vec<String> = order_only_patterns
             .iter()
-            .map(|p| apply_stem(p, &stem))
+            .map(|p| unescape_percent_in_target(&apply_stem(p, &stem)))
             .filter(|p| !p.is_empty())
             .collect();
 
+        // Unescape \% → % in the target name: a static pattern rule target list may
+        // contain \% to represent a literal % in a target file name.  The explicit
+        // rule must be stored under the canonical (unescaped) name so that it can
+        // be found when the target is looked up by its unescaped name.
+        let canonical_target = unescape_percent_in_target(&target);
+
         let mut rule = Rule::new();
-        rule.targets = vec![target.clone()];
+        rule.targets = vec![canonical_target.clone()];
         rule.prerequisites = prereqs;
         rule.order_only_prerequisites = order_only;
         // Static pattern rules create explicit (non-pattern) rules.

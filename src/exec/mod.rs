@@ -2992,6 +2992,9 @@ impl<'a> Executor<'a> {
                 Vec::new() // pattern rules: no .WAIT groups by default
             };
         }
+        // Capture primary target mtime BEFORE running recipe, so we can detect if it changed.
+        // The peer-target warning fires only when the primary was actually created/updated.
+        let primary_mtime_before = self.file_mtime(target);
         let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
@@ -3086,12 +3089,20 @@ impl<'a> Executor<'a> {
         }
 
         // Check if peer targets were actually updated (emit warning if not).
-        // Per GNU Make: if a multi-target pattern rule ran AND the primary target now exists
-        // on disk (was actually created/touched), but a peer target doesn't exist, warn.
-        // Do NOT warn if the primary target also doesn't exist (recipe didn't create any files).
+        // Per GNU Make: warn only when the primary target was actually CREATED or UPDATED
+        // (its mtime changed, or it didn't exist before and now exists).
+        // Do NOT warn if the recipe ran but left the primary target unchanged (e.g., @echo).
         if let Ok(true) = &result {
-            let primary_exists = Path::new(target).exists();
-            if primary_exists {
+            let primary_mtime_after = self.file_mtime(target);
+            // Primary was "updated" if:
+            //   - it didn't exist before (None → Some), OR
+            //   - its mtime changed (before != after)
+            let primary_updated = match (primary_mtime_before, primary_mtime_after) {
+                (None, Some(_)) => true,                       // newly created
+                (Some(before), Some(after)) => after != before, // mtime changed
+                _ => false,
+            };
+            if primary_updated {
                 for sib in &also_make_siblings {
                     if !Path::new(sib.as_str()).exists() {
                         // Peer target wasn't created: warn
