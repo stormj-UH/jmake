@@ -750,6 +750,38 @@ impl<'a> Executor<'a> {
         // If we have explicit rules
         if let Some(ref rules) = rules {
             if !rules.is_empty() {
+                // sv 62650: If VPATH resolves this target to a path that also has rules
+                // with a recipe, AND the local target also has a recipe, then the VPATH
+                // version takes precedence. Warn and redirect to the VPATH path.
+                let local_has_recipe = rules.iter().any(|r| !r.recipe.is_empty());
+                if local_has_recipe {
+                    if let Some(vpath_resolved) = self.find_in_vpath(target) {
+                        if vpath_resolved != target {
+                            if let Some(vpath_rules) = self.db.rules.get(&vpath_resolved) {
+                                let vpath_has_recipe = vpath_rules.iter().any(|r| !r.recipe.is_empty());
+                                if vpath_has_recipe {
+                                    // Find source info for the local rule with a recipe
+                                    let local_rule_with_recipe = rules.iter()
+                                        .find(|r| !r.recipe.is_empty());
+                                    if let Some(local_rule) = local_rule_with_recipe {
+                                        let src = &local_rule.source_file;
+                                        let recipe_lineno = local_rule.recipe.first()
+                                            .map(|(l, _)| *l)
+                                            .unwrap_or(local_rule.lineno);
+                                        eprintln!("{}:{}: Recipe was specified for file '{}' at {}:{},",
+                                            src, recipe_lineno, target, src, recipe_lineno);
+                                        eprintln!("{}:{}: but '{}' is now considered the same file as '{}'.",
+                                            src, recipe_lineno, target, vpath_resolved);
+                                        eprintln!("{}:{}: Recipe for '{}' will be ignored in favor of the one for '{}'.",
+                                            src, recipe_lineno, target, vpath_resolved);
+                                    }
+                                    return self.build_target(&vpath_resolved);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check if these are double-colon rules.  Target-specific variable
                 // placeholders (single-colon, no recipe) may appear first in the list
                 // before the actual :: rules, so check any() rather than first().
@@ -4227,15 +4259,14 @@ impl<'a> Executor<'a> {
                 (*lineno, rejoined)
             }).collect();
 
-            // Clear the pending prereqs (they were used by build_with_rules to pre-record
-            // the plan; here we update the plan's recipe field).
-            let _ = std::mem::take(&mut self.pending_plan_prereqs);
-            let _ = std::mem::take(&mut self.pending_plan_order_only);
-
             // Update the existing plan (created in build_with_rules) with the expanded recipe.
             // If no plan exists yet (e.g., called from .DEFAULT or pattern rules), create one.
             if let Some(ref mut plans) = self.pending_plans {
                 if let Some(plan) = plans.get_mut(target) {
+                    // Plan was pre-created by build_with_rules; clear pending prereqs since
+                    // they were already used during plan pre-creation.
+                    let _ = std::mem::take(&mut self.pending_plan_prereqs);
+                    let _ = std::mem::take(&mut self.pending_plan_order_only);
                     plan.recipe = expanded_recipe;
                     plan.needs_rebuild = true;
                     plan.auto_vars = auto_vars.clone();
@@ -4248,9 +4279,11 @@ impl<'a> Executor<'a> {
                     }
                 } else {
                     // Plan not pre-created (e.g. pattern rule or .DEFAULT); create it now.
+                    // Use pending_plan_prereqs which was set by build_with_pattern_rule.
+                    let prereqs_for_plan = std::mem::take(&mut self.pending_plan_prereqs);
                     let plan = parallel::TargetPlan {
                         target: target.to_string(),
-                        prerequisites: std::mem::take(&mut self.pending_plan_prereqs),
+                        prerequisites: prereqs_for_plan,
                         order_only: std::mem::take(&mut self.pending_plan_order_only),
                         recipe: expanded_recipe,
                         source_file: source_file.to_string(),
