@@ -768,12 +768,20 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
     // have their comments stripped so `#` is not treated as a prerequisite name.
     // The inline recipe (after `;`) is NOT comment-stripped here — it is passed
     // to the shell verbatim.
+    //
+    // Important: we must find the inline-recipe `;` ONLY in the part BEFORE any
+    // `#` comment.  A `;` inside a comment (e.g. "target: # foo ; bar") is not an
+    // inline recipe separator.  Use find_inline_recipe_semi_pos (which is already
+    // comment-aware) to locate the `;`, then strip the comment from the prereq part.
     let rest_trimmed_owned;
     let rest_trimmed = {
-        // Find the semicolon position in the RAW rest (before comment-stripping)
-        // so we can preserve the inline recipe exactly.
-        let semi_in_raw = find_semicolon(rest_trimmed_raw);
-        if let Some(semi) = semi_in_raw {
+        // find_inline_recipe_semi_pos operates on the whole-line context, but here
+        // we only have the rest (after the target colon).  We reconstruct a fake
+        // line with a dummy "x:" prefix so the function sees a post-colon context.
+        let fake_line = format!("x:{}", rest_trimmed_raw);
+        let semi_in_rest = find_inline_recipe_semi_pos(&fake_line)
+            .map(|pos| pos - 2); // subtract the length of "x:"
+        if let Some(semi) = semi_in_rest {
             // Strip comments only from the prereq part; keep recipe verbatim.
             let prereq_stripped = strip_comment(&rest_trimmed_raw[..semi]);
             rest_trimmed_owned = format!("{};{}", prereq_stripped, &rest_trimmed_raw[semi+1..]);
