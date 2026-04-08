@@ -22,17 +22,8 @@ jobs:
             tar xz --strip-components=1
           ls Cargo.toml && echo "Checkout OK"
 
-      - name: Build jmake
-        env:
-          CC: clang
-          RUSTFLAGS: "-C linker=clang -C link-self-contained=yes"
-        run: |
-          # Create stub libgcc_s.so - musl/clang image lacks GCC runtime but
-          # rustc unconditionally links -lgcc_s for proc-macro shared objects.
-          # The actual unwinding is handled by Rust's bundled libunwind.a.
-          SYSROOT=$(rustc --print sysroot)
-          clang -shared -nostdlib -o ${SYSROOT}/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/libgcc_s.so -x c /dev/null
-          cargo build --release
+      - name: Build and package with jpkg
+        run: jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
 
       - name: Verify binary
         run: |
@@ -97,14 +88,12 @@ jobs:
             echo "No test results, skipping README update"
             exit 0
           fi
-          # Update badge between markers using sed
           sed -i "/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
             /<!-- test-badge-start -->/!{/<!-- test-badge-end -->/!d}
             /<!-- test-badge-start -->/a\\
 ${BADGE}
           }" README.md
           echo "Updated badge to: $BADGE"
-          # Commit and push via API
           CONTENT=$(base64 < README.md | tr -d '\n')
           SHA=$(curl -s -H "Authorization: token ${TOKEN}" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" | \
@@ -115,16 +104,13 @@ ${BADGE}
             -d "{\"message\":\"CI: update test badge\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
           echo "README pushed"
 
-      - name: Package with jpkg
+      - name: Upload package
         env:
           TOKEN: ${{ secrets.REPO_TOKEN }}
           SERVER: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          jpkg build packages/jmake --output /tmp/jpkg-out
           ls -lh /tmp/jpkg-out/
-          # Upload to Forgejo generic packages
           for f in /tmp/jpkg-out/*; do
             FNAME=$(basename "$f")
             curl -s -X PUT -H "Authorization: token ${TOKEN}" \
@@ -132,4 +118,4 @@ ${BADGE}
               "${SERVER}/api/packages/jonerik/generic/jmake/${VERSION}/${FNAME}"
             echo "Uploaded ${FNAME}"
           done
-          echo "Package published: ${SERVER}/jonerik/-/packages/generic/jmake/${VERSION}"
+          echo "Package: ${SERVER}/jonerik/-/packages/generic/jmake/${VERSION}"

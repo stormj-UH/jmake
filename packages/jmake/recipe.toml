@@ -9,7 +9,9 @@ type = "local"
 
 [build]
 system = "custom"
-build = "cargo build --release"
+build = """SYSROOT=$(rustc --print sysroot)
+clang -shared -nostdlib -o ${SYSROOT}/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/libgcc_s.so -x c /dev/null 2>/dev/null || true
+CC=clang RUSTFLAGS="-C linker=clang -C link-self-contained=yes" cargo build --release"""
 install = """install -Dm755 target/release/jmake $DESTDIR/bin/jmake
 ln -sf jmake $DESTDIR/bin/make
 llvm-strip --strip-all $DESTDIR/bin/jmake 2>/dev/null || true"""
