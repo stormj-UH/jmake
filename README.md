@@ -3,7 +3,7 @@
 Clean-room drop-in replacement for [GNU Make](https://www.gnu.org/software/make/), written in Rust.
 
 <!-- test-badge-start -->
-**GNU Make 4.4.1 test suite: 1331 / 1336 (99.6%)**
+**GNU Make 4.4.1 test suite: 1334 / 1336 (99.8%)**
 <!-- test-badge-end -->
 
 ## Overview
