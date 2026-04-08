@@ -107,7 +107,7 @@ jobs:
           ' README.md > README.tmp && mv README.tmp README.md
           echo "Updated badge to: $BADGE"
           # Push via API
-          CONTENT=$(base64 < README.md | tr -d '\n')
+          CONTENT=$(base64 -w 0 < README.md 2>/dev/null || base64 < README.md | awk '{printf "%s",$0}')
           SHA=$(curl -s -H "Authorization: token ${TOKEN}" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" | \
             sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' | head -1)
