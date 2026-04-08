@@ -652,8 +652,9 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // Collect in build order: intermediates built first are listed first in the
-        // rm command, matching GNU Make's deletion output order.
+        // GNU Make deletion order: for grouped multi-target pattern rules,
+        // siblings are listed in reverse target-list order. For non-grouped
+        // intermediates, list in build order.
         let to_delete: Vec<String> = self.intermediate_built.iter()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
@@ -3468,20 +3469,15 @@ impl<'a> Executor<'a> {
                 self.grouped_covered.insert(sib.clone());
                 self.built.insert(sib.clone(), true);
             }
-            // Push PRIMARY to intermediate_built BEFORE siblings.
-            // Deletion iterates intermediate_built in REVERSE (.rev()), so to get
-            // GNU Make's deletion order (siblings before primary), we push primary
-            // first and siblings (forward declaration order) after.
+            // Push siblings to intermediate_built in REVERSE declaration order FIRST,
+            // then push PRIMARY last. This gives GNU Make's deletion order when
+            // iterating forward: siblings (reverse) then primary.
             // Example: `%.1 %.15:`, primary a.1, siblings [a.15].
-            //   Push a.1 → intermediate_built = [..., a.1]
-            //   Push a.15 → intermediate_built = [..., a.1, a.15]
-            //   Deletion .rev() → [a.15, a.1] → `rm a.15 a.1` ✓
-            if is_target_intermediate {
-                if !self.intermediate_built.contains(&target.to_string()) {
-                    self.intermediate_built.push(target.to_string());
-                }
-            }
-            // Now push siblings to intermediate_built in FORWARD declaration order.
+            //   Push a.15 → intermediate_built = [..., a.15]
+            //   Push a.1 → intermediate_built = [..., a.15, a.1]
+            //   Deletion forward → `rm a.15 a.1` ✓
+            // First collect sibling intermediates, then push in reverse order + primary last.
+            let mut sib_intermediates: Vec<String> = Vec::new();
             for sib in also_make_siblings.iter() {
                 // Track intermediate status for also_make siblings.
                 // A sibling is intermediate if:
@@ -3491,7 +3487,7 @@ impl<'a> Executor<'a> {
                 // Note: explicitly mentioned = appears as target or prereq of any explicit rule.
                 if self.db.is_intermediate(sib) {
                     if !self.intermediate_built.contains(sib) {
-                        self.intermediate_built.push(sib.clone());
+                        sib_intermediates.push(sib.clone());
                     }
                 } else if !self.db.is_precious(sib)
                     && !self.db.is_notintermediate(sib)
@@ -3522,9 +3518,21 @@ impl<'a> Executor<'a> {
                         || any_expanded_prereq_explicit_no_rule;
                     if !is_explicit {
                         if !self.intermediate_built.contains(sib) {
-                            self.intermediate_built.push(sib.clone());
+                            sib_intermediates.push(sib.clone());
                         }
                     }
+                }
+            }
+            // Push siblings in reverse declaration order, then primary last.
+            // This gives GNU Make's deletion order: `rm a.15 a.1` for `%.1 %.15:`
+            for sib in sib_intermediates.into_iter().rev() {
+                if !self.intermediate_built.contains(&sib) {
+                    self.intermediate_built.push(sib);
+                }
+            }
+            if is_target_intermediate {
+                if !self.intermediate_built.contains(&target.to_string()) {
+                    self.intermediate_built.push(target.to_string());
                 }
             }
             // In collect_plans_mode, update the plan's is_intermediate flag now that we
