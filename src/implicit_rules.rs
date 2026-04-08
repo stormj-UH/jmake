@@ -66,7 +66,7 @@ pub fn register_default_variables(db: &mut MakeDatabase) {
         ("TARGET_MACH", ""),
         // Default library search patterns: used by -lname prerequisite resolution.
         // On Linux/Unix: search for shared library first, then static.
-        (".LIBPATTERNS", "lib%.so lib%.a"),
+        (".LIBPATTERNS", "lib%.a lib%.so"),
     ];
 
     for (name, value) in defaults {
