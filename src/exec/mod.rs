@@ -37,6 +37,7 @@ pub struct Executor<'a> {
     built: HashMap<String, bool>, // target -> was rebuilt
     building: HashSet<String>,    // cycle detection
     building_stack: Vec<String>,  // ordered stack for cycle detection messages
+    circular_dropped: HashSet<String>, // targets whose circular dep was dropped
     question_out_of_date: bool,
     errors: Vec<String>,
     progname: String,
@@ -168,6 +169,7 @@ impl<'a> Executor<'a> {
             built: HashMap::new(),
             building: HashSet::new(),
             building_stack: Vec::new(),
+            circular_dropped: HashSet::new(),
             question_out_of_date: false,
             errors: Vec::new(),
             progname,
@@ -764,9 +766,10 @@ impl<'a> Executor<'a> {
                 .map(|s| s.as_str())
                 .unwrap_or(target);
             eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, requester, target);
-            // Mark as built so terminal rule checks know this dep was handled
-            // (circular deps are "available" even though no file was created).
+            // Mark as built and circular so terminal rule checks know this dep was
+            // handled (circular deps are "available" even though no file was created).
             self.built.insert(target.to_string(), false);
+            self.circular_dropped.insert(target.to_string());
             return Ok(false);
         }
         self.building.insert(target.to_string());
@@ -3134,11 +3137,11 @@ impl<'a> Executor<'a> {
                     // doesn't count — it must be buildable by an explicit (non-pattern) rule.
                     let has_explicit_recipe = self.db.rules.get(prereq.as_str())
                         .map_or(false, |rules| rules.iter().any(|r| !r.recipe.is_empty()));
-                    // Skip the terminal existence check if the prereq was already
-                    // successfully processed (e.g. circular dep that was dropped).
-                    let already_built = self.built.contains_key(prereq.as_str());
+                    // Skip the terminal existence check if the prereq was a
+                    // circular dep that was dropped — it's available by definition.
+                    let was_circular = self.circular_dropped.contains(prereq.as_str());
                     if rule.is_terminal && !self.db.is_phony(&prereq)
-                        && !has_explicit_recipe && !already_built
+                        && !has_explicit_recipe && !was_circular
                     {
                         let exists = std::path::Path::new(&prereq).exists()
                             || self.find_in_vpath(&prereq).is_some();
@@ -3889,6 +3892,10 @@ impl<'a> Executor<'a> {
         // Pass 3: GNU Make "compatibility rule search" — terminal rules that were
         // skipped in pass 2 can still be used when all their prereqs are satisfiable
         // (on disk, in building set for cycles, or chainable via non-terminal rules).
+        // Pass 3: GNU Make "compatibility rule search" for terminal rules.
+        // Terminal rules skipped in pass 2 can still match when all their
+        // prereqs are immediately satisfiable (on disk, in building set for
+        // cycles, PHONY, VPATH, or have explicit rules). NO chaining allowed.
         if compat_rule.is_none() {
             for rule in &all_rules {
                 if !rule.is_terminal { continue; }
@@ -3898,16 +3905,13 @@ impl<'a> Executor<'a> {
                         let prereqs_ok = if rule.prerequisites.is_empty() {
                             true
                         } else {
-                            let mut visited = std::collections::HashSet::new();
                             rule.prerequisites.iter().all(|p| {
                                 if p == ".WAIT" { return true; }
                                 let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                                 Path::new(&resolved).exists()
-                                    || self.db.rules.contains_key(&resolved)
                                     || self.db.is_phony(&resolved)
                                     || self.find_in_vpath(&resolved).is_some()
                                     || self.building.contains(&resolved)
-                                    || self.find_pattern_rule_exists_inner(&resolved, &mut visited, 0)
                             })
                         };
                         if prereqs_ok {
