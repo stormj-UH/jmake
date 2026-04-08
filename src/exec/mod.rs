@@ -3125,8 +3125,14 @@ impl<'a> Executor<'a> {
                     // implicit rules that produce no file is not allowed.
                     // However, prerequisites with EXPLICIT rules are fine even if they
                     // don't create files (an explicit rule with empty recipe is valid).
-                    if rule.is_terminal && !rule.is_compat && !self.db.is_phony(&prereq)
-                        && !self.db.rules.contains_key(prereq.as_str())
+                    // For terminal rules, a prereq is only exempt from the
+                    // "must exist" check if it has an explicit rule WITH a recipe.
+                    // Just being mentioned as a prerequisite (e.g. `unrelated: hello.x`)
+                    // doesn't count — it must be buildable by an explicit (non-pattern) rule.
+                    let has_explicit_recipe = self.db.rules.get(prereq.as_str())
+                        .map_or(false, |rules| rules.iter().any(|r| !r.recipe.is_empty()));
+                    if rule.is_terminal && !self.db.is_phony(&prereq)
+                        && !has_explicit_recipe
                     {
                         let exists = std::path::Path::new(&prereq).exists()
                             || self.find_in_vpath(&prereq).is_some();
