@@ -23,6 +23,9 @@ jobs:
           ls Cargo.toml && echo "Checkout OK"
 
       - name: Build jmake
+        env:
+          CC: clang
+          RUSTFLAGS: "-C linker=clang"
         run: cargo build --release
 
       - name: Verify binary
