@@ -3687,21 +3687,48 @@ impl MakeState {
             let file_path = file_path_buf.as_path();
 
             if file_path.exists() {
-                let idx = work_items.len();
-                file_to_work_idx.entry(pi.file.clone()).or_insert(idx);
-                work_items.push(PendingWork {
-                    pi_file: pi.file,
-                    pi_ignore_missing: pi.ignore_missing,
-                    pi_parent: pi.parent,
-                    pi_lineno: pi.lineno,
-                    outcome: PendingOutcome::AlreadyExists,
-                    deferred_no_such_file: false,
-                    also_make_siblings: Vec::new(),
-                    rule_source_file: String::new(),
-                    rule_lineno: 0, pre_mtime: None,
-                });
-                continue;
+                // Check if the file is actually readable. If not, it needs to be
+                // rebuilt via rules (GNU Make behavior: unreadable include files are
+                // treated like missing files that need rebuilding).
+                let is_readable = std::fs::File::open(file_path).is_ok();
+                if is_readable {
+                    let idx = work_items.len();
+                    file_to_work_idx.entry(pi.file.clone()).or_insert(idx);
+                    work_items.push(PendingWork {
+                        pi_file: pi.file,
+                        pi_ignore_missing: pi.ignore_missing,
+                        pi_parent: pi.parent,
+                        pi_lineno: pi.lineno,
+                        outcome: PendingOutcome::AlreadyExists,
+                        deferred_no_such_file: false,
+                        also_make_siblings: Vec::new(),
+                        rule_source_file: String::new(),
+                        rule_lineno: 0, pre_mtime: None,
+                    });
+                    continue;
+                }
+                // File exists but is unreadable. Print the read error now (GNU Make
+                // prints "MAKEFILE:LINE: FILE: Permission denied" before trying rules).
+                if !pi.ignore_missing && !pi.parent.is_empty() {
+                    let err_msg = std::fs::File::open(file_path)
+                        .err()
+                        .map(|e| {
+                            let s = format!("{}", e);
+                            // Strip Rust's " (os error N)" suffix for clean GNU Make-style output
+                            if let Some(idx) = s.find(" (os error") {
+                                s[..idx].to_string()
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_else(|| "Permission denied".to_string());
+                    eprintln!("{}:{}: {}: {}", pi.parent, pi.lineno, pi.file, err_msg);
+                }
+                // Fall through to try rebuilding via rules (same as missing file).
+                // Don't print "No such file or directory" later — we already printed the error.
             }
+            // Track whether we already printed an error for this file (unreadable).
+            let already_printed_error = file_path.exists() && !std::fs::File::open(file_path).is_ok();
 
             let is_phony = self.db.special_targets
                 .get(&SpecialTarget::Phony)
@@ -3745,9 +3772,11 @@ impl MakeState {
                     } else {
                         // Required include with no rule: defer the "No such file or
                         // directory" message to Phase C so ordering is correct.
+                        // If we already printed "Permission denied" for an unreadable
+                        // file, don't also print "No such file or directory".
                         (PendingOutcome::Error(
                             format!("No rule to make target '{}'.  Stop.", pi.file)
-                        ), !pi.parent.is_empty())
+                        ), !pi.parent.is_empty() && !already_printed_error)
                     }
                 }
                 Some(IncludeRuleInfo { skippable: true, .. }) => {
