@@ -1583,7 +1583,17 @@ impl MakeState {
                         parser.posix_mode = true;
                         // POSIX mode sets specific default variable values,
                         // but only if not already overridden by user/environment.
-                        let posix_defaults = [("CC", "c99"), ("CFLAGS", "-O1"), ("ARFLAGS", "-rv"), ("SCCSGETFLAGS", "-s")];
+                        let posix_defaults = [("CC", "c99"), ("CFLAGS", "-O1"), ("FC", "fort77"), ("FFLAGS", "-O1"), ("ARFLAGS", "-rv"), ("SCCSGETFLAGS", "-s")];
+                        // POSIX mode: shell runs with -e (exit on error)
+                        // Only set if not already overridden
+                        let sf_should_set = match self.db.variables.get(".SHELLFLAGS") {
+                            None => true,
+                            Some(v) => v.origin == VarOrigin::Default,
+                        };
+                        if sf_should_set {
+                            self.db.variables.insert(".SHELLFLAGS".into(),
+                                Variable::new("-ec".into(), VarFlavor::Simple, VarOrigin::Default));
+                        }
                         for (name, val) in &posix_defaults {
                             let should_set = match self.db.variables.get(*name) {
                                 None => true,

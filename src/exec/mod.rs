@@ -5189,10 +5189,25 @@ impl<'a> Executor<'a> {
                 // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
                 // otherwise fall back to the global defaults.
                 let eff_shell_raw = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
-                let eff_flags = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
-                    f.as_str()
-                } else {
-                    self.shell_flags
+                let eff_flags_owned;
+                let eff_flags = {
+                    let base = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
+                        f.as_str()
+                    } else {
+                        self.shell_flags
+                    };
+                    // GNU Make: when a recipe line has the `-` (ignore error) prefix
+                    // and .POSIX mode added `-e` to .SHELLFLAGS (not user-set), strip it.
+                    // Check if .SHELLFLAGS was set by POSIX mode (origin=Default).
+                    let posix_added_e = self.db.posix_mode
+                        && self.db.variables.get(".SHELLFLAGS")
+                            .map_or(false, |v| v.origin == crate::types::VarOrigin::Default);
+                    if effective_ignore && posix_added_e && base.contains("-e") {
+                        eff_flags_owned = base.replace("-ec", "-c").replace("-e", "");
+                        eff_flags_owned.as_str()
+                    } else {
+                        base
+                    }
                 };
 
                 // When SHELL contains spaces (e.g. "echo hi"), GNU Make composes the full
