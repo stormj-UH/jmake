@@ -4968,12 +4968,16 @@ impl<'a> Executor<'a> {
             // Execute all recipe lines as one shell script.
             // In .ONESHELL mode:
             //   - ALL recipe lines are joined and passed to a single shell invocation.
-            //   - Prefix chars (@, -, +) are stripped from ALL recipe lines when building
-            //     the script (so they don't appear as invalid shell commands).
+            //   - For Bourne-compatible shells: prefix chars (@, -, +) are stripped
+            //     from each recipe line before building the script.
+            //   - For non-Bourne shells (perl, python, etc.): prefix chars are NOT
+            //     stripped because they may be valid syntax in those languages.
+            //     GNU Make's rule: only strip for is_bourne_compatible_shell().
             //   - Echo behaviour and error-ignore are controlled by the FIRST recipe
             //     line's prefix only; inner-line prefix chars don't affect behavior.
             //   - The last recipe lineno is used for error messages.
 
+            let bourne_shell = is_bourne_compatible_shell(self.shell);
             let mut script = String::new();
             let mut first_line_silent = false;
             let mut first_line_ignore = false;
@@ -4990,15 +4994,20 @@ impl<'a> Executor<'a> {
                 // Pre-process: collapse \<newline> inside $(…)/${…} references
                 let preprocessed = preprocess_recipe_bsnl(line);
                 let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                // Strip @-+ prefixes from ALL lines for the script.
-                // First line: also record behavioral flags (silent, ignore errors).
+                // For the first line: record behavioral flags (silent, ignore errors).
                 if is_first {
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
                     is_first = false;
                 }
-                let cmd_line = strip_recipe_prefixes(&expanded);
+                // Strip @-+ prefixes only for Bourne-compatible shells.
+                // Non-Bourne shells (perl, python, etc.) receive the lines as-is.
+                let cmd_line = if bourne_shell {
+                    strip_recipe_prefixes(&expanded)
+                } else {
+                    expanded
+                };
                 script.push_str(&cmd_line);
                 script.push('\n');
             }
@@ -5008,7 +5017,7 @@ impl<'a> Executor<'a> {
             let effective_ignore = first_line_ignore || self.ignore_errors;
 
             if !effective_silent {
-                // Echo lines with @-+ prefixes stripped from ALL lines.
+                // Echo lines with @-+ prefixes stripped from ALL lines (for display).
                 for (_lineno, line) in recipe {
                     let preprocessed = preprocess_recipe_bsnl(line);
                     let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
