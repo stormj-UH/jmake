@@ -8,13 +8,19 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/stormj-uh/jonerix:builder-amd64
+    env:
+      FORGEJO_URL: ${{ github.server_url }}
+      FORGEJO_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           cd $GITHUB_WORKSPACE
-          curl -sL -H "Authorization: token ${{ github.token }}" \
-            "${{ github.server_url }}/${{ github.repository }}/archive/${{ github.sha }}.tar.gz" | \
+          curl -sL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${FORGEJO_URL}/${FORGEJO_REPO}/archive/${GITHUB_SHA}.tar.gz" | \
             tar xz --strip-components=1
+          ls Cargo.toml
 
       - name: Build jmake
         run: cargo build --release
@@ -72,4 +78,3 @@ jobs:
           cd /tmp/jpkg
           VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
-# trigger
