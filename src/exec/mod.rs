@@ -3119,7 +3119,7 @@ impl<'a> Executor<'a> {
                     // implicit rules that produce no file is not allowed.
                     // However, prerequisites with EXPLICIT rules are fine even if they
                     // don't create files (an explicit rule with empty recipe is valid).
-                    if rule.is_terminal && !self.db.is_phony(&prereq)
+                    if rule.is_terminal && !rule.is_compat && !self.db.is_phony(&prereq)
                         && !self.db.rules.contains_key(prereq.as_str())
                     {
                         let exists = std::path::Path::new(&prereq).exists()
@@ -3132,11 +3132,13 @@ impl<'a> Executor<'a> {
                     }
                 }
                 Err(e) => {
-                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty() && !rule.is_compat {
+                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty()
+                        && (!rule.is_compat || !self.is_explicitly_mentioned(&prereq)) {
                         // GNU Make behavior: if a prerequisite doesn't exist and has
                         // no rule, but the parent target HAS a recipe, just consider
-                        // the parent out of date. This handles auto-generated dependency
-                        // files that list system headers as prerequisites.
+                        // the parent out of date. For compat rules, only prune prereqs
+                        // that are NOT explicitly mentioned (intermediates like hello.f).
+                        // Explicitly mentioned prereqs in compat rules still error.
                         any_rebuilt = true;
                     } else {
                         // Propagate "No rule to make target" errors correctly
@@ -3928,6 +3930,9 @@ impl<'a> Executor<'a> {
                                 // a terminal rule's prereq pattern resolves to a longer name
                                 // that re-matches the same terminal rule (e.g. %:: %.c → hello.c → hello.c.c → ...).
                                 || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, depth + 1))
+                                // For terminal rules: accept prereqs that are in explicit_dep_names
+                                // (compat candidates). This allows circular deps through compat rules.
+                                || (rule.is_terminal && self.db.explicit_dep_names.contains(&resolved))
                         })
                     };
                     if prereqs_ok { return true; }
