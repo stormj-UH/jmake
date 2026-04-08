@@ -3932,6 +3932,24 @@ impl MakeState {
                             eprintln!("{}:{}: {}: No such file or directory",
                                 pi_parent, pi_lineno, pi_file);
                         }
+                        if self.args.keep_going {
+                            // In -k mode: print error without ".  Stop.", add "Failed to
+                            // remake", then continue (but still return error at the end).
+                            let progname = make_progname();
+                            let clean = if msg.ends_with("  Stop.") {
+                                &msg[..msg.len() - "  Stop.".len()]
+                            } else {
+                                msg.as_str()
+                            };
+                            if !clean.is_empty() {
+                                eprintln!("{}: *** {}", progname, clean);
+                            }
+                            if !pi_parent.is_empty() {
+                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                    pi_parent, pi_lineno, pi_file);
+                            }
+                            return Err(String::new());
+                        }
                         return Err(msg.clone());
                     }
                 }
@@ -4020,14 +4038,23 @@ impl MakeState {
                                 // the "Failed to remake" in the error string so it follows
                                 // the "*** Error N" line in the output.
                                 // Without -k: just return the error, no "Failed to remake".
-                                let recipe_err_clone = recipe_err.clone();
-                                let failed_msg = if self.args.keep_going && !pi_parent.is_empty() {
-                                    format!("{}\n{}:{}: Failed to remake makefile '{}'.",
-                                        recipe_err_clone, pi_parent, pi_lineno, pi_file)
+                                let recipe_err_clean = if self.args.keep_going {
+                                    // In -k mode, strip ".  Stop." from the error
+                                    let e = recipe_err.trim_end_matches(".  Stop.").to_string();
+                                    // Print the error with *** prefix directly
+                                    let progname = std::env::args().next().unwrap_or_else(|| "make".into());
+                                    if !e.is_empty() {
+                                        eprintln!("{}: *** {}", progname, e);
+                                    }
+                                    if !pi_parent.is_empty() {
+                                        eprintln!("{}:{}: Failed to remake makefile '{}'.",
+                                            pi_parent, pi_lineno, pi_file);
+                                    }
+                                    return Err(String::new()); // Empty = already printed
                                 } else {
-                                    recipe_err_clone
+                                    recipe_err.clone()
                                 };
-                                return Err(failed_msg);
+                                return Err(recipe_err_clean);
                             }
                         }
                     }
