@@ -652,9 +652,10 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // GNU Make deletion order: for grouped multi-target pattern rules,
-        // siblings are listed in reverse target-list order. For non-grouped
-        // intermediates, list in build order.
+        // GNU Make deletion order: reverse of build order.
+        // Intermediates built last are deleted first. For grouped pattern targets,
+        // primary is pushed first, then siblings forward — reversing gives
+        // siblings before primary, matching GNU Make output.
         let to_delete: Vec<String> = self.intermediate_built.iter()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
@@ -3523,8 +3524,9 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            // Push siblings in reverse declaration order, then primary last.
-            // This gives GNU Make's deletion order: `rm a.15 a.1` for `%.1 %.15:`
+            // Push siblings in REVERSE declaration order, then primary last.
+            // Forward iteration gives: siblings (reverse) then primary.
+            //   push a.15 then a.1 → [a.15, a.1] → `rm a.15 a.1` ✓
             for sib in sib_intermediates.into_iter().rev() {
                 if !self.intermediate_built.contains(&sib) {
                     self.intermediate_built.push(sib);
