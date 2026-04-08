@@ -219,15 +219,18 @@ fn execute_job_oneshell(job: Job) -> JobResult {
     for (lineno, _orig, sub_lines) in &job.pre_expanded {
         last_lineno = *lineno;
         let expanded = sub_lines.join("\n");
-        if is_first {
+        // The first line's prefix chars (@, -, +) are ALWAYS stripped:
+        // GNU Make's start_job_command() strips them unconditionally from the start
+        // of the recipe text. Interior lines (2+) are stripped only for Bourne-
+        // compatible shells; for non-Bourne shells (perl, python, etc.) they pass
+        // verbatim because those chars may be valid syntax in the target language.
+        let cmd_line = if is_first {
             let (_d, ls, li, _f) = parse_recipe_prefix_standalone(&expanded);
             first_line_silent = ls;
             first_line_ignore = li;
             is_first = false;
-        }
-        // Strip @-+ prefixes only for Bourne-compatible shells.
-        // Non-Bourne shells (perl, python, etc.) receive lines as-is.
-        let cmd_line = if bourne_shell {
+            strip_recipe_prefixes_standalone(&expanded)
+        } else if bourne_shell {
             strip_recipe_prefixes_standalone(&expanded)
         } else {
             expanded
