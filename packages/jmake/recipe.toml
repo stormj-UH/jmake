@@ -1,7 +1,7 @@
 [package]
 name = "jmake"
 version = "0.1.0"
-license = "All rights reserved"
+license = "MIT"
 description = "Clean-room drop-in replacement for GNU Make, written in Rust"
 
 [source]
