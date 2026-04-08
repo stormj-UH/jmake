@@ -3727,9 +3727,10 @@ impl<'a> Executor<'a> {
                     if prereqs_ok {
                         pass1_candidates.push(((**rule).clone(), stem));
                         break; // Only take first matching pattern_target per rule
-                    } else if found_compat && compat_rule.is_none() && !rule.is_terminal {
-                        // Use as compat (last-resort) candidate. Terminal rules are NOT
-                        // used as compat candidates — they require prereqs to already exist.
+                    } else if found_compat && compat_rule.is_none() {
+                        // Use as compat (last-resort) candidate. Terminal rules CAN be
+                        // used as compat candidates when prereqs are explicitly mentioned
+                        // (GNU Make runs .DEFAULT for them).
                         compat_rule = Some(((**rule).clone(), stem.clone()));
                     }
                 }
