@@ -573,6 +573,40 @@ pub fn parse_args() -> MakeArgs {
     result
 }
 
+/// Split a MAKEFLAGS string into tokens, respecting backslash escaping.
+/// A backslash before any character escapes it: `\ ` means a literal space
+/// (not a word separator), `\\` means a literal backslash.
+/// The unescaped value of each token (with backslashes removed) is returned.
+fn split_makeflags_tokens(flags: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = flags.chars().peekable();
+    let mut in_token = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            // Escape: next character is literal (including spaces).
+            if let Some(next) = chars.next() {
+                current.push(next);
+                in_token = true;
+            }
+        } else if ch.is_ascii_whitespace() {
+            // Unescaped whitespace: end current token.
+            if in_token {
+                tokens.push(std::mem::take(&mut current));
+                in_token = false;
+            }
+        } else {
+            current.push(ch);
+            in_token = true;
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
 pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     // MAKEFLAGS format:
     //   - May start with single-letter flags bundled (no leading '-'), e.g. "erR"
@@ -582,20 +616,22 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     //
     // We tokenize and parse similarly to command-line args, but the first token
     // (if it doesn't start with '-') is treated as bundled single-char flags.
+    // IMPORTANT: backslash-escaping is respected: \<space> is a literal space,
+    // not a token separator (as in --eval=$(info\ eval)).
 
     let trimmed = flags.trim();
     if trimmed.is_empty() {
         return;
     }
 
-    // Split into tokens by whitespace but respect that "-I" args may be attached
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    // Split into tokens respecting backslash escaping.
+    let tokens: Vec<String> = split_makeflags_tokens(trimmed);
     let mut i = 0;
     let mut past_dashdash = false;
     let mut first_token = true;
 
     while i < tokens.len() {
-        let token = tokens[i];
+        let token: &str = &tokens[i];
 
         if past_dashdash && !token.starts_with('-') {
             // Variable assignment: NAME=value or NAME:=value etc.
@@ -663,6 +699,23 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                 _ if token.starts_with("--load-average=") => {
                     result.load_average = token[15..].parse().ok();
                 }
+                _ if token.starts_with("--eval=") => {
+                    // The token was already unescaped by split_makeflags_tokens
+                    // (backslash-escapes removed). But $$ → $ still needs handling
+                    // since quote_for_env doubles $ to $$ for MAKEFLAGS.
+                    let raw = &token[7..];
+                    let mut s = String::with_capacity(raw.len());
+                    let mut chars = raw.chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        if ch == '$' && chars.peek() == Some(&'$') {
+                            s.push('$');
+                            chars.next();
+                        } else {
+                            s.push(ch);
+                        }
+                    }
+                    result.eval_strings.push(s);
+                }
                 _ => {}
             }
             i += 1;
@@ -690,7 +743,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                             result.include_dirs.push(std::path::PathBuf::from(arg));
                         } else if i + 1 < tokens.len() {
                             i += 1;
-                            result.include_dirs.push(std::path::PathBuf::from(tokens[i]));
+                            result.include_dirs.push(std::path::PathBuf::from(&tokens[i]));
                         }
                         j = chars.len();
                         continue;
