@@ -31,19 +31,6 @@ The binary is at `target/release/jmake`. It can be used as a drop-in replacement
 ln -sf jmake /usr/local/bin/make
 ```
 
-## Real-World Package Builds
-
-Verified builds with jmake in the [jonerix](https://github.com/stormj-UH/jonerix) builder container:
-
-| Package | Status |
-|---------|--------|
-| Lua 5.4.7 | Full build + runs |
-| zlib 1.3.2 | Full build + tests pass |
-| pigz 2.8 | Full build + verified |
-| nginx 1.28.3 | Full build (with `-r`) |
-| hostapd 2.11 | All sources compile |
-| wpa_supplicant 2.11 | All sources compile |
-
 ## License
 
 Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
