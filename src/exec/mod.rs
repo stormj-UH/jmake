@@ -2639,6 +2639,18 @@ impl<'a> Executor<'a> {
                     if !virtual_prereqs.contains(prev) {
                         virtual_prereqs.push(prev.clone());
                     }
+                    // Also make each prerequisite of THIS rule depend on the previous
+                    // virtual node. This ensures prereqs of later double-colon rules
+                    // don't start until earlier rules complete (GNU Make behavior).
+                    if let Some(ref mut plans) = self.pending_plans {
+                        for p in &prereqs {
+                            if let Some(plan) = plans.get_mut(p.as_str()) {
+                                if !plan.prerequisites.contains(prev) {
+                                    plan.prerequisites.push(prev.clone());
+                                }
+                            }
+                        }
+                    }
                 }
                 let virtual_plan = parallel::TargetPlan {
                     target: virtual_key.clone(),
