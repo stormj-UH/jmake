@@ -904,13 +904,22 @@ impl MakeState {
             // GNU Make always tries to remake ALL three default makefile candidates
             // (GNUmakefile, makefile, Makefile), even if one was found and read.
             // Add all three as pending includes so they can be updated/created by rules.
-            for name in &candidates {
-                self.pending_includes.push(PendingInclude {
-                    file: name.to_string(),
-                    parent: String::new(),
-                    lineno: 0,
-                    ignore_missing: true,
-                });
+            // On case-insensitive filesystems (macOS), "makefile" and "Makefile" resolve
+            // to the same file.  Deduplicate by canonical path to avoid reading twice.
+            {
+                let mut seen_canonical = std::collections::HashSet::new();
+                for name in &candidates {
+                    let canonical = Path::new(name).canonicalize().ok();
+                    let dominated = canonical.as_ref().map_or(false, |c| !seen_canonical.insert(c.clone()));
+                    if !dominated {
+                        self.pending_includes.push(PendingInclude {
+                            file: name.to_string(),
+                            parent: String::new(),
+                            lineno: 0,
+                            ignore_missing: true,
+                        });
+                    }
+                }
             }
             found
         } else {
@@ -2881,7 +2890,16 @@ impl MakeState {
         // (and wasn't already set from the command line), remove all default built-in
         // variables now (they were registered at startup by register_default_variables).
         if self.args.no_builtin_variables && !self.cmdline_args.no_builtin_variables {
-            self.db.variables.retain(|_k, v| v.origin != VarOrigin::Default);
+            // Remove default built-in variables, but keep MAKEFLAGS/MAKEOVERRIDES/MAKE_RESTARTS
+            // and other make-internal variables that must survive -R.
+            let keep = ["MAKEFLAGS", "MAKEOVERRIDES", "MAKE_RESTARTS", "MAKELEVEL",
+                        "MAKECMDGOALS", "CURDIR", "MAKE", "MAKE_VERSION", ".SHELLFLAGS",
+                        "SHELL", ".FEATURES", ".DEFAULT_GOAL", ".INCLUDE_DIRS",
+                        "MAKE_COMMAND", ".RECIPEPREFIX", ".LOADED", "MAKEFILES",
+                        "SUFFIXES", ".LIBPATTERNS"];
+            self.db.variables.retain(|k, v| {
+                v.origin != VarOrigin::Default || keep.contains(&k.as_str())
+            });
         }
     }
 
