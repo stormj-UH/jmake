@@ -25,21 +25,14 @@ jobs:
       - name: Build and package with jpkg
         env:
           JPKG_SOURCE_DIR: ${{ github.workspace }}
-        run: jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
+        run: |
+          jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
+          jpkg install /tmp/jpkg-out/jmake-*.jpkg
 
       - name: Verify binary
         run: |
-          # Extract jmake from jpkg package for testing
-          cd /tmp/jpkg-out
-          # jpkg format: 8-byte magic + 4-byte header len + TOML header + zstd payload
-          # Extract the binary from the package using jpkg itself or test from build dir
-          JMAKE=$(find /tmp/jpkg-build-jmake-*/src/target/release -name jmake -type f 2>/dev/null | head -1)
-          if [ -z "$JMAKE" ]; then
-            echo "Binary not found in build dir, skipping verify"
-            exit 0
-          fi
           echo 'all:;@echo "jmake works"' > /tmp/test.mk
-          "$JMAKE" -f /tmp/test.mk
+          jmake -f /tmp/test.mk
 
       - name: Run GNU Make test suite
         id: tests
@@ -54,7 +47,7 @@ jobs:
             exit 0
           fi
           tar xzf make.tar.gz
-          MAKE_BIN=$(find /tmp/jpkg-build-jmake-*/src/target/release -name jmake -type f 2>/dev/null | head -1)
+          MAKE_BIN=$(which jmake)
           cd make-4.4.1/tests
 
           TOTAL_PASS=0
