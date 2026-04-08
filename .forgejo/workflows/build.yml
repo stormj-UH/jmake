@@ -20,11 +20,62 @@ jobs:
           ./target/release/jmake -f /tmp/test.mk
 
       - name: Run GNU Make test suite
+        id: tests
         run: |
           cd /tmp
           curl -sL https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz | tar xz
+          MAKE_BIN=$GITHUB_WORKSPACE/target/release/jmake
           cd make-4.4.1/tests
-          perl run_make_tests.pl -make $GITHUB_WORKSPACE/target/release/jmake 2>&1 | tail -5
+
+          # Run each category individually to avoid cascading 0/0 failures
+          TOTAL_PASS=0
+          TOTAL_FAIL=0
+          for cat in $(find scripts -mindepth 2 -maxdepth 2 -type f | sed 's|^scripts/||' | sort); do
+            rm -rf work
+            result=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+/[0-9]+ passed|Complete' | tail -1)
+            if echo "$result" | grep -q Complete; then
+              # Extract total from the "N Tests ... Complete" line
+              total=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+ Tests' | head -1 | grep -oE '[0-9]+')
+              TOTAL_PASS=$((TOTAL_PASS + ${total:-0}))
+            elif echo "$result" | grep -qE '[0-9]+/[0-9]+'; then
+              pass=$(echo "$result" | cut -d/ -f1)
+              total=$(echo "$result" | cut -d/ -f1 | sed 's/.*//' ; echo "$result" | cut -d/ -f2 | sed 's/ .*//')
+              total=$(echo "$result" | grep -oE '/[0-9]+' | sed 's|/||')
+              TOTAL_PASS=$((TOTAL_PASS + pass))
+              TOTAL_FAIL=$((TOTAL_FAIL + total - pass))
+            fi
+          done
+
+          TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
+          if [ "$TOTAL" -gt 0 ]; then
+            PCT=$((TOTAL_PASS * 1000 / TOTAL))
+            PCT_INT=$((PCT / 10))
+            PCT_DEC=$((PCT % 10))
+            BADGE="**GNU Make 4.4.1 test suite: ${TOTAL_PASS} / ${TOTAL} (${PCT_INT}.${PCT_DEC}%)**"
+          else
+            BADGE="**GNU Make 4.4.1 test suite: unknown**"
+          fi
+
+          echo "PASS=$TOTAL_PASS" >> $GITHUB_OUTPUT
+          echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
+          echo "BADGE=$BADGE" >> $GITHUB_OUTPUT
+          echo "$BADGE"
+
+      - name: Update README with test results
+        run: |
+          cd $GITHUB_WORKSPACE
+          BADGE="${{ steps.tests.outputs.BADGE }}"
+          if [ -n "$BADGE" ]; then
+            sed -i '/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
+              /<!-- test-badge-start -->/!{/<!-- test-badge-end -->/!d}
+              /<!-- test-badge-start -->/a\'"$BADGE"'
+            }' README.md
+            git config user.name "Forgejo CI"
+            git config user.email "ci@jonerix"
+            git add README.md
+            git diff --cached --quiet || git commit -m "CI: update test results in README [skip ci]"
+            git push || true
+          fi
 
       - name: Package jpkg
         run: |
@@ -33,7 +84,8 @@ jobs:
           ln -sf jmake /tmp/jpkg/bin/make
           llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
           cd /tmp/jpkg
-          tar czf /tmp/jmake-$(cat $GITHUB_WORKSPACE/Cargo.toml | grep '^version' | head -1 | sed 's/.*"\(.*\)"/\1/')-aarch64.tar.gz .
+          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          tar czf /tmp/jmake-${VERSION}-aarch64.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
