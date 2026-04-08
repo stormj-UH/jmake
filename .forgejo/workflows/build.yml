@@ -6,10 +6,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/stormj-uh/jonerix:builder-amd64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Build jmake
         run: cargo build --release
@@ -27,19 +30,16 @@ jobs:
           MAKE_BIN=$GITHUB_WORKSPACE/target/release/jmake
           cd make-4.4.1/tests
 
-          # Run each category individually to avoid cascading 0/0 failures
           TOTAL_PASS=0
           TOTAL_FAIL=0
           for cat in $(find scripts -mindepth 2 -maxdepth 2 -type f | sed 's|^scripts/||' | sort); do
             rm -rf work
             result=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+/[0-9]+ passed|Complete' | tail -1)
             if echo "$result" | grep -q Complete; then
-              # Extract total from the "N Tests ... Complete" line
               total=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+ Tests' | head -1 | grep -oE '[0-9]+')
               TOTAL_PASS=$((TOTAL_PASS + ${total:-0}))
             elif echo "$result" | grep -qE '[0-9]+/[0-9]+'; then
               pass=$(echo "$result" | cut -d/ -f1)
-              total=$(echo "$result" | cut -d/ -f1 | sed 's/.*//' ; echo "$result" | cut -d/ -f2 | sed 's/ .*//')
               total=$(echo "$result" | grep -oE '/[0-9]+' | sed 's|/||')
               TOTAL_PASS=$((TOTAL_PASS + pass))
               TOTAL_FAIL=$((TOTAL_FAIL + total - pass))
@@ -77,12 +77,12 @@ jobs:
             git push || true
           fi
 
-      - name: Package jpkg
+      - name: Package
         run: |
           mkdir -p /tmp/jpkg/bin
           cp target/release/jmake /tmp/jpkg/bin/jmake
           ln -sf jmake /tmp/jpkg/bin/make
-          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
+          strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
           cd /tmp/jpkg
           VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
