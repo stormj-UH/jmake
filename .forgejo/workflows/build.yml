@@ -6,14 +6,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    container:
+      image: ghcr.io/stormj-uh/jonerix:builder-amd64
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
+      - name: Checkout (manual)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          cd $GITHUB_WORKSPACE
+          curl -sL -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_SHA.tar.gz" | \
+            tar xz --strip-components=1
 
       - name: Build jmake
         run: cargo build --release
@@ -62,34 +63,12 @@ jobs:
           echo "BADGE=$BADGE" >> $GITHUB_OUTPUT
           echo "$BADGE"
 
-      - name: Update README with test results
-        run: |
-          cd $GITHUB_WORKSPACE
-          BADGE="${{ steps.tests.outputs.BADGE }}"
-          if [ -n "$BADGE" ]; then
-            sed -i '/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
-              /<!-- test-badge-start -->/!{/<!-- test-badge-end -->/!d}
-              /<!-- test-badge-start -->/a\'"$BADGE"'
-            }' README.md
-            git config user.name "Forgejo CI"
-            git config user.email "ci@jonerix"
-            git add README.md
-            git diff --cached --quiet || git commit -m "CI: update test results in README [skip ci]"
-            git push || true
-          fi
-
       - name: Package
         run: |
           mkdir -p /tmp/jpkg/bin
           cp target/release/jmake /tmp/jpkg/bin/jmake
           ln -sf jmake /tmp/jpkg/bin/make
-          strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
+          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || toybox true
           cd /tmp/jpkg
-          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | toybox head -1 | toybox sed 's/.*"\(.*\)"/\1/')
           tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: jmake-x86_64
-          path: /tmp/jmake-*-x86_64.tar.gz
