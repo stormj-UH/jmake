@@ -53,16 +53,29 @@ jobs:
             exit 0
           fi
           tar xzf make.tar.gz
+          cd make-4.4.1
+          ./configure --quiet 2>/dev/null || true
+
+          # Create a non-root user for testing. Some tests (e.g. temp_stdin)
+          # rely on filesystem permission checks that root bypasses.
+          adduser -D -h /tmp/testhome testuser 2>/dev/null || useradd -m -d /tmp/testhome testuser 2>/dev/null || true
+          chown -R testuser:testuser /tmp/make-4.4.1
+          # Make jmake binary readable/executable by testuser
+          chmod a+rx $(which jmake)
+
           MAKE_BIN=$(which jmake)
-          cd make-4.4.1/tests
+          cd tests
 
           TOTAL_PASS=0
           TOTAL_FAIL=0
           for cat in $(find scripts -type f | sed 's|^scripts/||' | sort); do
+            # Skip test_template (meta test, not a real make behavior test)
+            case "$cat" in test_template) continue;; esac
             rm -rf work
-            result=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+/[0-9]+ passed|Complete' | tail -1)
+            output=$(su testuser -c "cd /tmp/make-4.4.1/tests && perl run_make_tests.pl -make $MAKE_BIN $cat" 2>&1)
+            result=$(echo "$output" | grep -oE '[0-9]+/[0-9]+ passed|Complete' | tail -1)
             if echo "$result" | grep -q Complete; then
-              total=$(perl run_make_tests.pl -make "$MAKE_BIN" "$cat" 2>&1 | grep -oE '[0-9]+ Tests' | head -1 | grep -oE '[0-9]+')
+              total=$(echo "$output" | grep -oE '[0-9]+ Tests' | head -1 | grep -oE '[0-9]+')
               TOTAL_PASS=$((TOTAL_PASS + ${total:-0}))
             elif echo "$result" | grep -qE '[0-9]+/[0-9]+'; then
               pass=$(echo "$result" | cut -d/ -f1)
