@@ -23,6 +23,8 @@ jobs:
           ls Cargo.toml && echo "Checkout OK"
 
       - name: Build and package with jpkg
+        env:
+          JPKG_SOURCE_DIR: ${{ github.workspace }}
         run: jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
 
       - name: Verify binary
