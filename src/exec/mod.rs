@@ -673,34 +673,31 @@ impl<'a> Executor<'a> {
         // Re-reverse consecutive runs of siblings that are all prereqs of
         // the same explicit rule, restoring prerequisite order for those groups.
         {
+            // Find a rule that has BOTH files as prerequisites (shared parent).
+            let find_shared_parent = |a: &str, b: &str| -> bool {
+                for (_tgt, rules) in &self.db.rules {
+                    for rule in rules {
+                        let has_a = rule.prerequisites.iter().any(|p| p == a);
+                        let has_b = rule.prerequisites.iter().any(|p| p == b);
+                        if has_a && has_b { return true; }
+                    }
+                }
+                false
+            };
             let mut i = 0;
             while i < to_delete_raw.len() {
-                // Find the shared parent rule (if any) for to_delete_raw[i]
-                let find_parent = |file: &str| -> Option<String> {
-                    for (tgt, rules) in &self.db.rules {
-                        for rule in rules {
-                            if rule.prerequisites.iter().any(|p| p == file) {
-                                return Some(tgt.clone());
-                            }
-                        }
+                let start = i;
+                i += 1;
+                // Extend the run while consecutive entries share a parent with the first
+                while i < to_delete_raw.len() {
+                    if find_shared_parent(&to_delete_raw[start], &to_delete_raw[i]) {
+                        i += 1;
+                    } else {
+                        break;
                     }
-                    None
-                };
-                if let Some(parent) = find_parent(&to_delete_raw[i]) {
-                    let start = i;
-                    i += 1;
-                    while i < to_delete_raw.len() {
-                        if find_parent(&to_delete_raw[i]).as_ref() == Some(&parent) {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    if i - start > 1 {
-                        to_delete_raw[start..i].reverse();
-                    }
-                } else {
-                    i += 1;
+                }
+                if i - start > 1 {
+                    to_delete_raw[start..i].reverse();
                 }
             }
         }
