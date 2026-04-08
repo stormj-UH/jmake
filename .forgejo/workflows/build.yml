@@ -46,12 +46,31 @@ jobs:
         run: |
           set +e
           cd /tmp
-          echo "Downloading GNU Make 4.4.1 test suite..."
-          curl -sfL https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz -o make.tar.gz
-          if [ $? -ne 0 ]; then
-            echo "Failed to download test suite"
-            exit 0
+          EXPECTED_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
+
+          # Use vendored tarball (fallback: download from GNU FTP)
+          if [ -f "$GITHUB_WORKSPACE/tests/vendor/make-4.4.1.tar.gz" ]; then
+            echo "Using vendored GNU Make 4.4.1 test suite"
+            cp "$GITHUB_WORKSPACE/tests/vendor/make-4.4.1.tar.gz" make.tar.gz
+          else
+            echo "Downloading GNU Make 4.4.1 test suite..."
+            curl -sfL https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz -o make.tar.gz
+            if [ $? -ne 0 ]; then
+              echo "Failed to download test suite"
+              exit 0
+            fi
           fi
+
+          # Verify hash
+          ACTUAL_SHA256=$(sha256sum make.tar.gz 2>/dev/null | cut -d' ' -f1 || shasum -a 256 make.tar.gz | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "ERROR: SHA-256 mismatch!"
+            echo "  Expected: $EXPECTED_SHA256"
+            echo "  Actual:   $ACTUAL_SHA256"
+            exit 1
+          fi
+          echo "SHA-256 verified: $ACTUAL_SHA256"
+
           tar xzf make.tar.gz
           cd make-4.4.1
           # Create config-flags.pm directly (./configure needs bash, container has mksh)
