@@ -3466,12 +3466,22 @@ impl MakeState {
 
                 match built {
                     Ok(()) => {
-                        // If the file exists after the recipe ran, consider it rebuilt.
-                        // GNU Make re-execs whenever an included makefile's recipe ran
-                        // successfully, regardless of whether the mtime changed (e.g. a
-                        // future-timestamped file overwritten with current-time content).
-                        // Only skip re-exec if the file still doesn't exist (sv 61226).
-                        if mf_path.exists() {
+                        // Re-exec only if the included makefile was actually modified.
+                        // Compare mtime before and after the recipe to detect changes.
+                        // - File created (didn't exist before) → always re-exec.
+                        // - File mtime changed (either direction, to handle future-timestamped
+                        //   files overwritten with current-time content) → re-exec.
+                        // - File exists but mtime unchanged → recipe ran but didn't modify
+                        //   the file (e.g. `test -f $@ || echo >> $@` guard) → no re-exec.
+                        //   This prevents infinite loops (sv reinvoke F=b case).
+                        // - File still doesn't exist (sv 61226) → no re-exec, no error.
+                        let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
+                        let actually_updated = match (target_mtime, new_mtime) {
+                            (_, None) => false,              // file still doesn't exist
+                            (None, Some(_)) => true,         // file was created
+                            (Some(old_t), Some(new_t)) => new_t != old_t, // mtime changed
+                        };
+                        if actually_updated {
                             any_really_rebuilt = true;
                         }
                         // If file not updated/created (sv 61226): no re-exec, no error
