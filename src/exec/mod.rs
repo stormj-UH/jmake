@@ -652,9 +652,9 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // Collect in REVERSE build order: intermediates built last (closest to the final
-        // target) are deleted first, matching GNU Make's deletion output order.
-        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
+        // Collect in build order: intermediates built first are listed first in the
+        // rm command, matching GNU Make's deletion output order.
+        let to_delete: Vec<String> = self.intermediate_built.iter()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)

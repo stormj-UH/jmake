@@ -1564,6 +1564,19 @@ impl MakeState {
                     if rule.targets.iter().any(|t| t == ".POSIX") {
                         self.db.posix_mode = true;
                         parser.posix_mode = true;
+                        // POSIX mode sets specific default variable values,
+                        // but only if not already overridden by user/environment.
+                        let posix_defaults = [("CC", "c99"), ("CFLAGS", "-O1"), ("ARFLAGS", "-rv"), ("SCCSGETFLAGS", "-s")];
+                        for (name, val) in &posix_defaults {
+                            let should_set = match self.db.variables.get(*name) {
+                                None => true,
+                                Some(v) => v.origin == VarOrigin::Default,
+                            };
+                            if should_set {
+                                self.db.variables.insert(name.to_string(),
+                                    Variable::new(val.to_string(), VarFlavor::Simple, VarOrigin::Default));
+                            }
+                        }
                     }
 
                     // Eagerly update .DEFAULT_GOAL when the first valid target is seen.
@@ -2809,7 +2822,6 @@ impl MakeState {
         env::set_var("MAKEFLAGS", &new_makeflags);
 
         // Update .INCLUDE_DIRS to reflect current include_dirs
-        // GNU Make's .INCLUDE_DIRS shows the effective include path (excluding special "-" entry)
         let include_dirs_str: String = self.args.include_dirs.iter()
             .filter(|d| d.to_string_lossy() != "-")
             .map(|d| d.to_string_lossy().to_string())
@@ -2818,8 +2830,8 @@ impl MakeState {
         self.db.variables.insert(".INCLUDE_DIRS".into(),
             Variable::new(include_dirs_str, VarFlavor::Simple, VarOrigin::Default));
 
-        // GNU Make: -R (no_builtin_variables) implies -r (no_builtin_rules).
-        // Apply this implication here so the subsequent -r and -R blocks both trigger.
+        // GNU Make: -R implies -r. Apply AFTER MAKEFLAGS rebuild (so parse-time
+        // $(info $(MAKEFLAGS)) shows just R) but before builtin removal check.
         if self.args.no_builtin_variables {
             self.args.no_builtin_rules = true;
         }
