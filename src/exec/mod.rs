@@ -49,6 +49,8 @@ pub struct Executor<'a> {
     /// Intermediate targets that were actually built this run (candidates for deletion).
     /// Stored as Vec to maintain insertion order (for consistent rm output).
     intermediate_built: Vec<String>,
+    /// Maps intermediate target → its parent target (for deletion order).
+    intermediate_parent: HashMap<String, String>,
     /// Top-level targets (not subject to intermediate deletion even if .INTERMEDIATE).
     top_level_targets: HashSet<String>,
     /// Targets/files marked as "infinitely new" via -W/--what-if.
@@ -172,6 +174,7 @@ impl<'a> Executor<'a> {
             any_recipe_ran: false,
             grouped_covered: HashSet::new(),
             intermediate_built: Vec::new(),
+            intermediate_parent: HashMap::new(),
             top_level_targets: HashSet::new(),
             what_if,
             inherited_vars_stack: Vec::new(),
@@ -652,11 +655,12 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // GNU Make deletion order: reverse of build order (chain intermediates
-        // closest to final target are deleted first). Grouped pattern siblings
-        // are pushed primary-first then siblings-forward, so reversing gives
-        // siblings before primary.
-        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
+        // GNU Make deletion order: reverse of build order, BUT same-parent
+        // sibling prereqs stay in forward (prerequisite) order.
+        // Strategy: reverse the list, then within each consecutive run of
+        // entries that are all prereqs of the same explicit rule, re-reverse
+        // to restore forward prereq order.
+        let mut to_delete_raw: Vec<String> = self.intermediate_built.iter().rev()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -666,6 +670,41 @@ impl<'a> Executor<'a> {
             })
             .cloned()
             .collect();
+        // Re-reverse consecutive runs of siblings that are all prereqs of
+        // the same explicit rule, restoring prerequisite order for those groups.
+        {
+            let mut i = 0;
+            while i < to_delete_raw.len() {
+                // Find the shared parent rule (if any) for to_delete_raw[i]
+                let find_parent = |file: &str| -> Option<String> {
+                    for (tgt, rules) in &self.db.rules {
+                        for rule in rules {
+                            if rule.prerequisites.iter().any(|p| p == file) {
+                                return Some(tgt.clone());
+                            }
+                        }
+                    }
+                    None
+                };
+                if let Some(parent) = find_parent(&to_delete_raw[i]) {
+                    let start = i;
+                    i += 1;
+                    while i < to_delete_raw.len() {
+                        if find_parent(&to_delete_raw[i]).as_ref() == Some(&parent) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if i - start > 1 {
+                        to_delete_raw[start..i].reverse();
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let to_delete = to_delete_raw;
         // Collect files that actually exist and need to be deleted.
         // Exclude files that also exist in VPATH: these were "promoted" from VPATH to a
         // local copy (VPATH+ rename behavior) and should not be deleted.
