@@ -193,9 +193,22 @@ pub fn execute_job(job: Job) -> JobResult {
     execute_job_normal(job)
 }
 
+/// Check if the given shell path is a Bourne-compatible shell.
+/// For non-Bourne shells (perl, python, etc.) in .ONESHELL mode,
+/// recipe prefix chars (@, -, +) must NOT be stripped.
+fn is_bourne_compatible_shell_standalone(shell: &str) -> bool {
+    const UNIX_SHELLS: &[&str] = &["sh", "bash", "dash", "ksh", "rksh", "zsh", "ash"];
+    let basename = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    UNIX_SHELLS.contains(&basename)
+}
+
 fn execute_job_oneshell(job: Job) -> JobResult {
     let target = job.target.clone();
     let is_silent_target = job.is_silent_target;
+    let bourne_shell = is_bourne_compatible_shell_standalone(&job.shell);
 
     let mut script = String::new();
     let mut first_line_silent = false;
@@ -212,7 +225,13 @@ fn execute_job_oneshell(job: Job) -> JobResult {
             first_line_ignore = li;
             is_first = false;
         }
-        let cmd_line = strip_recipe_prefixes_standalone(&expanded);
+        // Strip @-+ prefixes only for Bourne-compatible shells.
+        // Non-Bourne shells (perl, python, etc.) receive lines as-is.
+        let cmd_line = if bourne_shell {
+            strip_recipe_prefixes_standalone(&expanded)
+        } else {
+            expanded
+        };
         script.push_str(&cmd_line);
         script.push('\n');
     }

@@ -1493,7 +1493,11 @@ pub fn split_filenames(s: &str) -> Vec<String> {
                     continue;
                 }
                 b'\\' => {
-                    // Escaped backslash: `\\` → `\`
+                    // Double backslash: keep both characters verbatim.
+                    // GNU Make does not collapse `\\` → `\` in file names;
+                    // `\\` is stored as two backslashes so that `$(info $@)` etc.
+                    // print the literal `\\` that appeared in the makefile.
+                    current.push('\\');
                     current.push('\\');
                     i += 2;
                     continue;
