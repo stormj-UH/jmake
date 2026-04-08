@@ -2818,6 +2818,12 @@ impl MakeState {
         self.db.variables.insert(".INCLUDE_DIRS".into(),
             Variable::new(include_dirs_str, VarFlavor::Simple, VarOrigin::Default));
 
+        // GNU Make: -R (no_builtin_variables) implies -r (no_builtin_rules).
+        // Apply this implication here so the subsequent -r and -R blocks both trigger.
+        if self.args.no_builtin_variables {
+            self.args.no_builtin_rules = true;
+        }
+
         // If -r (no_builtin_rules) was activated via MAKEFLAGS inside the makefile,
         // remove the built-in pattern rules now (they were loaded at startup).
         if self.args.no_builtin_rules {
@@ -2934,7 +2940,13 @@ impl MakeState {
                                 // Continue building siblings even on error.
                             }
                         }
-                        if !rule.recipe.is_empty() {
+                        // Skip running the recipe if it was already queued or run
+                        // as a pending include (Phase A sets include_recipe_ran when
+                        // it schedules the file for Phase B, before Phase B actually
+                        // creates the file on disk).
+                        if !rule.recipe.is_empty()
+                            && !self.include_recipe_ran.contains(prereq.as_str())
+                        {
                             let src = rule.source_file.clone();
                             if let Err(e) = self.run_include_recipe(
                                 prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
