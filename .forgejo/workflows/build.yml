@@ -86,6 +86,7 @@ jobs:
               total=$(echo "$result" | grep -oE '/[0-9]+' | sed 's|/||')
               TOTAL_PASS=$((TOTAL_PASS + pass))
               TOTAL_FAIL=$((TOTAL_FAIL + total - pass))
+              echo "FAIL: $cat - $result"
             fi
           done
 
