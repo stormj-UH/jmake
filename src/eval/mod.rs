@@ -522,6 +522,29 @@ impl MakeState {
             Variable::new("/bin/sh".into(), VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".SHELLFLAGS".into(),
             Variable::new("-c".into(), VarFlavor::Simple, VarOrigin::Default));
+        // Build $(-*-eval-flags-*-) from --eval strings (used in MAKEFLAGS expansion).
+        // Each eval string is quoted: $ → $$, spaces/backslashes → \<char>.
+        // GNU Make stores them as "--eval=quoted_string [--eval=quoted_string ...]".
+        {
+            fn quote_for_env(s: &str) -> String {
+                let mut out = String::with_capacity(s.len() * 2);
+                for ch in s.chars() {
+                    if ch == '$' {
+                        out.push('$');
+                    } else if ch == ' ' || ch == '\t' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out
+            }
+            let eval_flags: String = self.args.eval_strings.iter()
+                .map(|s| format!("--eval={}", quote_for_env(s)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.db.variables.insert("-*-eval-flags-*-".into(),
+                Variable::new(eval_flags, VarFlavor::Simple, VarOrigin::Default));
+        }
         {
             let mf = self.build_makeflags();
             // Also update the process environment so $(shell echo "$MAKEFLAGS") reflects
@@ -729,6 +752,13 @@ impl MakeState {
         if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
         if self.args.no_silent { long_parts.push("--no-silent".to_string()); }
         if self.args.warn_undefined_variables { long_parts.push("--warn-undefined-variables".to_string()); }
+
+        // --eval=... strings are appended via the $(-*-eval-flags-*-) reference.
+        // Build that reference if we have eval strings.
+        // GNU Make quotes each eval string: $ → $$, spaces/backslashes → \<char>
+        if !self.args.eval_strings.is_empty() {
+            long_parts.push("$(-*-eval-flags-*-)".to_string());
+        }
 
         // Build the main flags portion
         let has_single = !single_flags.is_empty();
