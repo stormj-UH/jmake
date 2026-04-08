@@ -82,18 +82,20 @@ jobs:
           TOKEN: ${{ secrets.REPO_TOKEN }}
           SERVER: ${{ github.server_url }}
           REPO: ${{ github.repository }}
+          BADGE: ${{ steps.tests.outputs.BADGE }}
         run: |
-          BADGE="${{ steps.tests.outputs.BADGE }}"
           if [ -z "$BADGE" ]; then
             echo "No test results, skipping README update"
             exit 0
           fi
-          sed -i "/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
-            /<!-- test-badge-start -->/!{/<!-- test-badge-end -->/!d}
-            /<!-- test-badge-start -->/a\\
-${BADGE}
-          }" README.md
+          # Replace badge line between markers
+          awk -v badge="$BADGE" '
+            /<!-- test-badge-start -->/{print; print badge; skip=1; next}
+            /<!-- test-badge-end -->/{skip=0}
+            !skip{print}
+          ' README.md > README.tmp && mv README.tmp README.md
           echo "Updated badge to: $BADGE"
+          # Push via API
           CONTENT=$(base64 < README.md | tr -d '\n')
           SHA=$(curl -s -H "Authorization: token ${TOKEN}" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" | \
