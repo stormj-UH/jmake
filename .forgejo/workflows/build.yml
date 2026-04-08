@@ -22,10 +22,28 @@ jobs:
             tar xz --strip-components=1
           ls Cargo.toml && echo "Checkout OK"
 
+      - name: Debug environment
+        run: |
+          echo "=== which cc ==="
+          which cc || echo "cc not found"
+          cc --version 2>&1 || true
+          echo "=== which clang ==="
+          which clang || echo "clang not found"
+          echo "=== PATH ==="
+          echo "$PATH"
+          echo "=== rustc sysroot ==="
+          rustc --print sysroot
+          echo "=== rustc host ==="
+          rustc -vV | grep host
+          echo "=== self-contained dir ==="
+          ls $(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/ 2>/dev/null || echo "no self-contained dir"
+          echo "=== full env ==="
+          env | sort
+
       - name: Build jmake
         env:
           CC: clang
-          RUSTFLAGS: "-C linker=clang"
+          RUSTFLAGS: "-C linker=clang -C link-self-contained=yes"
         run: cargo build --release
 
       - name: Verify binary
