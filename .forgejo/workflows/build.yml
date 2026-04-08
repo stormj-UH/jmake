@@ -5,9 +5,9 @@ on:
 
 jobs:
   build:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
-      image: jonerix:builder-arm64
+      image: ghcr.io/stormj-uh/jonerix:builder-arm64
     steps:
       - uses: actions/checkout@v4
 
