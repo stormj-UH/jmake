@@ -5231,8 +5231,11 @@ impl<'a> Executor<'a> {
                     };
                     // GNU Make: when a recipe line has the `-` (ignore error) prefix
                     // and .POSIX mode added `-e` to .SHELLFLAGS (not user-set), strip it.
-                    // Check if .SHELLFLAGS was set by POSIX mode (origin=Default).
+                    // Only strip if: POSIX mode set -ec as default AND no target-specific
+                    // or user override of .SHELLFLAGS is in effect.
+                    let has_target_specific_sf = auto_vars.contains_key(".SHELLFLAGS");
                     let posix_added_e = self.db.posix_mode
+                        && !has_target_specific_sf
                         && self.db.variables.get(".SHELLFLAGS")
                             .map_or(false, |v| v.origin == crate::types::VarOrigin::Default);
                     if effective_ignore && posix_added_e && base.contains("-e") {
