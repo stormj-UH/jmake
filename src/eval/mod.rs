@@ -400,7 +400,7 @@ impl MakeState {
         // Apply this implication after all makefiles are read (so it doesn't affect
         // parse-time $(info $(MAKEFLAGS)) calls) but before building targets (so it
         // does affect recipe-time $(info $(MAKEFLAGS))).
-        if self.args.no_builtin_variables && !self.args.no_builtin_rules {
+        if self.args.no_builtin_variables {
             self.args.no_builtin_rules = true;
             // Rebuild MAKEFLAGS so the recipe-level $(info $(MAKEFLAGS)) includes 'r'.
             let new_makeflags = self.build_makeflags();
