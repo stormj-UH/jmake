@@ -635,12 +635,31 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
 
         if past_dashdash && !token.starts_with('-') {
             // Variable assignment: NAME=value or NAME:=value etc.
-            // Add to variables so they're included in MAKEFLAGS output
-            // and applied as command-line-level overrides in sub-makes.
             if let Some(eq_pos) = token.find('=') {
                 let name = token[..eq_pos].to_string();
                 let value = token[eq_pos+1..].to_string();
                 result.variables.push((name, value));
+            } else {
+                // Bare token after -- with no '=': treat as bundled single-char flags.
+                // This handles `MAKEFLAGS += R` which appends 'R' after '--'.
+                for ch in token.chars() {
+                    match ch {
+                        'B' => result.always_make = true,
+                        'e' => result.environment_overrides = true,
+                        'i' => result.ignore_errors = true,
+                        'k' => { result.keep_going = true; result.keep_going_explicit = true; }
+                        'n' => { result.dry_run = true; result.just_print = true; }
+                        'q' => result.question = true,
+                        'r' => result.no_builtin_rules = true,
+                        'R' => result.no_builtin_variables = true,
+                        's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; }
+                        'S' => { result.keep_going = false; result.no_keep_going_explicit = true; }
+                        't' => result.touch = true,
+                        'w' => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; }
+                        'L' => result.check_symlink_times = true,
+                        _ => {}
+                    }
+                }
             }
             i += 1;
             continue;
