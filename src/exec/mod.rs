@@ -3937,30 +3937,25 @@ impl<'a> Executor<'a> {
     }
 
     /// Search for a library named `name` (from a `-lname` prerequisite).
-    /// GNU Make searches for `libname.a` and `libname.so` in:
-    ///   1. Each directory in vpath patterns that match `libname.a` or `libname.so`
-    ///   2. The vpath_general directories
-    ///   3. The VPATH variable directories
-    ///   4. The current directory (last resort)
-    /// Prefers `.a` over `.so` (static linking preferred, matching GNU Make behavior).
+    /// Uses `.LIBPATTERNS` to determine what filenames to look for, then searches
+    /// in VPATH directories and the current directory.
     /// Returns the path to the found library if found.
     fn find_library(&self, name: &str) -> Option<String> {
-        let lib_a = format!("lib{}.a", name);
-        let lib_so = format!("lib{}.so", name);
-
         // Collect all VPATH directories to search.
-        // We search for .a first, then .so in each directory.
         let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
 
-        // From named vpath patterns that match .a files
+        // From named vpath patterns
         for (pattern, dirs) in &self.db.vpath {
-            if vpath_pattern_matches(pattern, &lib_a) || vpath_pattern_matches(pattern, &lib_so)
-                || pattern == "%" || pattern == "*"
-            {
-                for dir in dirs {
-                    if !search_dirs.contains(dir) {
-                        search_dirs.push(dir.clone());
+            for candidate_name in &[format!("lib{}.a", name), format!("lib{}.so", name)] {
+                if vpath_pattern_matches(pattern, candidate_name)
+                    || pattern == "%" || pattern == "*"
+                {
+                    for dir in dirs {
+                        if !search_dirs.contains(dir) {
+                            search_dirs.push(dir.clone());
+                        }
                     }
+                    break;
                 }
             }
         }
@@ -3986,27 +3981,36 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Search order (GNU Make compatibility):
-        //   1. CWD for .a (CWD static library wins over any VPATH shared library)
-        //   2. VPATH dirs for .a
-        //   3. CWD for .so
-        //   4. VPATH dirs for .so
-        if Path::new(&lib_a).exists() {
-            return Some(lib_a);
-        }
-        for dir in &search_dirs {
-            let candidate_a = dir.join(&lib_a);
-            if candidate_a.exists() {
-                return Some(candidate_a.to_string_lossy().to_string());
+        // Get .LIBPATTERNS; fall back to default if not set.
+        let lib_patterns_val = if let Some(var) = self.db.variables.get(".LIBPATTERNS") {
+            self.state.expand(&var.value)
+        } else {
+            "lib%.so lib%.a".to_string()
+        };
+
+        // For each pattern in .LIBPATTERNS (in order), apply it to get the
+        // candidate filename, then search in current dir and VPATH dirs.
+        // GNU Make returns the first found match (earliest in .LIBPATTERNS order).
+        for pattern in lib_patterns_val.split_ascii_whitespace() {
+            // Pattern must contain '%'; if not, emit warning and skip.
+            if !pattern.contains('%') {
+                eprintln!("{}: .LIBPATTERNS element '{}' is not a pattern",
+                    self.progname, pattern);
+                continue;
             }
-        }
-        if Path::new(&lib_so).exists() {
-            return Some(lib_so);
-        }
-        for dir in &search_dirs {
-            let candidate_so = dir.join(&lib_so);
-            if candidate_so.exists() {
-                return Some(candidate_so.to_string_lossy().to_string());
+            // Replace '%' with the library name.
+            let candidate = pattern.replace('%', name);
+
+            // Search current directory first.
+            if Path::new(&candidate).exists() {
+                return Some(candidate);
+            }
+            // Then VPATH directories.
+            for dir in &search_dirs {
+                let full = dir.join(&candidate);
+                if full.exists() {
+                    return Some(full.to_string_lossy().to_string());
+                }
             }
         }
 
