@@ -11,6 +11,7 @@ jobs:
     steps:
       - name: Checkout
         run: |
+          cd $GITHUB_WORKSPACE
           curl -sL -H "Authorization: token ${{ github.token }}" \
             "${{ github.server_url }}/${{ github.repository }}/archive/${{ github.sha }}.tar.gz" | \
             tar xz --strip-components=1
