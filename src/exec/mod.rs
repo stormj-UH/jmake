@@ -5183,11 +5183,13 @@ impl<'a> Executor<'a> {
                 child.arg(script.trim_end_matches('\n'));
                 child.env("MAKELEVEL", self.get_makelevel());
                 self.setup_exports(&mut child);
-                let status = child.status();
+                // Use run_cmd_with_error_handling to filter shell exec error messages
+                // (e.g. "/bin/sh: cmd: No such file or directory") the same way
+                // multi-line recipes do.
+                let child_status = run_cmd_with_error_handling(child, &script, &self.progname);
 
-                match status {
-                    Ok(s) if !s.success() => {
-                        let code = s.code().unwrap_or(1);
+                match child_status {
+                    Ok(code) if code != 0 => {
                         if effective_ignore {
                             let loc = make_location(source_file, last_lineno);
                             eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
@@ -6624,7 +6626,9 @@ fn run_cmd_with_error_handling(
             || line.ends_with(": not found")
             || line.ends_with(": command not found")
             || line.contains(": can't execute: ")
+            || (line.ends_with(": No such file or directory") && !line.starts_with("jmake:"))
             || (line.ends_with(": Permission denied") && !line.starts_with("jmake:"))
+            || (line.ends_with(": is a directory") && !line.starts_with("jmake:"))
             || (line.ends_with(": Is a directory") && !line.starts_with("jmake:"));
         if !is_shell_exec_error {
             eprintln!("{}", line);
