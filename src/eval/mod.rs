@@ -4039,10 +4039,13 @@ impl MakeState {
                                 // the "*** Error N" line in the output.
                                 // Without -k: just return the error, no "Failed to remake".
                                 let recipe_err_clean = if self.args.keep_going {
-                                    // In -k mode, strip ".  Stop." from the error
-                                    let e = recipe_err.trim_end_matches(".  Stop.").to_string();
-                                    // Print the error with *** prefix directly
-                                    let progname = std::env::args().next().unwrap_or_else(|| "make".into());
+                                    // In -k mode: print error directly, add "Failed to remake"
+                                    let e = if recipe_err.ends_with("  Stop.") {
+                                        recipe_err[..recipe_err.len() - "  Stop.".len()].to_string()
+                                    } else {
+                                        recipe_err.to_string()
+                                    };
+                                    let progname = make_progname();
                                     if !e.is_empty() {
                                         eprintln!("{}: *** {}", progname, e);
                                     }
