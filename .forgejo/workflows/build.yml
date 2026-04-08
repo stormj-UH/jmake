@@ -27,7 +27,13 @@ jobs:
           JPKG_SOURCE_DIR: ${{ github.workspace }}
         run: |
           jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
-          jpkg install /tmp/jpkg-out/jmake-*.jpkg
+          # Extract binary from jpkg (magic:8 + hdrlen:4 + header + zstd tar)
+          PKG=$(ls /tmp/jpkg-out/jmake-*.jpkg)
+          HDRLEN=$(dd if="$PKG" bs=1 skip=8 count=4 2>/dev/null | python3 -c "import sys; d=sys.stdin.buffer.read(); print(int.from_bytes(d,'little'))")
+          SKIP=$((12 + HDRLEN))
+          dd if="$PKG" bs=1 skip=$SKIP 2>/dev/null | zstdcat | tar x -C /
+          echo "Installed jmake from jpkg"
+          ls -la /bin/jmake
 
       - name: Verify binary
         run: |
