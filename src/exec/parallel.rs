@@ -413,9 +413,19 @@ fn execute_job_normal(job: Job) -> JobResult {
 // Parallel scheduler
 // ---------------------------------------------------------------------------
 
+/// Read the system 1-minute load average from /proc/loadavg (Linux).
+/// Returns None if the file can't be read or parsed.
+fn read_load_average() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/loadavg").ok()?;
+    s.split_ascii_whitespace().next()?.parse().ok()
+}
+
 /// The parallel build scheduler.  Runs on the main thread.
 pub struct ParallelScheduler {
     max_jobs: usize,
+    /// Maximum load average: if set, don't start new jobs if load >= this value
+    /// AND at least one job is already running (GNU Make -l behavior).
+    max_load: Option<f64>,
     /// All target plans, keyed by target name.
     plans: HashMap<String, TargetPlan>,
     /// Current execution state of each target.
@@ -451,6 +461,7 @@ pub struct ParallelScheduler {
 impl ParallelScheduler {
     pub fn new(
         max_jobs: usize,
+        max_load: Option<f64>,
         mut plans: HashMap<String, TargetPlan>,
         job_tx: mpsc::Sender<Job>,
         result_rx: mpsc::Receiver<JobResult>,
@@ -667,6 +678,7 @@ impl ParallelScheduler {
 
         ParallelScheduler {
             max_jobs,
+            max_load,
             plans,
             states,
             prereqs_of,
@@ -1000,7 +1012,24 @@ impl ParallelScheduler {
     }
 
     pub fn should_launch(&self) -> bool {
-        !self.draining && self.running_count < self.max_jobs && !self.ready_queue.is_empty()
+        if self.draining || self.ready_queue.is_empty() {
+            return false;
+        }
+        if self.running_count >= self.max_jobs {
+            return false;
+        }
+        // Respect -l (max load average): if at least one job is already running
+        // and the system load is at or above the limit, don't start new jobs.
+        if let Some(max_load) = self.max_load {
+            if self.running_count >= 1 {
+                if let Some(current_load) = read_load_average() {
+                    if current_load >= max_load {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub fn pop_ready(&mut self) -> Option<String> {

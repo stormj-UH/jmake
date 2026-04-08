@@ -442,6 +442,7 @@ impl MakeState {
             &self.db,
             self,
             self.args.jobs,
+            self.args.load_average,
             self.args.keep_going,
             self.args.dry_run,
             self.args.touch,
