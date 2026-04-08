@@ -78,3 +78,4 @@ jobs:
           cd /tmp/jpkg
           VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
+# v2
