@@ -3643,6 +3643,8 @@ impl MakeState {
             /// Source file and line for the rule (for the peer warning message).
             rule_source_file: String,
             rule_lineno: usize,
+            /// File mtime before recipe ran (for detecting actual changes).
+            pre_mtime: Option<std::time::SystemTime>,
         }
 
         let pending = std::mem::take(&mut self.pending_includes);
@@ -3669,7 +3671,7 @@ impl MakeState {
                     deferred_no_such_file: false,
                     also_make_siblings: Vec::new(),
                     rule_source_file: String::new(),
-                    rule_lineno: 0,
+                    rule_lineno: 0, pre_mtime: None,
                 });
                 continue;
             }
@@ -3696,7 +3698,7 @@ impl MakeState {
                     deferred_no_such_file: !pi.ignore_missing,
                     also_make_siblings: Vec::new(),
                     rule_source_file: String::new(),
-                    rule_lineno: 0,
+                    rule_lineno: 0, pre_mtime: None,
                 });
                 continue;
             }
@@ -3812,6 +3814,7 @@ impl MakeState {
                 also_make_siblings: also_make_siblings_for_work,
                 rule_source_file: rule_source_file_for_work,
                 rule_lineno: rule_lineno_for_work,
+                pre_mtime: file_path_buf.metadata().ok().and_then(|m| m.modified().ok()),
             });
         }
 
@@ -4000,11 +4003,26 @@ impl MakeState {
                     match result {
                         Ok(()) => {
                             if file_path.exists() {
-                                // Do NOT read the rebuilt file here: we are about to re-exec
-                                // and the re-exec'd process will read it with the updated content.
-                                // Reading it now would cause $(info) and similar side-effect
-                                // directives in the rebuilt file to fire twice.
-                                any_really_rebuilt = true;
+                                // Check if the file was actually modified by the recipe.
+                                // If mtime is unchanged, the recipe ran but didn't modify
+                                // the file (e.g., `@echo force $@`). No re-exec needed.
+                                let post_mtime = file_path.metadata().ok().and_then(|m| m.modified().ok());
+                                let pre = work_items_vec[i].pre_mtime;
+                                let actually_changed = match (pre, post_mtime) {
+                                    (Some(old), Some(new)) => new != old,
+                                    (None, Some(_)) => true,  // file created
+                                    _ => false,
+                                };
+                                if !actually_changed {
+                                    // Recipe ran but file unchanged — don't re-exec.
+                                    // Still read it if not already read.
+                                    let already_read = self.makefile_list.iter().any(|p| p == &file_path);
+                                    if !already_read {
+                                        let _ = self.read_makefile(file_path.as_path());
+                                    }
+                                } else {
+                                    any_really_rebuilt = true;
+                                }
                                 // Emit peer-target warning if siblings weren't created.
                                 // This mirrors the warning in build_with_pattern_rule for
                                 // the include-rebuild path (e.g. `include gta` with `%a %b: ...`).
