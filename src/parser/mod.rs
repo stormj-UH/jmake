@@ -1006,6 +1006,38 @@ fn find_bare_colon(s: &str) -> Option<usize> {
 /// In GNU Make, `\%` in a target name or static pattern rule target list
 /// represents a literal `%` character.  This function converts stored
 /// `\%` sequences back to plain `%` so the target can be looked up in the
+/// Unescape backslash sequences in target/prerequisite names.
+/// `\:` → `:` (escaped colon becomes literal colon)
+/// `\\` → `\` (escaped backslash becomes literal backslash)
+/// `\#` → `#` (escaped hash becomes literal hash)
+/// `\ ` → ` ` (escaped space becomes literal space)
+pub fn unescape_target_name(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b':' | b'#' | b'\\' | b' ' => {
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                _ => {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 /// rule database by its canonical (unescaped) name.
 pub fn unescape_percent_in_target(s: &str) -> String {
     if !s.contains("\\%") {
@@ -1493,12 +1525,21 @@ pub fn split_filenames(s: &str) -> Vec<String> {
                     continue;
                 }
                 b'\\' => {
-                    // Double backslash: keep both characters verbatim.
-                    // GNU Make does not collapse `\\` → `\` in file names;
-                    // `\\` is stored as two backslashes so that `$(info $@)` etc.
-                    // print the literal `\\` that appeared in the makefile.
-                    current.push('\\');
-                    current.push('\\');
+                    // Double backslash: collapse to single backslash ONLY if
+                    // a third char follows that is a special escape char (: # \ space).
+                    // `\\:` → `\:` (then next iteration: `\:` → `:` ... no wait, we
+                    //          already consumed both `\`s; the `:` will be next char)
+                    // Actually: `\\\:` in source is `\\` then `\:`.
+                    // We need: `\\` before a special char → collapse to `\`.
+                    // `\\` before non-special → keep both.
+                    if i + 2 < bytes.len() && matches!(bytes[i + 2], b':' | b'#' | b'\\' | b' ' | b'\t') {
+                        // Collapse: the `\\` is escaping the backslash before a special char
+                        current.push('\\');
+                    } else {
+                        // Keep both backslashes (e.g., `\\_` stays as `\\_`)
+                        current.push('\\');
+                        current.push('\\');
+                    }
                     i += 2;
                     continue;
                 }
