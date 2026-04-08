@@ -924,6 +924,18 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // GPATH check: if target is found via VPATH in a GPATH directory,
+        // treat it as already existing (don't try pattern rules).
+        // GPATH files are authoritative — no local rebuild needed.
+        if let Some(ref vp) = self.find_in_vpath(target) {
+            if self.is_in_gpath(vp) {
+                if self.collect_plans_mode {
+                    self.record_leaf_plan(target, is_phony);
+                }
+                return Ok(false);
+            }
+        }
+
         // Try pattern rules
         if let Some((pattern_rule, stem)) = self.find_pattern_rule(target) {
             return self.build_with_pattern_rule(target, &pattern_rule, &stem, is_phony);
@@ -3968,7 +3980,8 @@ impl<'a> Executor<'a> {
     /// GPATH directories cause VPATH-found files to be treated as local.
     fn is_gpath_dir(&self, dir: &str) -> bool {
         if let Some(var) = self.db.variables.get("GPATH") {
-            let gpath = &var.value;
+            // Expand the GPATH value (it may contain variable references like $(VPATH))
+            let gpath = &self.state.expand(&var.value);
             if gpath.is_empty() { return false; }
             for gdir in gpath.split(|c: char| c == ':' || c == ' ' || c == '\t') {
                 let gdir = gdir.trim();
@@ -4515,7 +4528,17 @@ impl<'a> Executor<'a> {
         if depth > 10 { return None; }
         // If target exists, use its actual mtime — but check if what-if or rule prereqs
         // would cause a rebuild; if so, treat this target as infinitely new.
-        if let Some(t) = self.file_mtime(target).or_else(|| self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))) {
+        // With GPATH: prefer VPATH location for timestamp (GPATH files are authoritative)
+        let target_mtime = if let Some(vp) = self.find_in_vpath(target) {
+            if self.is_in_gpath(&vp) {
+                self.file_mtime(&vp)
+            } else {
+                self.file_mtime(target).or_else(|| self.file_mtime(&vp))
+            }
+        } else {
+            self.file_mtime(target)
+        };
+        if let Some(t) = target_mtime {
             // Check explicit rules for this target
             if let Some(rules) = self.db.rules.get(target) {
                 for rule in rules {
