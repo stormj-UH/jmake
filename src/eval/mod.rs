@@ -84,6 +84,8 @@ pub struct MakeState {
     pub in_recipe_execution: RefCell<bool>,
     /// Pending includes that couldn't be found during initial read
     pub pending_includes: Vec<PendingInclude>,
+    /// Current include depth (for detecting infinite recursion)
+    pub include_depth: usize,
     /// Set of include file names for which a rebuild recipe has already been
     /// attempted (ran or was considered ran via grouped pattern rules).
     /// Used to avoid running the same recipe twice for grouped pattern rules.
@@ -254,6 +256,7 @@ impl MakeState {
             in_second_expansion: RefCell::new(false),
             in_recipe_execution: RefCell::new(false),
             pending_includes: Vec::new(),
+            include_depth: 0,
             include_recipe_ran: HashSet::new(),
             entering_directory_printed: false,
             makeoverrides_cleared: false,
@@ -960,6 +963,20 @@ impl MakeState {
     /// Like read_makefile but uses `display_name` as the filename shown in error messages.
     /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
     pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
+        // Guard against infinite include recursion (e.g., a makefile including itself)
+        self.include_depth += 1;
+        if self.include_depth > 200 {
+            self.include_depth -= 1;
+            let progname = std::env::args().next().unwrap_or_else(|| "make".into());
+            return Err(format!("{}: *** Recursive include of '{}'. Stop.",
+                progname, path.display()));
+        }
+        let result = self.read_makefile_display_inner(path, display_name);
+        self.include_depth -= 1;
+        result
+    }
+
+    fn read_makefile_display_inner(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
         let path_str = path.to_string_lossy();
         let is_stdin = path_str == "-" || path_str == "/dev/stdin";
 
