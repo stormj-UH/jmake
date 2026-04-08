@@ -9,11 +9,10 @@ jobs:
     container:
       image: ghcr.io/stormj-uh/jonerix:builder-amd64
     steps:
-      - name: Checkout (manual)
+      - name: Checkout
         run: |
-          cd $GITHUB_WORKSPACE
-          curl -sL -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/$GITHUB_SHA.tar.gz" | \
+          curl -sL -H "Authorization: token ${{ github.token }}" \
+            "${{ github.server_url }}/${{ github.repository }}/archive/${{ github.sha }}.tar.gz" | \
             tar xz --strip-components=1
 
       - name: Build jmake
@@ -68,7 +67,7 @@ jobs:
           mkdir -p /tmp/jpkg/bin
           cp target/release/jmake /tmp/jpkg/bin/jmake
           ln -sf jmake /tmp/jpkg/bin/make
-          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || toybox true
+          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
           cd /tmp/jpkg
-          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | toybox head -1 | toybox sed 's/.*"\(.*\)"/\1/')
+          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
