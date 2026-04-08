@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/stormj-uh/jonerix:builder-arm64
+      image: ghcr.io/stormj-uh/jonerix:builder-amd64
     steps:
       - uses: actions/checkout@v4
 
@@ -85,10 +85,10 @@ jobs:
           llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
           cd /tmp/jpkg
           VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          tar czf /tmp/jmake-${VERSION}-aarch64.tar.gz .
+          tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: jmake-aarch64
-          path: /tmp/jmake-*-aarch64.tar.gz
+          name: jmake-x86_64
+          path: /tmp/jmake-*-x86_64.tar.gz
