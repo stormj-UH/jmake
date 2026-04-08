@@ -107,7 +107,7 @@ jobs:
           curl -s -X PUT -H "Authorization: token ${TOKEN}" \
             -H "Content-Type: application/json" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" \
-            -d "{\"message\":\"CI: update test badge\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
+            -d "{\"message\":\"CI: update test badge [skip ci]\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
           echo "README pushed"
 
       - name: Upload package
