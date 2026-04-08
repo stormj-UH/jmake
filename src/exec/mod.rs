@@ -652,11 +652,11 @@ impl<'a> Executor<'a> {
 
     /// Delete intermediate files that were built during this run.
     fn delete_intermediate_files(&mut self) {
-        // GNU Make deletion order: reverse of build order.
-        // Intermediates built last are deleted first. For grouped pattern targets,
-        // primary is pushed first, then siblings forward — reversing gives
-        // siblings before primary, matching GNU Make output.
-        let to_delete: Vec<String> = self.intermediate_built.iter()
+        // GNU Make deletion order: reverse of build order (chain intermediates
+        // closest to final target are deleted first). Grouped pattern siblings
+        // are pushed primary-first then siblings-forward, so reversing gives
+        // siblings before primary.
+        let to_delete: Vec<String> = self.intermediate_built.iter().rev()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -3524,17 +3524,17 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            // Push siblings in REVERSE declaration order, then primary last.
-            // Forward iteration gives: siblings (reverse) then primary.
-            //   push a.15 then a.1 → [a.15, a.1] → `rm a.15 a.1` ✓
-            for sib in sib_intermediates.into_iter().rev() {
-                if !self.intermediate_built.contains(&sib) {
-                    self.intermediate_built.push(sib);
-                }
-            }
+            // Push primary FIRST, then siblings in FORWARD order.
+            // Deletion uses .rev(), which gives: siblings (reverse) then primary last.
+            //   push [a.1, a.15] → rev → [a.15, a.1] → `rm a.15 a.1` ✓
             if is_target_intermediate {
                 if !self.intermediate_built.contains(&target.to_string()) {
                     self.intermediate_built.push(target.to_string());
+                }
+            }
+            for sib in sib_intermediates.into_iter() {
+                if !self.intermediate_built.contains(&sib) {
+                    self.intermediate_built.push(sib);
                 }
             }
             // In collect_plans_mode, update the plan's is_intermediate flag now that we
@@ -3950,6 +3950,37 @@ impl<'a> Executor<'a> {
         }
 
         None
+    }
+
+    /// Check if a directory is listed in the GPATH variable.
+    /// GPATH directories cause VPATH-found files to be treated as local.
+    fn is_gpath_dir(&self, dir: &str) -> bool {
+        if let Some(var) = self.db.variables.get("GPATH") {
+            let gpath = &var.value;
+            if gpath.is_empty() { return false; }
+            for gdir in gpath.split(|c: char| c == ':' || c == ' ' || c == '\t') {
+                let gdir = gdir.trim();
+                if !gdir.is_empty() {
+                    // Normalize: strip trailing /
+                    let gdir_clean = gdir.trim_end_matches('/');
+                    let dir_clean = dir.trim_end_matches('/');
+                    if gdir_clean == dir_clean {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a VPATH-found path is in a GPATH directory.
+    fn is_in_gpath(&self, vpath_result: &str) -> bool {
+        if let Some(parent) = Path::new(vpath_result).parent() {
+            let parent_str = parent.to_string_lossy();
+            self.is_gpath_dir(&parent_str)
+        } else {
+            false
+        }
     }
 
     /// Search for a library named `name` (from a `-lname` prerequisite).
