@@ -764,6 +764,9 @@ impl<'a> Executor<'a> {
                 .map(|s| s.as_str())
                 .unwrap_or(target);
             eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, requester, target);
+            // Mark as built so terminal rule checks know this dep was handled
+            // (circular deps are "available" even though no file was created).
+            self.built.insert(target.to_string(), false);
             return Ok(false);
         }
         self.building.insert(target.to_string());
@@ -3131,8 +3134,11 @@ impl<'a> Executor<'a> {
                     // doesn't count — it must be buildable by an explicit (non-pattern) rule.
                     let has_explicit_recipe = self.db.rules.get(prereq.as_str())
                         .map_or(false, |rules| rules.iter().any(|r| !r.recipe.is_empty()));
+                    // Skip the terminal existence check if the prereq was already
+                    // successfully processed (e.g. circular dep that was dropped).
+                    let already_built = self.built.contains_key(prereq.as_str());
                     if rule.is_terminal && !self.db.is_phony(&prereq)
-                        && !has_explicit_recipe
+                        && !has_explicit_recipe && !already_built
                     {
                         let exists = std::path::Path::new(&prereq).exists()
                             || self.find_in_vpath(&prereq).is_some();
@@ -3880,6 +3886,42 @@ impl<'a> Executor<'a> {
             return Some(best);
         }
 
+        // Pass 3: GNU Make "compatibility rule search" — terminal rules that were
+        // skipped in pass 2 can still be used when all their prereqs are satisfiable
+        // (on disk, in building set for cycles, or chainable via non-terminal rules).
+        if compat_rule.is_none() {
+            for rule in &all_rules {
+                if !rule.is_terminal { continue; }
+                if rule.recipe.is_empty() { continue; }
+                for pattern_target in &rule.targets {
+                    if let Some(stem) = match_pattern(pattern_target, target) {
+                        let prereqs_ok = if rule.prerequisites.is_empty() {
+                            true
+                        } else {
+                            let mut visited = std::collections::HashSet::new();
+                            rule.prerequisites.iter().all(|p| {
+                                if p == ".WAIT" { return true; }
+                                let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
+                                Path::new(&resolved).exists()
+                                    || self.db.rules.contains_key(&resolved)
+                                    || self.db.is_phony(&resolved)
+                                    || self.find_in_vpath(&resolved).is_some()
+                                    || self.building.contains(&resolved)
+                                    || self.find_pattern_rule_exists_inner(&resolved, &mut visited, 0)
+                            })
+                        };
+                        if prereqs_ok {
+                            let mut r = (**rule).clone();
+                            r.is_compat = true;
+                            compat_rule = Some((r, stem));
+                            break;
+                        }
+                    }
+                }
+                if compat_rule.is_some() { break; }
+            }
+        }
+
         // Mark the compat rule as a compatibility rule so that
         // build_with_pattern_rule knows to propagate errors from missing prereqs.
         if let Some((ref mut rule, _)) = compat_rule {
@@ -3936,14 +3978,7 @@ impl<'a> Executor<'a> {
                                 || self.db.is_phony(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
                                 || self.building.contains(&resolved)
-                                // For terminal rules (%::), prerequisites cannot be
-                                // further built via chaining - only on-disk/explicit.
-                                // Allowing recursion here causes infinite expansion when
-                                // a terminal rule's prereq pattern resolves to a longer name
-                                // that re-matches the same terminal rule (e.g. %:: %.c → hello.c → hello.c.c → ...).
                                 || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, depth + 1))
-                                // For terminal rules: accept prereqs that are in explicit_dep_names
-                                // (compat candidates). This allows circular deps through compat rules.
                                 || (rule.is_terminal && self.db.explicit_dep_names.contains(&resolved))
                         })
                     };
