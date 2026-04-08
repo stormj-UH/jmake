@@ -4995,15 +4995,19 @@ impl<'a> Executor<'a> {
                 let preprocessed = preprocess_recipe_bsnl(line);
                 let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
                 // For the first line: record behavioral flags (silent, ignore errors).
-                if is_first {
+                // The first line's prefix chars (@, -, +) are ALWAYS stripped:
+                // GNU Make's start_job_command() strips them unconditionally
+                // from the start of the recipe text before passing it to the shell.
+                // Interior lines (2+) are stripped only for Bourne-compatible shells;
+                // for non-Bourne shells (perl, python, etc.) they pass verbatim because
+                // those chars may be valid syntax in the target language.
+                let cmd_line = if is_first {
                     let (_d, ls, li, _lf) = parse_recipe_prefix(&expanded);
                     first_line_silent = ls;
                     first_line_ignore = li;
                     is_first = false;
-                }
-                // Strip @-+ prefixes only for Bourne-compatible shells.
-                // Non-Bourne shells (perl, python, etc.) receive the lines as-is.
-                let cmd_line = if bourne_shell {
+                    strip_recipe_prefixes(&expanded)
+                } else if bourne_shell {
                     strip_recipe_prefixes(&expanded)
                 } else {
                     expanded
