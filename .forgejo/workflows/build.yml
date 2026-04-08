@@ -1,7 +1,7 @@
-name: Build jmake
+name: Build and Test jmake
 on:
   push:
-    branches: [main]
+    branches: [optimize]
 
 jobs:
   build:
@@ -22,23 +22,16 @@ jobs:
             tar xz --strip-components=1
           ls Cargo.toml && echo "Checkout OK"
 
-      - name: Build and package with jpkg
-        env:
-          JPKG_SOURCE_DIR: ${{ github.workspace }}
+      - name: Build
         run: |
-          jpkg build packages/jmake --build-jpkg --output /tmp/jpkg-out
-          # Extract binary from jpkg (magic:8 + hdrlen:4 + header + zstd tar)
-          PKG=$(ls /tmp/jpkg-out/jmake-*.jpkg)
-          HDRLEN=$(dd if="$PKG" bs=1 skip=8 count=4 2>/dev/null | python3 -c "import sys; d=sys.stdin.buffer.read(); print(int.from_bytes(d,'little'))")
-          SKIP=$((12 + HDRLEN))
-          dd if="$PKG" bs=1 skip=$SKIP 2>/dev/null | zstdcat | tar x -C /
-          echo "Installed jmake from jpkg"
-          ls -la /bin/jmake
+          cargo build --release 2>&1
+          echo "Build OK"
+          ls -la target/release/jmake
 
       - name: Verify binary
         run: |
           echo 'all:;@echo "jmake works"' > /tmp/test.mk
-          jmake -f /tmp/test.mk
+          ./target/release/jmake -f /tmp/test.mk
 
       - name: Run GNU Make test suite
         id: tests
@@ -48,7 +41,6 @@ jobs:
           cd /tmp
           EXPECTED_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
 
-          # Use vendored tarball (fallback: download from GNU FTP)
           if [ -f "$GITHUB_WORKSPACE/tests/vendor/make-4.4.1.tar.gz" ]; then
             echo "Using vendored GNU Make 4.4.1 test suite"
             cp "$GITHUB_WORKSPACE/tests/vendor/make-4.4.1.tar.gz" make.tar.gz
@@ -61,7 +53,6 @@ jobs:
             fi
           fi
 
-          # Verify hash
           ACTUAL_SHA256=$(sha256sum make.tar.gz 2>/dev/null | cut -d' ' -f1 || shasum -a 256 make.tar.gz | cut -d' ' -f1)
           if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
             echo "ERROR: SHA-256 mismatch!"
@@ -73,26 +64,20 @@ jobs:
 
           tar xzf make.tar.gz
           cd make-4.4.1
-          # Create config-flags.pm directly (./configure needs bash, container has mksh)
           printf '%%CONFIG_FLAGS = (AR=>"ar",CC=>"cc",CFLAGS=>"-O2",CPP=>"cc -E",CPPFLAGS=>"",LDFLAGS=>"",LIBS=>"",USE_SYSTEM_GLOB=>"no");\n1;\n' > tests/config-flags.pm
 
-          # Create a non-root user for testing. Some tests (e.g. temp_stdin)
-          # rely on filesystem permission checks that root bypasses.
-          # The builder image is minimal, so create user entries manually.
           echo 'testuser:x:1000:1000::/tmp/testhome:/bin/mksh' >> /etc/passwd
           echo 'testuser:x:1000:' >> /etc/group
           mkdir -p /tmp/testhome
           chown -R 1000:1000 /tmp/testhome /tmp/make-4.4.1
-          # Make jmake binary and its libs readable/executable by testuser
-          chmod a+rx $(which jmake)
+          chmod a+rx $GITHUB_WORKSPACE/target/release/jmake
 
-          MAKE_BIN=$(which jmake)
+          MAKE_BIN=$GITHUB_WORKSPACE/target/release/jmake
           cd tests
 
           TOTAL_PASS=0
           TOTAL_FAIL=0
           for cat in $(find scripts -type f | sed 's|^scripts/||' | sort); do
-            # Skip test_template (meta test, not a real make behavior test)
             case "$cat" in test_template) continue;; esac
             rm -rf work
             output=$(su testuser -c "cd /tmp/make-4.4.1/tests && perl run_make_tests.pl -make $MAKE_BIN $cat" 2>&1)
@@ -110,61 +95,8 @@ jobs:
           done
 
           TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
-          if [ "$TOTAL" -gt 0 ]; then
-            PCT=$((TOTAL_PASS * 1000 / TOTAL))
-            PCT_INT=$((PCT / 10))
-            PCT_DEC=$((PCT % 10))
-            BADGE="**GNU Make 4.4.1 test suite: ${TOTAL_PASS} / ${TOTAL} (${PCT_INT}.${PCT_DEC}%)**"
-          else
-            BADGE="**GNU Make 4.4.1 test suite: unknown**"
+          echo "=== RESULT: $TOTAL_PASS / $TOTAL ==="
+          if [ "$TOTAL_FAIL" -gt 0 ]; then
+            echo "REGRESSION: $TOTAL_FAIL test(s) failed!"
+            exit 1
           fi
-
-          echo "PASS=$TOTAL_PASS" >> $GITHUB_OUTPUT
-          echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
-          echo "BADGE=$BADGE" >> $GITHUB_OUTPUT
-          echo "$BADGE"
-
-      - name: Update README badge
-        env:
-          TOKEN: ${{ secrets.REPO_TOKEN }}
-          SERVER: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          BADGE: ${{ steps.tests.outputs.BADGE }}
-        run: |
-          if [ -z "$BADGE" ]; then
-            echo "No test results, skipping README update"
-            exit 0
-          fi
-          # Replace badge line between markers
-          awk -v badge="$BADGE" '
-            /<!-- test-badge-start -->/{print; print badge; skip=1; next}
-            /<!-- test-badge-end -->/{skip=0}
-            !skip{print}
-          ' README.md > README.tmp && mv README.tmp README.md
-          echo "Updated badge to: $BADGE"
-          # Push via API
-          CONTENT=$(base64 -w 0 < README.md 2>/dev/null || base64 < README.md | awk '{printf "%s",$0}')
-          SHA=$(curl -s -H "Authorization: token ${TOKEN}" \
-            "${SERVER}/api/v1/repos/${REPO}/contents/README.md" | \
-            sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' | head -1)
-          curl -s -X PUT -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${SERVER}/api/v1/repos/${REPO}/contents/README.md" \
-            -d "{\"message\":\"CI: update test badge [skip ci]\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
-          echo "README pushed"
-
-      - name: Upload package
-        env:
-          TOKEN: ${{ secrets.REPO_TOKEN }}
-          SERVER: ${{ github.server_url }}
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          ls -lh /tmp/jpkg-out/
-          for f in /tmp/jpkg-out/*; do
-            FNAME=$(basename "$f")
-            curl -s -X PUT -H "Authorization: token ${TOKEN}" \
-              --upload-file "$f" \
-              "${SERVER}/api/packages/jonerik/generic/jmake/${VERSION}/${FNAME}"
-            echo "Uploaded ${FNAME}"
-          done
-          echo "Package: ${SERVER}/jonerik/-/packages/generic/jmake/${VERSION}"
