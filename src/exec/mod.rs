@@ -748,6 +748,12 @@ impl<'a> Executor<'a> {
             self.built.insert(target.to_string(), false);
             return Ok(false);
         }
+        // If this target's recipe already ran during include rebuild but didn't
+        // change the file (PHONY-forced include), don't re-run the recipe.
+        if self.state.include_already_ran.contains(target) {
+            self.built.insert(target.to_string(), false);
+            return Ok(false);
+        }
 
         // Cycle detection
         if self.building.contains(target) {

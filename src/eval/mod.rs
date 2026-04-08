@@ -90,6 +90,9 @@ pub struct MakeState {
     /// attempted (ran or was considered ran via grouped pattern rules).
     /// Used to avoid running the same recipe twice for grouped pattern rules.
     pub include_recipe_ran: HashSet<String>,
+    /// Include files whose recipe ran but didn't change the file (mtime unchanged).
+    /// The executor should not re-run recipes for these during the build phase.
+    pub include_already_ran: HashSet<String>,
     /// True once "Entering directory" has been printed, to avoid printing it twice.
     pub entering_directory_printed: bool,
     /// Set to true when MAKEOVERRIDES= (empty) has been assigned from a makefile.
@@ -258,6 +261,7 @@ impl MakeState {
             pending_includes: Vec::new(),
             include_depth: 0,
             include_recipe_ran: HashSet::new(),
+            include_already_ran: HashSet::new(),
             entering_directory_printed: false,
             makeoverrides_cleared: false,
             stdin_temp_path: None,
@@ -3566,12 +3570,17 @@ impl MakeState {
                         // - File still doesn't exist (sv 61226) → no re-exec, no error.
                         let new_mtime = mf_path.metadata().ok().and_then(|m| m.modified().ok());
                         let actually_updated = match (target_mtime, new_mtime) {
-                            (_, None) => false,              // file still doesn't exist
-                            (None, Some(_)) => true,         // file was created
-                            (Some(old_t), Some(new_t)) => new_t != old_t, // mtime changed
+                            (_, None) => false,
+                            (None, Some(_)) => true,
+                            (Some(old_t), Some(new_t)) => new_t != old_t,
                         };
                         if actually_updated {
                             any_really_rebuilt = true;
+                        } else {
+                            // Recipe ran but file unchanged. Mark as "already built" so
+                            // the executor doesn't re-run the recipe during the build phase.
+                            // This prevents PHONY-forced include recipes from running twice.
+                            self.include_already_ran.insert(mf_name.clone());
                         }
                         // If file not updated/created (sv 61226): no re-exec, no error
                     }
