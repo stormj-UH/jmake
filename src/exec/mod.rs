@@ -6628,14 +6628,29 @@ fn run_cmd_with_error_handling(
         //   "/bin/sh: cmd: can't execute: Permission denied"  (mksh, 126)
         //   "/bin/sh: cmd: can't execute: Is a directory"     (mksh, 126)
         //   "sh: cmd: Permission denied"                (dash, 126)
-        let is_shell_exec_error = line.ends_with(": inaccessible or not found")
+        // Only suppress lines that look like shell exec errors.
+        // The shell name appears as the first colon-delimited field.
+        // E.g. "/bin/sh: ./cmd: No such file or directory" or "sh: cmd: not found".
+        // Do NOT suppress errors from other programs (e.g. perl's
+        // "Can't open perl script: No such file or directory").
+        let shell_prefix = line.split(':').next().unwrap_or("");
+        let looks_like_shell = shell_prefix.ends_with("sh")
+            || shell_prefix.ends_with("/sh")
+            || shell_prefix.ends_with("mksh")
+            || shell_prefix.ends_with("bash")
+            || shell_prefix.ends_with("dash")
+            || shell_prefix.ends_with("zsh")
+            || shell_prefix == "/bin/sh";
+        let is_shell_exec_error = looks_like_shell && (
+            line.ends_with(": inaccessible or not found")
             || line.ends_with(": not found")
             || line.ends_with(": command not found")
             || line.contains(": can't execute: ")
-            || (line.ends_with(": No such file or directory") && !line.starts_with("jmake:"))
-            || (line.ends_with(": Permission denied") && !line.starts_with("jmake:"))
-            || (line.ends_with(": is a directory") && !line.starts_with("jmake:"))
-            || (line.ends_with(": Is a directory") && !line.starts_with("jmake:"));
+            || line.ends_with(": No such file or directory")
+            || line.ends_with(": Permission denied")
+            || line.ends_with(": is a directory")
+            || line.ends_with(": Is a directory")
+        );
         if !is_shell_exec_error {
             eprintln!("{}", line);
         }
