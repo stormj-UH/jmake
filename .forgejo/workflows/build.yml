@@ -92,4 +92,3 @@ jobs:
         with:
           name: jmake-x86_64
           path: /tmp/jmake-*-x86_64.tar.gz
-# debug run
