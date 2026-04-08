@@ -2827,6 +2827,13 @@ impl MakeState {
                 self.db.builtin_pattern_rules_count = 0;
             }
         }
+
+        // If -R (no_builtin_variables) was activated via MAKEFLAGS inside the makefile
+        // (and wasn't already set from the command line), remove all default built-in
+        // variables now (they were registered at startup by register_default_variables).
+        if self.args.no_builtin_variables && !self.cmdline_args.no_builtin_variables {
+            self.db.variables.retain(|_k, v| v.origin != VarOrigin::Default);
+        }
     }
 
     pub fn evaluate_condition(&self, kind: &ConditionalKind) -> bool {
