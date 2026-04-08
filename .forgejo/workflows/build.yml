@@ -97,49 +97,39 @@ jobs:
             echo "No test results, skipping README update"
             exit 0
           fi
-          # Read current README
-          README=$(cat README.md)
-          # Replace badge between markers
-          NEW_README=$(echo "$README" | sed "/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
+          # Update badge between markers using sed
+          sed -i "/<!-- test-badge-start -->/,/<!-- test-badge-end -->/{
             /<!-- test-badge-start -->/!{/<!-- test-badge-end -->/!d}
             /<!-- test-badge-start -->/a\\
 ${BADGE}
-          }")
-          echo "$NEW_README" > README.md
+          }" README.md
           echo "Updated badge to: $BADGE"
           # Commit and push via API
-          CONTENT=$(cat README.md | base64 -w 0 2>/dev/null || cat README.md | base64)
+          CONTENT=$(base64 < README.md | tr -d '\n')
           SHA=$(curl -s -H "Authorization: token ${TOKEN}" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" | \
-            grep -o '"sha":"[^"]*"' | head -1 | cut -d'"' -f4)
+            sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' | head -1)
           curl -s -X PUT -H "Authorization: token ${TOKEN}" \
             -H "Content-Type: application/json" \
             "${SERVER}/api/v1/repos/${REPO}/contents/README.md" \
-            -d "{\"message\":\"CI: update test badge to ${BADGE}\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
-          echo "README updated"
+            -d "{\"message\":\"CI: update test badge\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
+          echo "README pushed"
 
-      - name: Package
-        run: |
-          mkdir -p /tmp/jpkg/bin
-          cp target/release/jmake /tmp/jpkg/bin/jmake
-          ln -sf jmake /tmp/jpkg/bin/make
-          llvm-strip --strip-all /tmp/jpkg/bin/jmake 2>/dev/null || true
-          cd /tmp/jpkg
-          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          tar czf /tmp/jmake-${VERSION}-x86_64.tar.gz .
-          echo "Package: /tmp/jmake-${VERSION}-x86_64.tar.gz"
-          ls -lh /tmp/jmake-${VERSION}-x86_64.tar.gz
-
-      - name: Upload package
+      - name: Package with jpkg
         env:
           TOKEN: ${{ secrets.REPO_TOKEN }}
           SERVER: ${{ github.server_url }}
           REPO: ${{ github.repository }}
         run: |
-          VERSION=$(grep '^version' $GITHUB_WORKSPACE/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          PKG="/tmp/jmake-${VERSION}-x86_64.tar.gz"
-          # Create or update a generic package in Forgejo packages
-          curl -s -X PUT -H "Authorization: token ${TOKEN}" \
-            --upload-file "$PKG" \
-            "${SERVER}/api/packages/jonerik/generic/jmake/${VERSION}/jmake-${VERSION}-x86_64.tar.gz"
-          echo "Uploaded to ${SERVER}/jonerik/-/packages/generic/jmake/${VERSION}"
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          jpkg build packages/jmake --output /tmp/jpkg-out
+          ls -lh /tmp/jpkg-out/
+          # Upload to Forgejo generic packages
+          for f in /tmp/jpkg-out/*; do
+            FNAME=$(basename "$f")
+            curl -s -X PUT -H "Authorization: token ${TOKEN}" \
+              --upload-file "$f" \
+              "${SERVER}/api/packages/jonerik/generic/jmake/${VERSION}/${FNAME}"
+            echo "Uploaded ${FNAME}"
+          done
+          echo "Package published: ${SERVER}/jonerik/-/packages/generic/jmake/${VERSION}"
