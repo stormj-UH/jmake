@@ -3707,28 +3707,12 @@ impl MakeState {
                     });
                     continue;
                 }
-                // File exists but is unreadable. Print the read error now (GNU Make
-                // prints "MAKEFILE:LINE: FILE: Permission denied" before trying rules).
-                if !pi.ignore_missing && !pi.parent.is_empty() {
-                    let err_msg = std::fs::File::open(file_path)
-                        .err()
-                        .map(|e| {
-                            let s = format!("{}", e);
-                            // Strip Rust's " (os error N)" suffix for clean GNU Make-style output
-                            if let Some(idx) = s.find(" (os error") {
-                                s[..idx].to_string()
-                            } else {
-                                s
-                            }
-                        })
-                        .unwrap_or_else(|| "Permission denied".to_string());
-                    eprintln!("{}:{}: {}: {}", pi.parent, pi.lineno, pi.file, err_msg);
-                }
+                // File exists but is unreadable. Defer the error message — only
+                // print it if the rebuild fails. If the rebuild succeeds, suppress it.
                 // Fall through to try rebuilding via rules (same as missing file).
-                // Don't print "No such file or directory" later — we already printed the error.
             }
-            // Track whether we already printed an error for this file (unreadable).
-            let already_printed_error = file_path.exists() && !std::fs::File::open(file_path).is_ok();
+            // Track whether the file was unreadable (exists but can't be opened).
+            let was_unreadable = file_path.exists() && !std::fs::File::open(file_path).is_ok();
 
             let is_phony = self.db.special_targets
                 .get(&SpecialTarget::Phony)
@@ -3772,11 +3756,23 @@ impl MakeState {
                     } else {
                         // Required include with no rule: defer the "No such file or
                         // directory" message to Phase C so ordering is correct.
-                        // If we already printed "Permission denied" for an unreadable
-                        // file, don't also print "No such file or directory".
+                        // For unreadable files, print "Permission denied" instead of
+                        // "No such file or directory".
+                        if was_unreadable && !pi.parent.is_empty() {
+                            let err_msg = std::fs::File::open(file_path)
+                                .err()
+                                .map(|e| {
+                                    let s = format!("{}", e);
+                                    if let Some(idx) = s.find(" (os error") {
+                                        s[..idx].to_string()
+                                    } else { s }
+                                })
+                                .unwrap_or_else(|| "Permission denied".to_string());
+                            eprintln!("{}:{}: {}: {}", pi.parent, pi.lineno, pi.file, err_msg);
+                        }
                         (PendingOutcome::Error(
                             format!("No rule to make target '{}'.  Stop.", pi.file)
-                        ), !pi.parent.is_empty() && !already_printed_error)
+                        ), !pi.parent.is_empty() && !was_unreadable)
                     }
                 }
                 Some(IncludeRuleInfo { skippable: true, .. }) => {
