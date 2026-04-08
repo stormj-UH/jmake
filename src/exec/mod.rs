@@ -3137,9 +3137,6 @@ impl<'a> Executor<'a> {
                         // no rule, but the parent target HAS a recipe, just consider
                         // the parent out of date. This handles auto-generated dependency
                         // files that list system headers as prerequisites.
-                        // Only applies to DIRECT "no rule" errors (without "needed by"),
-                        // not to errors propagated from deeper in the dependency chain,
-                        // and not to compatibility rules (which propagate errors).
                         any_rebuilt = true;
                     } else {
                         // Propagate "No rule to make target" errors correctly
