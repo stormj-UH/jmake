@@ -22,6 +22,8 @@ pub struct Executor<'a> {
     db: &'a MakeDatabase,
     state: &'a MakeState,
     jobs: usize,
+    /// Maximum load average for -l; None if not specified.
+    load_average: Option<f64>,
     keep_going: bool,
     dry_run: bool,
     touch: bool,
@@ -118,6 +120,7 @@ impl<'a> Executor<'a> {
         db: &'a MakeDatabase,
         state: &'a MakeState,
         jobs: usize,
+        load_average: Option<f64>,
         keep_going: bool,
         dry_run: bool,
         touch: bool,
@@ -149,6 +152,7 @@ impl<'a> Executor<'a> {
             db,
             state,
             jobs,
+            load_average,
             keep_going,
             dry_run,
             touch,
@@ -341,6 +345,7 @@ impl<'a> Executor<'a> {
 
         let mut scheduler = ParallelScheduler::new(
             self.jobs,
+            self.load_average,
             sched_plans,
             job_tx,
             result_rx,
