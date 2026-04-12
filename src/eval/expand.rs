@@ -164,32 +164,6 @@ impl MakeState {
         // Check for function call with comma args but no space (shouldn't normally happen, but...)
         // Most function calls have: $(func arg) format
 
-        // Variable reference with possible D/F modifier
-        // $(@D), $(@F), etc.
-        // Only attempt if the last byte is ASCII (D/F are single ASCII chars;
-        // multi-byte UTF-8 continuation bytes have the high bit set, so this
-        // check is both necessary and sufficient to avoid invalid slice indices).
-        if content.len() >= 2 && content.as_bytes()[content.len()-1].is_ascii() {
-            let first = &content[..content.len()-1];
-            let modifier = &content[content.len()-1..];
-            if (modifier == "D" || modifier == "F") && first.len() == 1 {
-                let base_char = first;
-                let base_val = if let Some(val) = auto_vars.get(base_char) {
-                    val.clone()
-                } else if let Some(var) = self.db.variables.get(base_char) {
-                    self.expand_var_value(var, auto_vars)
-                } else {
-                    String::new()
-                };
-
-                return match modifier {
-                    "D" => dir_part(&base_val),
-                    "F" => file_part(&base_val),
-                    _ => unreachable!(),
-                };
-            }
-        }
-
         // Simple variable lookup
         let expanded_name = self.expand_with_auto_vars(content, auto_vars);
         if let Some(val) = auto_vars.get(&expanded_name) {
@@ -211,6 +185,30 @@ impl MakeState {
         }
         if let Some(var) = self.db.variables.get(&expanded_name) {
             return self.expand_var_value(var, auto_vars);
+        }
+
+        // Variable reference with possible D/F modifier
+        // $(@D), $(@F), $(?D), etc.
+        // Exact variable names must win first so ordinary variables like $(LD)
+        // don't get misclassified as "directory part of $L".
+        if expanded_name.len() >= 2 && expanded_name.as_bytes()[expanded_name.len() - 1].is_ascii() {
+            let first = &expanded_name[..expanded_name.len() - 1];
+            let modifier = &expanded_name[expanded_name.len() - 1..];
+            if (modifier == "D" || modifier == "F") && matches!(first, "@" | "<" | "*" | "?" | "^" | "+") {
+                let base_val = if let Some(val) = auto_vars.get(first) {
+                    val.clone()
+                } else if let Some(var) = self.db.variables.get(first) {
+                    self.expand_var_value(var, auto_vars)
+                } else {
+                    String::new()
+                };
+
+                return match modifier {
+                    "D" => dir_part(&base_val),
+                    "F" => file_part(&base_val),
+                    _ => unreachable!(),
+                };
+            }
         }
 
         // Warn if requested — but suppress warnings for GNU Make's special/auto-set
@@ -1188,4 +1186,47 @@ fn file_part(path: &str) -> String {
         }
     }).collect();
     results.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::MakeArgs;
+
+    #[test]
+    fn exact_variable_lookup_beats_df_modifier_fallback() {
+        let mut state = MakeState::new(MakeArgs {
+            variables: vec![("LD".to_string(), "ld".to_string()), ("AD".to_string(), "alpha/beta".to_string())],
+            ..Default::default()
+        });
+        state.init_variables();
+
+        assert_eq!(state.expand("$(LD)"), "ld");
+        assert_eq!(state.expand("$(AD)"), "alpha/beta");
+    }
+
+    #[test]
+    fn df_modifier_still_works_for_automatic_variables() {
+        let mut state = MakeState::new(MakeArgs::default());
+        state.init_variables();
+
+        let auto_vars = HashMap::from([
+            ("?".to_string(), "a/b/c d/e/f".to_string()),
+            ("^".to_string(), "x/y/z".to_string()),
+        ]);
+
+        assert_eq!(state.expand_with_auto_vars("$(?D)", &auto_vars), "a/b d/e");
+        assert_eq!(state.expand_with_auto_vars("$(?F)", &auto_vars), "c f");
+        assert_eq!(state.expand_with_auto_vars("$(^D)", &auto_vars), "x/y");
+        assert_eq!(state.expand_with_auto_vars("$(^F)", &auto_vars), "z");
+    }
+
+    #[test]
+    fn built_in_ld_matches_gnu_make_default() {
+        let mut state = MakeState::new(MakeArgs::default());
+        state.init_variables();
+        crate::implicit_rules::register_default_variables(&mut state.db);
+
+        assert_eq!(state.expand("$(LD)"), "ld");
+    }
 }
