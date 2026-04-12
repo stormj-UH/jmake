@@ -3177,9 +3177,10 @@ impl MakeState {
         let progname = make_progname();
 
         for (lineno, cmd_template) in recipe {
+            let expanded_cmd = self.expand_with_auto_vars(cmd_template, &auto_vars);
             // Trim leading whitespace that may remain after stripping a custom
             // RECIPEPREFIX character (e.g. `>` leaves a leading space in ` @cmd`).
-            let mut cmd = cmd_template.trim_start().to_string();
+            let mut cmd = expanded_cmd.trim_start().to_string();
             let mut cmd_silent = false;
             let mut ignore_error = false;
             loop {
@@ -3187,10 +3188,10 @@ impl MakeState {
                     '@' => { cmd_silent = true; cmd = cmd[1..].to_string(); }
                     '-' => { ignore_error = true; cmd = cmd[1..].to_string(); }
                     '+' => { cmd = cmd[1..].to_string(); }
+                    ' ' | '\t' => { cmd = cmd[1..].to_string(); }
                     _ => break,
                 }
             }
-            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
             // Only echo the recipe if not silent and the expansion is non-empty.
             // When make functions like $(info ...) expand to empty string, don't print
             // a blank line (the function's side effects already produced output).
@@ -3261,7 +3262,8 @@ impl MakeState {
         auto_vars.insert("*".to_string(), stem.to_string());
 
         recipe.iter().map(|(lineno, cmd_template)| {
-            let mut cmd = cmd_template.trim_start().to_string();
+            let expanded_cmd = self.expand_with_auto_vars(cmd_template, &auto_vars);
+            let mut cmd = expanded_cmd.trim_start().to_string();
             let mut cmd_silent = false;
             let mut ignore_error = false;
             loop {
@@ -3269,11 +3271,11 @@ impl MakeState {
                     '@' => { cmd_silent = true; cmd = cmd[1..].to_string(); }
                     '-' => { ignore_error = true; cmd = cmd[1..].to_string(); }
                     '+' => { cmd = cmd[1..].to_string(); }
+                    ' ' | '\t' => { cmd = cmd[1..].to_string(); }
                     _ => break,
                 }
             }
-            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
-            (*lineno, expanded_cmd, cmd_silent, ignore_error)
+            (*lineno, cmd, cmd_silent, ignore_error)
         }).collect()
     }
 
