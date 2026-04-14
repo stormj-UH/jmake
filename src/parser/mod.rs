@@ -336,11 +336,15 @@ impl Parser {
         }
 
         // include / -include / sinclude
-        // Handle both "include file" (with space) and bare "include" (no filenames = no-op)
-        if effective.starts_with("include ") || effective == "include"
-            || effective.starts_with("-include ") || effective == "-include"
-            || effective.starts_with("sinclude ") || effective == "sinclude" {
-            return parse_include(&effective);
+        // Handle both "include file" (with space/tab) and bare "include" (no filenames = no-op)
+        // GNU make accepts any whitespace after the directive keyword.
+        {
+            let eff_trimmed = effective.replace('\t', " ");
+            if eff_trimmed.starts_with("include ") || effective == "include"
+                || eff_trimmed.starts_with("-include ") || effective == "-include"
+                || eff_trimmed.starts_with("sinclude ") || effective == "sinclude" {
+                return parse_include(&eff_trimmed);
+            }
         }
 
         // vpath directive
