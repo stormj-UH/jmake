@@ -42,9 +42,17 @@ jobs:
 
       - name: Run GNU Make test suite
         id: tests
-        continue-on-error: true
+        # Hard gate: the job FAILS if the test-suite failure count exceeds
+        # MAX_ALLOWED_FAILS. We keep `continue-on-error: false` so regressions
+        # cannot silently land on main (this was exactly how commits 6c9dd2f,
+        # b007f29, 76887fd slipped through and broke 9 tests on 2026-04-12/13).
         run: |
           set +e
+          # Pinned baseline: the only test that legitimately fails on the
+          # current jmake + jonerix:builder-amd64 combo is features/temp_stdin
+          # (7/8 passed). Any additional failure is treated as a regression.
+          # Raise this number only with a justified commit that explains why.
+          MAX_ALLOWED_FAILS=1
           cd /tmp
           EXPECTED_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
 
@@ -121,8 +129,21 @@ jobs:
 
           echo "PASS=$TOTAL_PASS" >> $GITHUB_OUTPUT
           echo "TOTAL=$TOTAL" >> $GITHUB_OUTPUT
+          echo "FAIL=$TOTAL_FAIL" >> $GITHUB_OUTPUT
           echo "BADGE=$BADGE" >> $GITHUB_OUTPUT
           echo "$BADGE"
+
+          # Hard gate. This is THE check that blocks regressions from
+          # landing on main. Do NOT add `continue-on-error: true` here
+          # and do NOT relax MAX_ALLOWED_FAILS without a commit explaining
+          # the new baseline and which test moved into the "expected-fail" set.
+          if [ "$TOTAL_FAIL" -gt "$MAX_ALLOWED_FAILS" ]; then
+            echo ""
+            echo "::error::GNU Make test suite regressed: $TOTAL_FAIL failures > MAX_ALLOWED_FAILS=$MAX_ALLOWED_FAILS"
+            echo "::error::Fix the regression or justify a higher baseline in this workflow."
+            exit 1
+          fi
+          echo "OK: $TOTAL_FAIL failure(s) <= MAX_ALLOWED_FAILS=$MAX_ALLOWED_FAILS"
 
       - name: Update README badge
         env:
