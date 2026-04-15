@@ -604,13 +604,22 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
     // Check for target-specific variable: target: var = value
     // But don't confuse with rules - target-specific has a known assignment op after the colon part
 
-    // Find assignment operator
+    // Find assignment operator. GNU make scans left-to-right and takes the
+    // FIRST assignment operator it sees. We must honour that order to avoid
+    // matching a `!=` / `+=` / etc. that appears inside the *value* (for
+    // example `VAR = sh -c '... if test $$n != 0 ...'`) when a plain `=`
+    // assignment appears earlier in the line. Prefer the longest op at the
+    // same starting position (e.g. `:::=` over `::=` over `:=`).
     let ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
-    for op in &ops {
-        if let Some(pos) = find_assignment_op(work, op) {
+    let earliest = ops
+        .iter()
+        .filter_map(|op| find_assignment_op(work, op).map(|pos| (pos, *op)))
+        .min_by(|(pa, oa), (pb, ob)| pa.cmp(pb).then(ob.len().cmp(&oa.len())));
+    if let Some((pos, op)) = earliest {
+        {
             let name = work[..pos].trim().to_string();
             let value = work[pos + op.len()..].trim_start().to_string();
-            let flavor = match *op {
+            let flavor = match op {
                 "=" => VarFlavor::Recursive,
                 ":=" | "::=" => VarFlavor::Simple,
                 ":::=" => VarFlavor::PosixSimple,
@@ -1647,4 +1656,94 @@ fn find_pipe(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: pluck (name, value, flavor) out of a ParsedLine::VariableAssignment.
+    fn va(p: ParsedLine) -> (String, String, VarFlavor) {
+        match p {
+            ParsedLine::VariableAssignment { name, value, flavor, .. } => (name, value, flavor),
+            other => panic!("expected VariableAssignment, got {:?}", other),
+        }
+    }
+
+    /// Regression for the tzcode Makefile parse failure (line 1125):
+    ///
+    ///   SET_TIMESTAMP_N = sh -c '... if test $$n != 0 && ...'
+    ///
+    /// The `!=` inside the shell value must not be picked up as the
+    /// assignment operator. GNU make scans left-to-right and takes the
+    /// FIRST assignment operator it sees, which here is the `=` after
+    /// the variable name.
+    #[test]
+    fn earliest_assignment_op_wins_over_later_ne_in_value() {
+        let line = "SET_TIMESTAMP_N = sh -c ' if test $$n != 0 && echo ok'";
+        let (name, value, flavor) = va(try_parse_variable_assignment(line).expect("parse"));
+        assert_eq!(name, "SET_TIMESTAMP_N");
+        assert!(
+            value.starts_with("sh -c ' if test $$n != 0"),
+            "value should include the full right-hand side, got: {value:?}"
+        );
+        assert!(matches!(flavor, VarFlavor::Recursive));
+    }
+
+    /// Same principle for `?=`, `+=`, `:=` showing up inside a plain `=` value.
+    #[test]
+    fn earliest_op_wins_over_embedded_qmark_plus_colon() {
+        for embedded in ["x ?= y", "x += y", "x := y"] {
+            let line = format!("VAR = echo '{embedded}'");
+            let (name, value, _) = va(try_parse_variable_assignment(&line).expect("parse"));
+            assert_eq!(name, "VAR", "input: {line}");
+            assert_eq!(value, format!("echo '{embedded}'"));
+        }
+    }
+
+    /// Longer ops still win at the same starting position.
+    /// `FOO ::= bar` must be Simple, not Recursive (`=` starts 2 chars later).
+    #[test]
+    fn longer_op_wins_at_same_position() {
+        for (line, want_flavor) in [
+            ("FOO ::= bar", VarFlavor::Simple),
+            ("FOO :::= bar", VarFlavor::PosixSimple),
+            ("FOO := bar", VarFlavor::Simple),
+            ("FOO += bar", VarFlavor::Append),
+            ("FOO ?= bar", VarFlavor::Conditional),
+            ("FOO != echo hi", VarFlavor::Shell),
+            ("FOO = bar", VarFlavor::Recursive),
+        ] {
+            let (name, value, flavor) = va(try_parse_variable_assignment(line).expect(line));
+            assert_eq!(name, "FOO", "input: {line}");
+            assert!(
+                std::mem::discriminant(&flavor) == std::mem::discriminant(&want_flavor),
+                "input {line}: got {flavor:?}, want {want_flavor:?}"
+            );
+            assert!(!value.is_empty(), "value should not be empty for {line}");
+        }
+    }
+
+    /// The original bug, in situ: a multi-line continuation collapsed into
+    /// a single logical line. Make sure that, with the surrounding whitespace
+    /// and embedded `$$(...)` from the real SET_TIMESTAMP_N block, we still
+    /// get a clean VariableAssignment and NOT a MissingSeparator.
+    #[test]
+    fn tzcode_set_timestamp_n_collapsed_line_parses() {
+        let line = concat!(
+            "SET_TIMESTAMP_N = sh -c '    n=$$0 dest=$$1; shift;    <\"$$dest\" && ",
+            "   if test $$n != 0 &&       lsout=$$(ls -nt --time-style=\"+%s\" ",
+            "\"$$@\" 2>/dev/null); then      set x $$lsout &&      timestamp=",
+            "$$(($$7 + $$n)) &&      echo \"+ touch -md @$$timestamp $$dest\" && ",
+            "     touch -md @$$timestamp \"$$dest\";    else      newest=$$(ls ",
+            "-t \"$$@\" | sed 1q) &&      echo \"+ touch -mr $$newest $$dest\" && ",
+            "     touch -mr \"$$newest\" \"$$dest\";    fi'"
+        );
+        let parsed = try_parse_variable_assignment(line)
+            .unwrap_or_else(|| panic!("expected VariableAssignment, got None for line: {line}"));
+        match parsed {
+            ParsedLine::VariableAssignment { name, .. } => assert_eq!(name, "SET_TIMESTAMP_N"),
+            other => panic!("expected VariableAssignment, got {other:?}"),
+        }
+    }
 }
