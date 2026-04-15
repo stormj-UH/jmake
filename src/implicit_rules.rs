@@ -11,7 +11,6 @@ pub fn register_default_variables(db: &mut MakeDatabase) {
         ("AS", "as"),
         ("CC", "cc"),
         ("CXX", "g++"),
-        ("LD", "ld"),
         ("CPP", "$(CC) -E"),
         ("FC", "f77"),
         ("GET", "get"),

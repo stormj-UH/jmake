@@ -33,4 +33,4 @@ ln -sf jmake /usr/local/bin/make
 
 ## License
 
-MIT
+Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
