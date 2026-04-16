@@ -1,6 +1,6 @@
 [package]
 name = "jmake"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "MIT"
 description = "Clean-room drop-in replacement for GNU Make"
@@ -16,6 +16,9 @@ clap = { version = "4", features = ["derive"] }
 indexmap = "2"
 filetime = "0.2"
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
