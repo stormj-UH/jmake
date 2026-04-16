@@ -1267,9 +1267,23 @@ impl MakeState {
                 .map(|c| line.starts_with(c))
                 .unwrap_or(false);
 
+            // If the raw line is a variable assignment, it must be handled by the
+            // variable-assignment branch below regardless of whether its VALUE contains
+            // a `;`.  Otherwise `V = a; echo $$X` would be mistakenly treated as a rule
+            // with inline recipe and the whole line would be expanded — collapsing
+            // `$$X` → `$X` in the value BEFORE the recursive variable is stored, which
+            // breaks shell-style recipes that use `$$VAR` for deferred shell-variable
+            // references (e.g. autoconf's `sane_makeflags=$$MAKEFLAGS`).
+            let raw_is_var_assignment = {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#')
+                    && !trimmed.starts_with('\t')
+                    && parser::try_parse_variable_assignment(trimmed).is_some()
+            };
             let expanded = if line.starts_with('\t') || is_custom_recipe_line {
                 line.clone()
-            } else if let Some(semi_pos) = parser::find_semicolon(&line) {
+            } else if !raw_is_var_assignment && parser::find_semicolon(&line).is_some() {
+                let semi_pos = parser::find_semicolon(&line).unwrap();
                 // Check whether the part before `;` contains a `:` (rule colon).
                 // If it does, this is an inline recipe: expand only the header.
                 let pre_semi = &line[..semi_pos];
