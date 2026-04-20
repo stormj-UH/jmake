@@ -901,25 +901,25 @@ impl MakeState {
                 }
                 return Err("No targets.  Stop.".to_string());
             }
-            // GNU Make always tries to remake ALL three default makefile candidates
-            // (GNUmakefile, makefile, Makefile), even if one was found and read.
-            // Add all three as pending includes so they can be updated/created by rules.
-            // On case-insensitive filesystems (macOS), "makefile" and "Makefile" resolve
-            // to the same file.  Deduplicate by canonical path to avoid reading twice.
-            {
-                let mut seen_canonical = std::collections::HashSet::new();
-                for name in &candidates {
-                    let canonical = Path::new(name).canonicalize().ok();
-                    let dominated = canonical.as_ref().map_or(false, |c| !seen_canonical.insert(c.clone()));
-                    if !dominated {
-                        self.pending_includes.push(PendingInclude {
-                            file: name.to_string(),
-                            parent: String::new(),
-                            lineno: 0,
-                            ignore_missing: true,
-                        });
-                    }
-                }
+            // GNU Make reads ONLY the first found default makefile candidate
+            // (priority: GNUmakefile, then makefile, then Makefile). It does NOT
+            // also read the others — only the selected one is a makefile. The
+            // post-build "makefile remake" step applies to the file(s) make read,
+            // not to all three candidates.
+            //
+            // Previously jmake added all three as pending includes here, which
+            // caused both GNUmakefile and Makefile to get included when both
+            // existed (breaking Ruby 3.4's configure test that uses exactly that
+            // ambiguity to detect GNU make — Ruby creates both files with
+            // conflicting `all:` rules and checks which one runs). On
+            // case-insensitive filesystems we still dedupe makefile vs Makefile.
+            for f in &found {
+                self.pending_includes.push(PendingInclude {
+                    file: f.to_string_lossy().into_owned(),
+                    parent: String::new(),
+                    lineno: 0,
+                    ignore_missing: true,
+                });
             }
             found
         } else {
@@ -1267,9 +1267,23 @@ impl MakeState {
                 .map(|c| line.starts_with(c))
                 .unwrap_or(false);
 
+            // If the raw line is a variable assignment, it must be handled by the
+            // variable-assignment branch below regardless of whether its VALUE contains
+            // a `;`.  Otherwise `V = a; echo $$X` would be mistakenly treated as a rule
+            // with inline recipe and the whole line would be expanded — collapsing
+            // `$$X` → `$X` in the value BEFORE the recursive variable is stored, which
+            // breaks shell-style recipes that use `$$VAR` for deferred shell-variable
+            // references (e.g. autoconf's `sane_makeflags=$$MAKEFLAGS`).
+            let raw_is_var_assignment = {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#')
+                    && !trimmed.starts_with('\t')
+                    && parser::try_parse_variable_assignment(trimmed).is_some()
+            };
             let expanded = if line.starts_with('\t') || is_custom_recipe_line {
                 line.clone()
-            } else if let Some(semi_pos) = parser::find_semicolon(&line) {
+            } else if !raw_is_var_assignment && parser::find_semicolon(&line).is_some() {
+                let semi_pos = parser::find_semicolon(&line).unwrap();
                 // Check whether the part before `;` contains a `:` (rule colon).
                 // If it does, this is an inline recipe: expand only the header.
                 let pre_semi = &line[..semi_pos];
@@ -1460,8 +1474,28 @@ impl MakeState {
                     }
                     w.starts_with("define ") || w.starts_with("define\t") || w == "define"
                 };
+                // Conditional directive lines (ifeq/ifneq with parenthesized args)
+                // can contain colons inside their argument list — e.g. Ruby's
+                //   ifeq ($(HAVE_BASERUBY):$(HAVE_GIT),yes:yes)
+                // The rule-colon heuristic mis-classifies these as rule lines and
+                // sends them through try_parse_rule_force, which then errors with
+                // "target pattern contains no '%'". Skip the heuristic for
+                // recognisable conditional-directive starters so they fall through
+                // to parse_line's parse_conditional check instead.
+                let is_conditional_directive_line = {
+                    let mut w = trimmed_raw;
+                    // Conditionals may be preceded by `else` (else ifeq, else ifneq).
+                    if w.starts_with("else ") || w.starts_with("else\t") {
+                        w = w["else".len()..].trim_start();
+                    }
+                    w.starts_with("ifeq ")  || w.starts_with("ifeq\t")  || w.starts_with("ifeq(")  ||
+                    w.starts_with("ifneq ") || w.starts_with("ifneq\t") || w.starts_with("ifneq(") ||
+                    w.starts_with("ifdef ") || w.starts_with("ifdef\t") ||
+                    w.starts_with("ifndef ") || w.starts_with("ifndef\t")
+                };
                 !trimmed_raw.starts_with('#')
                     && !is_define_directive_line
+                    && !is_conditional_directive_line
                     && parser::try_parse_variable_assignment(trimmed_raw).is_none()
                     && parser::find_rule_colon_pub(trimmed_raw).is_some()
             };
@@ -3254,11 +3288,30 @@ impl MakeState {
     /// This is used to separate the variable expansion (requires &self) from the execution
     /// (can run in a thread without &self).
     fn expand_include_recipe_lines(
-        &self, target: &str, stem: &str, recipe: &[(usize, String)]
+        &self, target: &str, stem: &str, recipe: &[(usize, String)],
+        prerequisites: &[String],
     ) -> Vec<(usize, String, bool, bool)> {
         let mut auto_vars = HashMap::new();
         auto_vars.insert("@".to_string(), target.to_string());
         auto_vars.insert("*".to_string(), stem.to_string());
+        // $<, $^, $+ must be set here too. Previously only $@ and $* were
+        // populated which silently broke recipes like
+        //     uncommon.mk: $(srcdir)/common.mk
+        //             sed '...' $< > $@
+        // — $< expanded to empty, sed read stdin, and uncommon.mk was
+        // created as a 0-byte file. Ruby 3.4's build hit this exact pattern.
+        let first_prereq = prerequisites.first().map(|s| s.as_str()).unwrap_or("");
+        auto_vars.insert("<".to_string(), first_prereq.to_string());
+        // $^ (all unique prereqs); $+ (all prereqs incl duplicates). For the
+        // include-recipe path these are the same since we rarely have dups.
+        let joined = prerequisites.join(" ");
+        auto_vars.insert("^".to_string(), joined.clone());
+        auto_vars.insert("+".to_string(), joined);
+        // $? (newer-than-target prereqs): leave empty for include-recipe
+        // context. The target is being rebuilt because it's missing; any
+        // prereq counts as "newer" but GNU make semantics for -include
+        // targets don't rely on $? in practice.
+        auto_vars.insert("?".to_string(), String::new());
 
         recipe.iter().map(|(lineno, cmd_template)| {
             let mut cmd = cmd_template.trim_start().to_string();
@@ -3834,7 +3887,7 @@ impl MakeState {
                                         self.include_recipe_ran.insert(sib.clone());
                                     }
                                     let expanded = self.expand_include_recipe_lines(
-                                        &pi.file, &stem, &recipe
+                                        &pi.file, &stem, &recipe, &prerequisites,
                                     );
                                     // Record this as the primary work item for siblings.
                                     let idx = work_items.len();

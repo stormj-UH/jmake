@@ -116,6 +116,26 @@ pub struct Executor<'a> {
     /// duplicate $(info ...) output.  Entries are removed after the skip so that a
     /// genuine re-build of the same target in a later invocation does fire SE.
     se_search_fired: HashSet<String>,
+    /// Memoization cache for `find_pattern_rule`. Without this, Python 3.14's install
+    /// phase runs thousands of `find_pattern_rule` calls on the same header files
+    /// (one per object file that #includes them). Reproduced 2026-04-17 local build:
+    /// 1038 calls on `./Include/internal/pycore_parser.h`, 150000 total calls in
+    /// 8 seconds, then thousands more targets each blocking the build for minutes.
+    ///
+    /// Cache key is the target name. Results are deterministic for a given
+    /// Makefile + filesystem state once the build starts — pattern rules and file
+    /// existence don't change during a `make` invocation. Correctness note: the
+    /// underlying check considers `self.building` for cycle detection, but cycle
+    /// membership only ever ADDS positive matches; caching a None (or any specific
+    /// match) and then seeing the same target again in the same build is fine
+    /// because the second call would behave the same way if building-set hadn't
+    /// changed, and by design we want consistent pattern-rule selection per target
+    /// across a single build.
+    ///
+    /// RefCell because find_pattern_rule takes &self; jmake is single-threaded on
+    /// the sequential exec path and the parallel path's collect_plans phase is
+    /// also single-threaded (runs sequential build in dry-run mode).
+    pattern_rule_cache: std::cell::RefCell<HashMap<String, Option<(Rule, String)>>>,
 }
 
 impl<'a> Executor<'a> {
@@ -196,6 +216,7 @@ impl<'a> Executor<'a> {
             se_explicitly_mentioned: HashSet::new(),
             vpath_extra_se_texts: HashMap::new(),
             se_search_fired: HashSet::new(),
+            pattern_rule_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -3726,7 +3747,17 @@ impl<'a> Executor<'a> {
     }
 
     fn find_pattern_rule(&self, target: &str) -> Option<(Rule, String)> {
-        self.find_pattern_rule_inner(target, &[])
+        // Memoization: the same target is looked up thousands of times on large
+        // Makefiles (every object file's header prereq triggers another call).
+        // Python 3.14 install reproduced 1038 lookups for one header; without
+        // this cache the build takes tens of minutes / hangs. See pattern_rule_cache
+        // docstring on the Executor struct for correctness reasoning.
+        if let Some(cached) = self.pattern_rule_cache.borrow().get(target) {
+            return cached.clone();
+        }
+        let result = self.find_pattern_rule_inner(target, &[]);
+        self.pattern_rule_cache.borrow_mut().insert(target.to_string(), result.clone());
+        result
     }
 
     /// Core pattern rule search.
@@ -4048,9 +4079,14 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Also check VPATH variable
+        // Also check VPATH variable. The value may reference other variables
+        // (e.g., Ruby's Makefile sets `VPATH = $(arch_hdrdir)/ruby:$(hdrdir)/ruby`)
+        // so expand before splitting. Without expansion, we'd be checking for
+        // a directory literally named `$(arch_hdrdir)/ruby` and never find anything.
         if let Some(var) = self.db.variables.get("VPATH") {
-            for dir in var.value.split(':') {
+            let vpath_expanded = self.state.expand(&var.value);
+            // GNU make accepts either colons or whitespace as separators.
+            for dir in vpath_expanded.split(|c: char| c == ':' || c.is_whitespace()) {
                 let dir = dir.trim();
                 if !dir.is_empty() {
                     let candidate = Path::new(dir).join(target);
