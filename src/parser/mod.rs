@@ -205,16 +205,29 @@ impl Parser {
             return ParsedLine::Comment;
         }
 
-        // Recipe line: check for tab (always a recipe line when in recipe context,
-        // and tab-prefixed lines are always recipes per GNU Make semantics)
-        // Also support .RECIPEPREFIX for a custom prefix character.
+        // Recipe line: check for tab (always a recipe line when in recipe
+        // context). Also support .RECIPEPREFIX for a custom prefix
+        // character.
         let recipe_prefix: char = state.db.variables.get(".RECIPEPREFIX")
             .and_then(|v| v.value.chars().next())
             .unwrap_or('\t');
 
-        // A tab-prefixed line is always treated as a recipe line (GNU Make rule).
-        // A custom RECIPEPREFIX line is also a recipe line.
-        if line.starts_with('\t') || (recipe_prefix != '\t' && line.starts_with(recipe_prefix)) {
+        // A tab-prefixed line is treated as a recipe ONLY when we're
+        // actively inside a rule's recipe block (parser.in_recipe ==
+        // true). GNU Make's own parser consults the same state: outside
+        // an open rule, a tab-indented line that otherwise parses as a
+        // conditional / directive / variable assignment is NOT a recipe.
+        // Dropbear's Makefile.in relies on this — its `ifndef PROGRAMS`
+        // block contains TAB-indented `PROGRAMS=…` assignments, same
+        // story in libtom's ifeq blocks. Earlier jmake versions
+        // unconditionally flagged them as recipes, dropped them on the
+        // floor, and `make all` came out empty.
+        // A custom RECIPEPREFIX line follows the same "only while
+        // in_recipe" rule — the prefix only ever takes effect for rule
+        // recipes.
+        let is_tab_prefixed = line.starts_with('\t');
+        let is_custom_prefix = recipe_prefix != '\t' && line.starts_with(recipe_prefix);
+        if (is_tab_prefixed || is_custom_prefix) && self.in_recipe {
             // Strip exactly the one prefix character
             let stripped = &line[recipe_prefix.len_utf8()..];
             return ParsedLine::Recipe(stripped.to_string());
