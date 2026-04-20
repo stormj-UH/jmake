@@ -52,11 +52,14 @@ jobs:
         # b007f29, 76887fd slipped through and broke 9 tests on 2026-04-12/13).
         run: |
           set +e
-          # Pinned baseline: the only test that legitimately fails on the
-          # current jmake + jonerix:builder-amd64 combo is features/temp_stdin
-          # (7/8 passed). Any additional failure is treated as a regression.
-          # Raise this number only with a justified commit that explains why.
-          MAX_ALLOWED_FAILS=1
+          # Pinned baseline: since jmake 1.0.15 the previously-failing
+          # features/temp_stdin test passes 8/8 (verified on aarch64
+          # Linux 2026-04-20). The 1.0.14 baseline allowed
+          # MAX_ALLOWED_FAILS=1 for that single test; now that it's
+          # clear we tighten to 0. Raise this number only with a
+          # commit that explains which test moved into the
+          # "expected-fail" set and why.
+          MAX_ALLOWED_FAILS=0
           cd /tmp
           EXPECTED_SHA256="dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
 
