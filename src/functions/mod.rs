@@ -351,43 +351,70 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let mut results = Vec::new();
     for pattern in patterns {
         let mut matches = Vec::new();
-        // Extract the directory prefix from the pattern to preserve it in results.
-        // e.g., pattern "./foo*" → prefix "./", pattern "dir/foo*" → prefix "dir/"
-        // GNU Make preserves the directory prefix from the pattern in its output.
-        let prefix = {
+        // GNU Make preserves the pattern's directory prefix in its output.
+        // The `glob` crate's behaviour is subtler than it first appears:
+        // for an input like `./src/*.h` it *keeps* the `src/` segment but
+        // *strips* the `./` leader, returning `src/agentfwd.h`. Earlier
+        // versions of this function unconditionally re-prepended the full
+        // `./src/` prefix whenever the result didn't start with it,
+        // producing the doubled path `./src/src/agentfwd.h`. Reproduced
+        // 2026-04-20 building dropbear-2024.86 whose Makefile does:
+        //     srcdir=./src
+        //     HEADERS=$(wildcard $(srcdir)/*.h *.h)
+        // — every header ended up listed as `./src/src/FOO.h` and make
+        // bailed with `No rule to make target './src/src/agentfwd.h'`.
+        //
+        // Correct behaviour: only re-prepend the SEGMENT of the prefix
+        // that glob dropped. Concretely, if the pattern started with
+        // `./` and the glob output doesn't, re-add just `./`. If the
+        // pattern had a real `dir/` prefix and glob returned a bare
+        // filename, re-add `dir/`. Otherwise leave the glob output alone.
+        let has_dot_slash = pattern.starts_with("./");
+        let dir_prefix: &str = {
             let p = std::path::Path::new(pattern);
-            if let Some(parent) = p.parent() {
-                let ps = parent.to_string_lossy();
-                if ps.is_empty() || ps == "." {
-                    // Pattern has no explicit dir prefix, or just "./" vs no prefix.
-                    // Check if the pattern literally starts with "./"
-                    if pattern.starts_with("./") {
-                        "./"
-                    } else {
+            match p.parent() {
+                Some(parent) => {
+                    let ps = parent.to_string_lossy();
+                    if ps.is_empty() || ps == "." {
                         ""
-                    }
-                } else {
-                    // Pattern has a real directory component like "dir/" or "../"
-                    // We need the prefix up to and including the last slash
-                    if let Some(slash) = pattern.rfind('/') {
+                    } else if let Some(slash) = pattern.rfind('/') {
                         &pattern[..slash + 1]
                     } else {
                         ""
                     }
                 }
-            } else {
-                ""
+                None => "",
             }
         };
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
                 let s = entry.to_string_lossy().to_string();
-                // If the glob crate stripped the directory prefix, re-add it.
-                if !prefix.is_empty() && !s.starts_with(prefix) && !s.starts_with('/') {
-                    matches.push(format!("{}{}", prefix, s));
-                } else {
+                // Absolute paths: glob didn't strip anything; keep as-is.
+                if s.starts_with('/') {
                     matches.push(s);
+                    continue;
                 }
+                // Case 1: pattern had a real dir prefix like `foo/bar/`
+                // and glob returned a name without it — put it back.
+                if !dir_prefix.is_empty() && !s.starts_with(dir_prefix) {
+                    // If glob stripped only the `./` leader (common when
+                    // dir_prefix is `./dir/`), prepend `./` not the full
+                    // prefix. The rest of the prefix (`dir/`) is already
+                    // in `s`.
+                    if has_dot_slash && s.starts_with(&dir_prefix[2..]) {
+                        matches.push(format!("./{}", s));
+                    } else {
+                        matches.push(format!("{}{}", dir_prefix, s));
+                    }
+                    continue;
+                }
+                // Case 2: pattern was `./*.foo` (no real dir prefix) and
+                // glob stripped the leading `./` — put it back.
+                if has_dot_slash && dir_prefix.is_empty() && !s.starts_with("./") {
+                    matches.push(format!("./{}", s));
+                    continue;
+                }
+                matches.push(s);
             }
         }
         // GNU Make sorts wildcard results lexicographically
