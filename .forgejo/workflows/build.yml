@@ -1,7 +1,11 @@
 name: Build jmake
 on:
   push:
-    branches: [main]
+    # Run on every branch so regressions can be caught on feature
+    # branches before merge. The badge-update step at the end only
+    # commits when running on main, so non-main pushes are test-only.
+    branches: ['**']
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -146,6 +150,9 @@ jobs:
           echo "OK: $TOTAL_FAIL failure(s) <= MAX_ALLOWED_FAILS=$MAX_ALLOWED_FAILS"
 
       - name: Update README badge
+        # Only update the README badge on main so feature branches
+        # don't thrash the badge with intermediate test numbers.
+        if: github.ref == 'refs/heads/main'
         env:
           TOKEN: ${{ secrets.REPO_TOKEN }}
           SERVER: ${{ github.server_url }}
@@ -175,6 +182,10 @@ jobs:
           echo "README pushed"
 
       - name: Upload package
+        # Publish the built jpkg only from main. Non-main branches are
+        # test-only and should not leak intermediate builds into the
+        # generic package registry.
+        if: github.ref == 'refs/heads/main'
         env:
           TOKEN: ${{ secrets.REPO_TOKEN }}
           SERVER: ${{ github.server_url }}
