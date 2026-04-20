@@ -384,9 +384,16 @@ impl MakeState {
             self.shell = var.value.clone();
         }
         // .SHELLFLAGS
-        let shell_flags = self.db.variables.get(".SHELLFLAGS")
+        // Read the raw value then expand it: .SHELLFLAGS is almost always
+        // stored recursive (`=`), so `$$` escapes must collapse before the
+        // tokens reach the shell. Missing this expansion was the cause of
+        // the ONESHELL test 10 failure (`-E 'my $$foo = "bar";'` reached
+        // perl as `my $$foo = "bar"` — scalar-dereference-in-my, which
+        // perl rejects at parse time).
+        let shell_flags_raw = self.db.variables.get(".SHELLFLAGS")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "-c".to_string());
+        let shell_flags = self.expand(&shell_flags_raw);
 
         // Determine targets
         let targets = if self.args.targets.is_empty() {
@@ -3509,12 +3516,15 @@ impl MakeState {
             return Ok(());
         }
 
-        let shell = self.db.variables.get("SHELL")
+        let shell_raw = self.db.variables.get("SHELL")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "/bin/sh".to_string());
-        let shell_flags = self.db.variables.get(".SHELLFLAGS")
+        let shell = self.expand(&shell_raw);
+        let shell_flags_raw = self.db.variables.get(".SHELLFLAGS")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "-c".to_string());
+        // Expand so `$$` escapes collapse before shell argv tokenization.
+        let shell_flags = self.expand(&shell_flags_raw);
         let silent = self.args.silent;
 
         let mut any_really_rebuilt = false;

@@ -5422,7 +5422,36 @@ impl<'a> Executor<'a> {
                     run_cmd_with_error_handling(c, &cmd, &self.progname)
                 } else {
                     // Direct exec: shell_prog [shell_flags] cmd
-                    let flags: Vec<&str> = eff_flags.split_whitespace().collect();
+                    //
+                    // Split any cluster that contains `-c` into individual
+                    // tokens. POSIX sh specifies `-c` as the option that
+                    // takes command_string as its operand, so clustering
+                    // `-ec` (the default .SHELLFLAGS under .POSIX) is
+                    // formally ambiguous. bash / dash / mksh all accept
+                    // it; toybox sh rejects with "Unknown option 'ec'".
+                    // Splitting to `-e -c` is equivalent everywhere and
+                    // lets toybox sh pass the 19-ish POSIX-strictness
+                    // tests that tripped on the Pi but passed on castle.
+                    let raw_flags: Vec<&str> = eff_flags.split_whitespace().collect();
+                    let mut flags: Vec<String> = Vec::with_capacity(raw_flags.len() + 2);
+                    for flag in &raw_flags {
+                        let bytes = flag.as_bytes();
+                        // Treat only a pure short-option cluster (e.g.
+                        // "-ec", "-xvc") — never a long option like
+                        // "--cflags" or a flag with an embedded value.
+                        let is_short_cluster = bytes.len() > 2
+                            && bytes[0] == b'-'
+                            && bytes[1] != b'-'
+                            && flag[1..].bytes().all(|b| b.is_ascii_alphabetic())
+                            && flag[1..].contains('c');
+                        if is_short_cluster {
+                            for ch in flag[1..].chars() {
+                                flags.push(format!("-{}", ch));
+                            }
+                        } else {
+                            flags.push((*flag).to_string());
+                        }
+                    }
                     let mut c = Command::new(eff_shell_raw);
                     for flag in &flags {
                         c.arg(flag);
@@ -6754,9 +6783,21 @@ fn run_cmd_with_error_handling(
                     Some("Permission denied")
                 }
             } else {
-                // Bare command name: use exit code to determine error message.
+                // Bare command name. Exit 126 → Permission denied
+                // unambiguously. Exit 127 is ambiguous — the shell can
+                // also exit 127 when PATH lookup found an entry but it
+                // wasn't executable (e.g. a directory with PATH=.).
+                // Check if the name exists as a filesystem entry in
+                // cwd: if so, the real error is "Permission denied",
+                // not "No such file". Mirrors GNU Make's behavior in
+                // tests/scripts/features/errors subtest 8 (the `sd`
+                // directory with PATH=.).
                 if code == 127 {
-                    Some("No such file or directory")
+                    if Path::new(cmd_name).exists() {
+                        Some("Permission denied")
+                    } else {
+                        Some("No such file or directory")
+                    }
                 } else {
                     Some("Permission denied")
                 }
