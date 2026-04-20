@@ -336,10 +336,20 @@ impl Parser {
         }
 
         // include / -include / sinclude
-        // Handle both "include file" (with space) and bare "include" (no filenames = no-op)
-        if effective.starts_with("include ") || effective == "include"
-            || effective.starts_with("-include ") || effective == "-include"
-            || effective.starts_with("sinclude ") || effective == "sinclude" {
+        // Handle "include<whitespace>file" (space OR tab), or bare
+        // "include" (no filenames = no-op). GNU make accepts TAB as a
+        // valid directive separator — dhcpcd's src/Makefile:12 is
+        // `include<TAB><TAB>${TOP}/iconfig.mk` and the old
+        // `starts_with("include ")` check rejected it as "missing
+        // separator". See the directive_accepts_tab_separator test.
+        let starts_with_directive = |kw: &str| -> bool {
+            effective == kw
+                || effective.strip_prefix(kw)
+                    .map_or(false, |rest| rest.starts_with(' ') || rest.starts_with('\t'))
+        };
+        if starts_with_directive("include")
+            || starts_with_directive("-include")
+            || starts_with_directive("sinclude") {
             return parse_include(&effective);
         }
 
@@ -1698,6 +1708,37 @@ mod tests {
             let (name, value, _) = va(try_parse_variable_assignment(&line).expect("parse"));
             assert_eq!(name, "VAR", "input: {line}");
             assert_eq!(value, format!("echo '{embedded}'"));
+        }
+    }
+
+    /// GNU make accepts either space or TAB between a directive
+    /// keyword and its operand. jmake's parser historically required
+    /// a space, which made `include<TAB>path` fail with "missing
+    /// separator" — tripping dhcpcd's `src/Makefile:12` on every
+    /// clean build (the line is `include<TAB><TAB>${TOP}/iconfig.mk`,
+    /// a BSD-make convention that GNU make happily accepts). Regress
+    /// every directive form that takes a path / name.
+    #[test]
+    fn directive_accepts_tab_separator() {
+        let starts_with_directive = |line: &str, kw: &str| -> bool {
+            line == kw
+                || line.strip_prefix(kw)
+                    .map_or(false, |rest| rest.starts_with(' ') || rest.starts_with('\t'))
+        };
+        for line in [
+            "include\tfoo.mk",
+            "include\t\t/abs/path/to/file.mk",
+            "-include\t\toptional.mk",
+            "sinclude\tother.mk",
+            "include foo.mk",
+            "include",
+        ] {
+            assert!(
+                starts_with_directive(line, "include")
+                    || starts_with_directive(line, "-include")
+                    || starts_with_directive(line, "sinclude"),
+                "directive parser rejected legal GNU-make line: {line:?}",
+            );
         }
     }
 
