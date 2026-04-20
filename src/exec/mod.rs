@@ -6786,14 +6786,18 @@ fn run_cmd_with_error_handling(
                 // Bare command name. Exit 126 → Permission denied
                 // unambiguously. Exit 127 is ambiguous — the shell can
                 // also exit 127 when PATH lookup found an entry but it
-                // wasn't executable (e.g. a directory with PATH=.).
-                // Check if the name exists as a filesystem entry in
-                // cwd: if so, the real error is "Permission denied",
-                // not "No such file". Mirrors GNU Make's behavior in
-                // tests/scripts/features/errors subtest 8 (the `sd`
-                // directory with PATH=.).
+                // wasn't executable (most commonly a DIRECTORY matching
+                // the name with PATH=. or PATH including cwd). Narrow
+                // the check to is_dir() specifically so we don't
+                // mis-report a regular file in cwd that isn't on PATH
+                // (tests/scripts/misc/general4 subtest 8 puts
+                // foobar.sh in sd/ with PATH=.. and expects "No such
+                // file"; tests/scripts/features/errors subtest 8
+                // makes sd a directory with PATH=. and expects
+                // "Permission denied"). The is_dir() discriminator
+                // matches both.
                 if code == 127 {
-                    if Path::new(cmd_name).exists() {
+                    if Path::new(cmd_name).is_dir() {
                         Some("Permission denied")
                     } else {
                         Some("No such file or directory")
