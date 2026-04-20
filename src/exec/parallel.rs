@@ -1008,6 +1008,22 @@ impl ParallelScheduler {
     }
 
     pub fn has_work(&self) -> bool {
+        // When draining (an error has already occurred and -k is NOT in
+        // effect), `should_launch()` refuses to start any queued target
+        // — so once the last running worker finishes, the ready_queue
+        // is effectively inert and we must stop calling `recv_result`
+        // on it or main will block forever waiting for a completion
+        // that will never arrive. Reproduced against jmake 1.0.13
+        // 2026-04-20 building wpa_supplicant-2.11 with -j4: one CC
+        // fails on a missing kernel header, scheduler drains, 85
+        // Ready targets sit in the queue untouched, recv_result
+        // hangs indefinitely. JMAKE_DEBUG_DEADLOCK=N dumps the
+        // scheduler state so this failure mode is at least
+        // diagnosable, but the actual fix is to teach has_work() to
+        // match should_launch()'s semantics.
+        if self.draining && self.running_count == 0 {
+            return false;
+        }
         self.running_count > 0 || !self.ready_queue.is_empty()
     }
 
