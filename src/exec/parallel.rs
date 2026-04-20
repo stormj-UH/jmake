@@ -1037,7 +1037,73 @@ impl ParallelScheduler {
     }
 
     pub fn recv_result(&self) -> Option<JobResult> {
-        self.result_rx.recv().ok()
+        // Diagnostic: if JMAKE_DEBUG_DEADLOCK is set, time out after N seconds
+        // and dump scheduler state. Helps catch deadlocks where main waits
+        // forever for a result that no worker will ever send.
+        if let Ok(secs) = std::env::var("JMAKE_DEBUG_DEADLOCK") {
+            let timeout_secs: u64 = secs.parse().unwrap_or(30);
+            let deadline = std::time::Duration::from_secs(timeout_secs);
+            match self.result_rx.recv_timeout(deadline) {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("\n=== JMAKE DEADLOCK DETECTED ({}s) ===", timeout_secs);
+                    eprintln!("running_count: {}", self.running_count);
+                    eprintln!("ready_queue: {:?}", self.ready_queue);
+                    eprintln!("draining: {}", self.draining);
+                    eprintln!("has_error: {}", self.has_error);
+                    // Print states: how many in each state
+                    let mut ready_count = 0;
+                    let mut running_count = 0;
+                    let mut done_count = 0;
+                    let mut failed_count = 0;
+                    let mut running_targets: Vec<&String> = Vec::new();
+                    for (tgt, st) in &self.states {
+                        match st {
+                            TargetState::Ready => ready_count += 1,
+                            TargetState::Running => { running_count += 1; running_targets.push(tgt); }
+                            TargetState::Done(_) => done_count += 1,
+                            TargetState::Failed(_) => failed_count += 1,
+                        }
+                    }
+                    let total_plans = self.plans.len();
+                    let no_state = total_plans - self.states.len();
+                    eprintln!("state counts: Ready={} Running={} Done={} Failed={} no-state={}/{} plans",
+                        ready_count, running_count, done_count, failed_count, no_state, total_plans);
+                    eprintln!("Running targets (should equal running_count={}): {:?}",
+                        self.running_count, running_targets);
+
+                    // For each target stuck in no-state, dump WHY: list unmet prereqs
+                    eprintln!("\n=== Plans with NO state (scheduler never visited) ===");
+                    let mut shown = 0;
+                    for (name, _) in &self.plans {
+                        if !self.states.contains_key(name) {
+                            if shown < 10 {
+                                let prereqs = self.prereqs_of.get(name).cloned().unwrap_or_default();
+                                let unmet: Vec<String> = prereqs.iter()
+                                    .filter(|p| !matches!(self.states.get(p.as_str()), Some(TargetState::Done(_))))
+                                    .map(|p| {
+                                        let s = match self.states.get(p.as_str()) {
+                                            Some(TargetState::Ready) => "Ready",
+                                            Some(TargetState::Running) => "Running",
+                                            Some(TargetState::Done(_)) => "Done",
+                                            Some(TargetState::Failed(_)) => "Failed",
+                                            None => "NO-STATE",
+                                        };
+                                        format!("{}={}", p, s)
+                                    }).collect();
+                                eprintln!("  '{}': unmet_prereqs=[{}]", name, unmet.join(", "));
+                            }
+                            shown += 1;
+                        }
+                    }
+                    if shown > 10 { eprintln!("  ... and {} more", shown - 10); }
+                    std::process::exit(99);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            }
+        } else {
+            self.result_rx.recv().ok()
+        }
     }
 
     /// Drain remaining in-flight jobs after an error (without -k).
