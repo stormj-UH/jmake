@@ -404,10 +404,6 @@ impl Parser {
             }
         }
         if !effective.is_empty() {
-            // A bare colon (empty target from variable expansion) is silently ignored
-            if effective.starts_with(':') || effective.trim() == ":" {
-                return ParsedLine::Empty;
-            }
             // Check for ifeq/ifneq without whitespace
             if effective.starts_with("ifeq(") || effective.starts_with("ifneq(") {
                 return ParsedLine::MissingSeparator(
@@ -916,9 +912,6 @@ fn try_parse_rule_inner(line: &str, skip_tsv: bool) -> Option<ParsedLine> {
 
     // Use split_filenames to handle escaped spaces (`\ `) and escaped colons (`\:`)
     let targets: Vec<String> = split_filenames(targets_str);
-    if targets.is_empty() && !_is_grouped {
-        return None;
-    }
 
     // Split prerequisites and order-only prerequisites (after |), and extract
     // any inline recipe that appears after a bare `;`.
@@ -1752,6 +1745,40 @@ mod tests {
                     || starts_with_directive(line, "sinclude"),
                 "directive parser rejected legal GNU-make line: {line:?}",
             );
+        }
+    }
+
+    /// GNU make accepts a bare `:` rule after variable expansion. Ruby's
+    /// generated yjit.mk does this when YJIT is disabled, and the following
+    /// recipe/conditional lines must stay attached to that throwaway rule
+    /// instead of being treated as top-level syntax errors.
+    #[test]
+    fn bare_colon_rule_is_not_dropped() {
+        let state = MakeState::new(crate::cli::MakeArgs::default());
+        let parser = Parser::new(PathBuf::from("Makefile"));
+        match parser.parse_line(":", &state) {
+            ParsedLine::Rule(rule) => {
+                assert!(rule.targets.is_empty(), "expected zero-target rule, got {:?}", rule.targets);
+                assert!(rule.prerequisites.is_empty(), "expected no prerequisites, got {:?}", rule.prerequisites);
+            }
+            other => panic!("expected Rule for bare colon, got {other:?}"),
+        }
+    }
+
+    /// Once the empty-target rule is recognized as a rule, the following tabbed
+    /// commands remain recipe lines instead of tripping "missing separator".
+    #[test]
+    fn bare_colon_rule_keeps_recipe_context() {
+        let state = MakeState::new(crate::cli::MakeArgs::default());
+        let mut parser = Parser::new(PathBuf::from("Makefile"));
+        match parser.parse_line(":", &state) {
+            ParsedLine::Rule(rule) => assert!(rule.targets.is_empty()),
+            other => panic!("expected Rule for bare colon, got {other:?}"),
+        }
+        parser.in_recipe = true;
+        match parser.parse_line("\t$(ECHO) partial linking into $@", &state) {
+            ParsedLine::Recipe(recipe) => assert!(recipe.contains("partial linking")),
+            other => panic!("expected Recipe after bare colon rule, got {other:?}"),
         }
     }
 

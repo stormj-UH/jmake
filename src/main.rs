@@ -13,6 +13,40 @@ mod signal_handler;
 
 use std::process;
 
+fn should_impersonate_gnu_make(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+fn test_mode_enabled() -> bool {
+    let value = std::env::var("JMAKE_TEST_MODE").ok();
+    should_impersonate_gnu_make(value.as_deref())
+}
+
+fn target_triple() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "aarch64-unknown-linux-gnu",
+        "x86_64" => "x86_64-pc-linux-gnu",
+        _ => "unknown-unknown-linux-gnu",
+    }
+}
+
+fn version_lines(test_mode: bool) -> Vec<String> {
+    if test_mode {
+        vec![
+            "GNU Make 4.4.1".to_string(),
+            format!("Built for {}", target_triple()),
+            "Copyright (c) 2026 Jon-Erik G. Storm.".to_string(),
+            "This is jmake, a clean-room replacement for GNU Make.".to_string(),
+        ]
+    } else {
+        vec![
+            format!("jmake {}", env!("CARGO_PKG_VERSION")),
+            "Copyright (c) 2026 Jon-Erik G. Storm.".to_string(),
+            "This is jmake, a clean-room replacement for GNU Make.".to_string(),
+        ]
+    }
+}
+
 fn main() {
     // Install a custom panic hook so that stdout write errors (e.g. writing to
     // /dev/full or a closed pipe) cause a clean exit(1) rather than a panic
@@ -57,10 +91,9 @@ fn main() {
     let args = cli::parse_args();
 
     if args.version {
-        println!("GNU Make 4.4.1");
-        println!("Built for aarch64-unknown-linux-gnu");
-        println!("Copyright (c) 2026 Jon-Erik G. Storm.");
-        println!("This is jmake, a clean-room replacement for GNU Make.");
+        for line in version_lines(test_mode_enabled()) {
+            println!("{line}");
+        }
         process::exit(0);
     }
 
@@ -96,5 +129,35 @@ fn main() {
             }
             process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_impersonate_gnu_make, target_triple, version_lines};
+
+    #[test]
+    fn test_mode_only_impersonates_for_explicit_one() {
+        assert!(should_impersonate_gnu_make(Some("1")));
+        assert!(should_impersonate_gnu_make(Some(" 1 ")));
+        assert!(!should_impersonate_gnu_make(None));
+        assert!(!should_impersonate_gnu_make(Some("0")));
+        assert!(!should_impersonate_gnu_make(Some("false")));
+        assert!(!should_impersonate_gnu_make(Some("true")));
+    }
+
+    #[test]
+    fn native_version_output_identifies_jmake() {
+        let lines = version_lines(false);
+        assert_eq!(lines[0], format!("jmake {}", env!("CARGO_PKG_VERSION")));
+        assert!(lines.iter().any(|line| line.contains("This is jmake")));
+        assert!(!lines.iter().any(|line| line == "GNU Make 4.4.1"));
+    }
+
+    #[test]
+    fn test_mode_version_output_keeps_gnu_make_impersonation() {
+        let lines = version_lines(true);
+        assert_eq!(lines[0], "GNU Make 4.4.1");
+        assert_eq!(lines[1], format!("Built for {}", target_triple()));
     }
 }
