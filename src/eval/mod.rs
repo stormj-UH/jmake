@@ -1432,8 +1432,10 @@ impl MakeState {
             let is_custom_recipe_line = custom_recipe_prefix
                 .map(|c| line.starts_with(c))
                 .unwrap_or(false);
+            let current_line_is_recipe =
+                parser.in_recipe && (line.starts_with('\t') || is_custom_recipe_line);
 
-            let expanded = if line.starts_with('\t') || is_custom_recipe_line {
+            let expanded = if current_line_is_recipe {
                 line.clone()
             } else if let Some(semi_pos) = parser::find_semicolon(&line) {
                 // Check whether the part before `;` contains a `:` (rule colon).
@@ -2321,7 +2323,9 @@ impl MakeState {
                     .get(".RECIPEPREFIX")
                     .and_then(|v| v.value.chars().next())
                     .filter(|&c| c != '\t');
-                line.starts_with('\t') || custom_pfx.map(|c| line.starts_with(c)).unwrap_or(false)
+                parser.in_recipe
+                    && (line.starts_with('\t')
+                        || custom_pfx.map(|c| line.starts_with(c)).unwrap_or(false))
             };
             if !self.eval_pending.borrow().is_empty() && !current_line_is_recipe {
                 if let Some(prev) = current_rule.take() {
@@ -4988,5 +4992,34 @@ mod tests {
         assert!(!reparsed.ignore_errors);
         assert!(!reparsed.no_builtin_rules);
         assert!(!reparsed.touch);
+    }
+
+    #[test]
+    fn tab_indented_assignment_outside_recipe_drives_target_expansion() {
+        let mut state = MakeState::new(MakeArgs::default());
+        state.init_variables();
+        state
+            .eval_string(
+                "ifndef PROGRAMS\n\tPROGRAMS=foo bar\nendif\nifeq ($(MULTI),1)\n\tTARGETS=multi\nelse\n\tTARGETS=$(PROGRAMS)\nendif\nall: $(TARGETS)\nfoo:\n\tprintf foo\\\\n\nbar:\n\tprintf bar\\\\n\n",
+            )
+            .unwrap();
+
+        let programs = state.db.variables.get("PROGRAMS").unwrap();
+        assert_eq!(programs.value, "foo bar");
+
+        let all_rules = state.db.get_rules("all").unwrap();
+        assert_eq!(all_rules[0].prerequisites, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn tab_indented_simple_assignment_outside_recipe_expands_immediately() {
+        let mut state = MakeState::new(MakeArgs::default());
+        state.init_variables();
+        state
+            .eval_string("X=one\nifndef Y\n\tY:=$(X) two\nendif\nall:\n\tprintf '%s\\n' '$(Y)'\n")
+            .unwrap();
+
+        let y = state.db.variables.get("Y").unwrap();
+        assert_eq!(y.value, "one two");
     }
 }

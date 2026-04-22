@@ -107,9 +107,9 @@ impl Parser {
         // shell can handle multi-line inline recipes correctly (GNU Make 4.4 behavior).
         while line.ends_with('\\') && self.pos < self.lines.len() {
             // Check if this is a recipe line (tab prefix or custom .RECIPEPREFIX)
-            let is_recipe_line = line.starts_with('\t') || self.recipe_prefix
+            let is_recipe_line = self.in_recipe && (line.starts_with('\t') || self.recipe_prefix
                 .map(|p| p != '\t' && line.starts_with(p))
-                .unwrap_or(false);
+                .unwrap_or(false));
             if is_recipe_line {
                 // Recipe line: preserve \<newline> for the shell.
                 // GNU Make strips at most ONE leading prefix character from the continuation
@@ -175,9 +175,9 @@ impl Parser {
         // backslash and append a single space (matching GNU Make's
         // collapse_continuations behaviour where backslash-newline at EOF
         // still triggers the join, just with an empty continuation).
-        let is_recipe_at_eof = line.starts_with('\t') || self.recipe_prefix
+        let is_recipe_at_eof = self.in_recipe && (line.starts_with('\t') || self.recipe_prefix
             .map(|p| p != '\t' && line.starts_with(p))
-            .unwrap_or(false);
+            .unwrap_or(false));
         if line.ends_with('\\') && !is_recipe_at_eof && !line_has_inline_recipe(&line) {
             line.pop(); // remove the trailing backslash
             if !self.posix_mode {
@@ -212,9 +212,11 @@ impl Parser {
             .and_then(|v| v.value.chars().next())
             .unwrap_or('\t');
 
-        // A tab-prefixed line is always treated as a recipe line (GNU Make rule).
-        // A custom RECIPEPREFIX line is also a recipe line.
-        if line.starts_with('\t') || (recipe_prefix != '\t' && line.starts_with(recipe_prefix)) {
+        let line_has_recipe_prefix =
+            line.starts_with('\t') || (recipe_prefix != '\t' && line.starts_with(recipe_prefix));
+
+        // A recipe prefix only starts a recipe when we are already in recipe context.
+        if self.in_recipe && line_has_recipe_prefix {
             // Strip exactly the one prefix character
             let stripped = &line[recipe_prefix.len_utf8()..];
             return ParsedLine::Recipe(stripped.to_string());
@@ -384,6 +386,11 @@ impl Parser {
             // A bare colon (empty target from variable expansion) is silently ignored
             if effective.starts_with(':') || effective.trim() == ":" {
                 return ParsedLine::Empty;
+            }
+            if line_has_recipe_prefix {
+                return ParsedLine::MissingSeparator(
+                    "recipe commences before first target".to_string()
+                );
             }
             // Check for ifeq/ifneq without whitespace
             if effective.starts_with("ifeq(") || effective.starts_with("ifneq(") {
