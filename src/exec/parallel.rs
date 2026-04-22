@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -183,7 +183,11 @@ pub fn execute_job(job: Job) -> JobResult {
         if !job.dry_run {
             touch_file_standalone(&target);
         }
-        return JobResult { target, rebuilt: true, error: None };
+        return JobResult {
+            target,
+            rebuilt: true,
+            error: None,
+        };
     }
 
     if job.one_shell {
@@ -253,11 +257,19 @@ fn execute_job_oneshell(job: Job) -> JobResult {
     }
 
     if script.trim().is_empty() {
-        return JobResult { target, rebuilt: false, error: None };
+        return JobResult {
+            target,
+            rebuilt: false,
+            error: None,
+        };
     }
 
     if job.dry_run {
-        return JobResult { target, rebuilt: true, error: None };
+        return JobResult {
+            target,
+            rebuilt: true,
+            error: None,
+        };
     }
 
     let flags = parse_shell_flags_standalone(&job.shell_flags);
@@ -266,8 +278,14 @@ fn execute_job_oneshell(job: Job) -> JobResult {
         cmd.arg(flag);
     }
     cmd.arg(script.trim_end_matches('\n'));
-    apply_env_ops(&mut cmd, &job.env_ops, &job.extra_exports, &job.extra_unexports,
-                  &job.makelevel, job.gnumakeflags_was_set);
+    apply_env_ops(
+        &mut cmd,
+        &job.env_ops,
+        &job.extra_exports,
+        &job.extra_unexports,
+        &job.makelevel,
+        job.gnumakeflags_was_set,
+    );
 
     match cmd.status() {
         Ok(s) if !s.success() => {
@@ -280,19 +298,38 @@ fn execute_job_oneshell(job: Job) -> JobResult {
                 format!("{}:{}: ", job.source_file, last_lineno)
             };
             if effective_ignore {
-                eprintln!("{}: [{}{}] Error {} (ignored)", job.progname, loc, target, code);
-                JobResult { target, rebuilt: true, error: None }
+                eprintln!(
+                    "{}: [{}{}] Error {} (ignored)",
+                    job.progname, loc, target, code
+                );
+                JobResult {
+                    target,
+                    rebuilt: true,
+                    error: None,
+                }
             } else {
                 eprintln!("{}: *** [{}{}] Error {}", job.progname, loc, target, code);
                 maybe_delete_on_error(&target, job.delete_on_error, job.is_precious, &job.progname);
-                JobResult { target, rebuilt: true, error: Some(String::new()) }
+                JobResult {
+                    target,
+                    rebuilt: true,
+                    error: Some(String::new()),
+                }
             }
         }
         Err(e) => {
             eprintln!("{}: *** Error running shell: {}", job.progname, e);
-            JobResult { target, rebuilt: true, error: Some(String::new()) }
+            JobResult {
+                target,
+                rebuilt: true,
+                error: Some(String::new()),
+            }
         }
-        _ => JobResult { target, rebuilt: true, error: None },
+        _ => JobResult {
+            target,
+            rebuilt: true,
+            error: None,
+        },
     }
 }
 
@@ -347,9 +384,14 @@ fn execute_job_normal(job: Job) -> JobResult {
                 let composed = format!("{} {} {}", job.shell, job.shell_flags, cmd);
                 let mut c = Command::new("/bin/sh");
                 c.arg("-c").arg(&composed);
-                apply_env_ops(&mut c, &job.env_ops, &job.extra_exports,
-                              &job.extra_unexports, &job.makelevel,
-                              job.gnumakeflags_was_set);
+                apply_env_ops(
+                    &mut c,
+                    &job.env_ops,
+                    &job.extra_exports,
+                    &job.extra_unexports,
+                    &job.makelevel,
+                    job.gnumakeflags_was_set,
+                );
                 c.status()
             } else {
                 let flags = parse_shell_flags_standalone(&job.shell_flags);
@@ -358,9 +400,14 @@ fn execute_job_normal(job: Job) -> JobResult {
                     c.arg(flag);
                 }
                 c.arg(&cmd);
-                apply_env_ops(&mut c, &job.env_ops, &job.extra_exports,
-                              &job.extra_unexports, &job.makelevel,
-                              job.gnumakeflags_was_set);
+                apply_env_ops(
+                    &mut c,
+                    &job.env_ops,
+                    &job.extra_exports,
+                    &job.extra_unexports,
+                    &job.makelevel,
+                    job.gnumakeflags_was_set,
+                );
                 c.status()
             };
 
@@ -376,24 +423,38 @@ fn execute_job_normal(job: Job) -> JobResult {
                 Ok(s) if !s.success() => {
                     let code = s.code().unwrap_or(1);
                     if effective_ignore {
-                        eprintln!("{}: [{}{}] Error {} (ignored)",
-                                  job.progname, loc, target, code);
+                        eprintln!(
+                            "{}: [{}{}] Error {} (ignored)",
+                            job.progname, loc, target, code
+                        );
                     } else {
-                        eprintln!("{}: *** [{}{}] Error {}",
-                                  job.progname, loc, target, code);
-                        maybe_delete_on_error(&target, job.delete_on_error,
-                                              job.is_precious, &job.progname);
-                        return JobResult { target, rebuilt: true, error: Some(String::new()) };
+                        eprintln!("{}: *** [{}{}] Error {}", job.progname, loc, target, code);
+                        maybe_delete_on_error(
+                            &target,
+                            job.delete_on_error,
+                            job.is_precious,
+                            &job.progname,
+                        );
+                        return JobResult {
+                            target,
+                            rebuilt: true,
+                            error: Some(String::new()),
+                        };
                     }
                 }
                 Err(e) => {
                     if effective_ignore {
-                        eprintln!("{}: [{}{}] Error: {} (ignored)",
-                                  job.progname, loc, target, e);
+                        eprintln!(
+                            "{}: [{}{}] Error: {} (ignored)",
+                            job.progname, loc, target, e
+                        );
                     } else {
-                        eprintln!("{}: *** [{}{}] Error: {}",
-                                  job.progname, loc, target, e);
-                        return JobResult { target, rebuilt: true, error: Some(String::new()) };
+                        eprintln!("{}: *** [{}{}] Error: {}", job.progname, loc, target, e);
+                        return JobResult {
+                            target,
+                            rebuilt: true,
+                            error: Some(String::new()),
+                        };
                     }
                 }
                 _ => {}
@@ -546,7 +607,8 @@ impl ParallelScheduler {
                 let barrier_name = format!("{}##wait##{}", name, gi);
 
                 // Barrier prerequisites: targets in the current group that are known.
-                let mut barrier_prereqs: Vec<String> = group.iter()
+                let mut barrier_prereqs: Vec<String> = group
+                    .iter()
                     .filter(|t| plans.contains_key(t.as_str()))
                     .cloned()
                     .collect();
@@ -596,8 +658,10 @@ impl ParallelScheduler {
                                     continue;
                                 }
                                 if plans.contains_key(first_prereq.as_str()) {
-                                    extra_prereqs.push((first_prereq.clone(), barrier_name.clone()));
-                                    extra_dependents.push((barrier_name.clone(), first_prereq.clone()));
+                                    extra_prereqs
+                                        .push((first_prereq.clone(), barrier_name.clone()));
+                                    extra_dependents
+                                        .push((barrier_name.clone(), first_prereq.clone()));
                                 }
                             }
                         }
@@ -605,23 +669,26 @@ impl ParallelScheduler {
                 }
 
                 // Create the virtual barrier plan (empty recipe, completes immediately).
-                barrier_plans.insert(barrier_name.clone(), TargetPlan {
-                    target: barrier_name.clone(),
-                    prerequisites: barrier_prereqs,
-                    order_only: Vec::new(),
-                    recipe: Vec::new(),
-                    source_file: String::new(),
-                    auto_vars: HashMap::new(),
-                    is_phony: false,
-                    needs_rebuild: true,
-                    grouped_primary: None,
-                    grouped_siblings: Vec::new(),
-                    extra_exports: HashMap::new(),
-                    extra_unexports: Vec::new(),
-                    is_intermediate: false,
-                    wait_groups: Vec::new(),
-                    intermediate_also_make: Vec::new(),
-                });
+                barrier_plans.insert(
+                    barrier_name.clone(),
+                    TargetPlan {
+                        target: barrier_name.clone(),
+                        prerequisites: barrier_prereqs,
+                        order_only: Vec::new(),
+                        recipe: Vec::new(),
+                        source_file: String::new(),
+                        auto_vars: HashMap::new(),
+                        is_phony: false,
+                        needs_rebuild: true,
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: HashMap::new(),
+                        extra_unexports: Vec::new(),
+                        is_intermediate: false,
+                        wait_groups: Vec::new(),
+                        intermediate_also_make: Vec::new(),
+                    },
+                );
 
                 last_barrier = Some(barrier_name);
             }
@@ -665,7 +732,8 @@ impl ParallelScheduler {
                 //
                 // Check: does this target have any prerequisites that are themselves
                 // in the plans map (i.e., need to be scheduled)?
-                let has_pending_prereqs = prereqs_of.get(name.as_str())
+                let has_pending_prereqs = prereqs_of
+                    .get(name.as_str())
                     .map_or(false, |deps| !deps.is_empty());
                 if !has_pending_prereqs {
                     // Leaf "up-to-date" target: mark Done immediately.
@@ -706,7 +774,9 @@ impl ParallelScheduler {
         let mut visited_order: Vec<String> = Vec::new();
         let mut queue: VecDeque<String> = roots.iter().cloned().collect();
         while let Some(t) = queue.pop_front() {
-            if !visited.insert(t.clone()) { continue; }
+            if !visited.insert(t.clone()) {
+                continue;
+            }
             visited_order.push(t.clone());
             if let Some(deps) = self.prereqs_of.get(&t) {
                 for d in deps.clone() {
@@ -744,7 +814,8 @@ impl ParallelScheduler {
                     self.states.insert(t.clone(), TargetState::Done(false));
                     // Also complete grouped siblings if any.
                     for sib in grouped_siblings {
-                        self.states.insert(sib, TargetState::Done(false));
+                        self.states.insert(sib.clone(), TargetState::Done(false));
+                        newly_done.push(sib);
                     }
                     newly_done.push(t.clone());
                 }
@@ -763,9 +834,9 @@ impl ParallelScheduler {
             Some(p) => p,
             None => return true,
         };
-        prereqs.iter().all(|p| {
-            matches!(self.states.get(p.as_str()), Some(TargetState::Done(_)))
-        })
+        prereqs
+            .iter()
+            .all(|p| matches!(self.states.get(p.as_str()), Some(TargetState::Done(_))))
     }
 
     /// Public version of all_prereqs_done for use from exec/mod.rs.
@@ -779,9 +850,9 @@ impl ParallelScheduler {
             Some(p) => p,
             None => return false,
         };
-        prereqs.iter().any(|p| {
-            matches!(self.states.get(p.as_str()), Some(TargetState::Failed(_)))
-        })
+        prereqs
+            .iter()
+            .any(|p| matches!(self.states.get(p.as_str()), Some(TargetState::Failed(_))))
     }
 
     /// Check if the recipe for `target` actually needs to run, given what we
@@ -798,9 +869,10 @@ impl ParallelScheduler {
             // Was conservatively marked as needing rebuild during graph resolution.
             // Re-check: if no prereq was actually rebuilt AND target exists with
             // newer mtime, skip.
-            let any_rebuilt = plan.prerequisites.iter().any(|p| {
-                matches!(self.states.get(p.as_str()), Some(TargetState::Done(true)))
-            });
+            let any_rebuilt = plan
+                .prerequisites
+                .iter()
+                .any(|p| matches!(self.states.get(p.as_str()), Some(TargetState::Done(true))));
             if any_rebuilt {
                 return true;
             }
@@ -810,9 +882,9 @@ impl ParallelScheduler {
             return true;
         }
         // Wasn't marked as needing rebuild — check if any normal prereq was rebuilt.
-        plan.prerequisites.iter().any(|p| {
-            matches!(self.states.get(p.as_str()), Some(TargetState::Done(true)))
-        })
+        plan.prerequisites
+            .iter()
+            .any(|p| matches!(self.states.get(p.as_str()), Some(TargetState::Done(true))))
     }
 
     fn launch_job(&mut self, target: &str) {
@@ -820,44 +892,51 @@ impl ParallelScheduler {
             Some(p) => p,
             None => {
                 // No plan → mark done (no-op).
-                self.states.insert(target.to_string(), TargetState::Done(false));
+                self.states
+                    .insert(target.to_string(), TargetState::Done(false));
                 return;
             }
         };
 
         // Check if the recipe actually needs to run given current state.
         if !self.should_rebuild_now(target) {
-            self.states.insert(target.to_string(), TargetState::Done(false));
+            self.states
+                .insert(target.to_string(), TargetState::Done(false));
             self.complete_grouped_siblings(target, false);
             return;
         }
 
         if plan.recipe.is_empty() {
             // No recipe to run — target is "built" without executing anything.
-            self.states.insert(target.to_string(), TargetState::Done(false));
+            self.states
+                .insert(target.to_string(), TargetState::Done(false));
             self.complete_grouped_siblings(target, false);
             return;
         }
 
         let job = Job {
             target: plan.target.clone(),
-            pre_expanded: plan.recipe.iter().map(|(ln, line)| {
-                // The recipe lines stored in TargetPlan are already the RAW (unexpanded)
-                // lines. We need to expand them here. However, since we're on the main
-                // thread and the plan was built on the main thread, and all expansion
-                // happened during graph resolution (pre_expanded is stored), we just
-                // package them for the worker.
-                //
-                // IMPORTANT: The recipe stored in TargetPlan IS pre-expanded (the executor
-                // calls expand_with_auto_vars and stores the result). Sub-lines are
-                // computed from the expanded text.
-                //
-                // For parallel.rs, TargetPlan.recipe stores (lineno, expanded_text) pairs
-                // where expanded_text is the ALREADY-EXPANDED recipe line. Sub-lines are
-                // split here.
-                let sub_lines = split_recipe_sub_lines_standalone(line);
-                (*ln, line.clone(), sub_lines)
-            }).collect(),
+            pre_expanded: plan
+                .recipe
+                .iter()
+                .map(|(ln, line)| {
+                    // The recipe lines stored in TargetPlan are already the RAW (unexpanded)
+                    // lines. We need to expand them here. However, since we're on the main
+                    // thread and the plan was built on the main thread, and all expansion
+                    // happened during graph resolution (pre_expanded is stored), we just
+                    // package them for the worker.
+                    //
+                    // IMPORTANT: The recipe stored in TargetPlan IS pre-expanded (the executor
+                    // calls expand_with_auto_vars and stores the result). Sub-lines are
+                    // computed from the expanded text.
+                    //
+                    // For parallel.rs, TargetPlan.recipe stores (lineno, expanded_text) pairs
+                    // where expanded_text is the ALREADY-EXPANDED recipe line. Sub-lines are
+                    // split here.
+                    let sub_lines = split_recipe_sub_lines_standalone(line);
+                    (*ln, line.clone(), sub_lines)
+                })
+                .collect(),
             source_file: plan.source_file.clone(),
             shell: String::new(), // filled by build_targets_parallel before launch
             shell_flags: String::new(),
@@ -894,8 +973,12 @@ impl ParallelScheduler {
             Some(p) => p.grouped_siblings.clone(),
             None => return,
         };
+        for sibling in &siblings {
+            self.states
+                .insert(sibling.clone(), TargetState::Done(rebuilt));
+        }
         for sibling in siblings {
-            self.states.insert(sibling, TargetState::Done(rebuilt));
+            self.propagate_completion(&sibling);
         }
     }
 
@@ -904,7 +987,8 @@ impl ParallelScheduler {
         let target = result.target.clone();
 
         if let Some(err) = result.error {
-            self.states.insert(target.clone(), TargetState::Failed(err.clone()));
+            self.states
+                .insert(target.clone(), TargetState::Failed(err.clone()));
             self.has_error = true;
             if self.running_count > 0 && !self.draining {
                 eprintln!("{}: *** Waiting for unfinished jobs....", self.progname);
@@ -922,16 +1006,20 @@ impl ParallelScheduler {
             if let Some(deps) = self.dependents_of.get(&target) {
                 for dep in deps.clone() {
                     if !self.states.contains_key(dep.as_str()) {
-                        self.states.insert(dep.clone(), TargetState::Failed(
-                            format!("prerequisite '{}' failed", target)
-                        ));
+                        self.states.insert(
+                            dep.clone(),
+                            TargetState::Failed(format!("prerequisite '{}' failed", target)),
+                        );
                     }
                 }
             }
         } else {
             let rebuilt = result.rebuilt;
-            if rebuilt { self.any_recipe_ran = true; }
-            self.states.insert(target.clone(), TargetState::Done(rebuilt));
+            if rebuilt {
+                self.any_recipe_ran = true;
+            }
+            self.states
+                .insert(target.clone(), TargetState::Done(rebuilt));
             // Complete grouped siblings.
             self.complete_grouped_siblings(&target, rebuilt);
             // Track intermediate targets that were rebuilt.
@@ -973,14 +1061,17 @@ impl ParallelScheduler {
             }
             if !self.has_error || self.keep_going {
                 if self.any_prereq_failed(&dep) {
-                    self.states.insert(dep.clone(), TargetState::Failed(
-                        format!("prerequisite of '{}' failed", dep)
-                    ));
+                    self.states.insert(
+                        dep.clone(),
+                        TargetState::Failed(format!("prerequisite of '{}' failed", dep)),
+                    );
                     continue;
                 }
                 if self.all_prereqs_done(&dep) {
                     // Check if this dependent needs rebuilding.
-                    let needs_rebuild = self.plans.get(dep.as_str())
+                    let needs_rebuild = self
+                        .plans
+                        .get(dep.as_str())
                         .map_or(true, |p| p.needs_rebuild);
                     if needs_rebuild {
                         self.states.insert(dep.clone(), TargetState::Ready);
@@ -988,13 +1079,7 @@ impl ParallelScheduler {
                     } else {
                         // Up-to-date target: mark Done and propagate further.
                         self.states.insert(dep.clone(), TargetState::Done(false));
-                        // Complete grouped siblings.
-                        let siblings = self.plans.get(dep.as_str())
-                            .map(|p| p.grouped_siblings.clone())
-                            .unwrap_or_default();
-                        for sib in &siblings {
-                            self.states.insert(sib.clone(), TargetState::Done(false));
-                        }
+                        self.complete_grouped_siblings(&dep, false);
                         // Recursively propagate to this dep's dependents.
                         self.propagate_completion(&dep);
                     }
@@ -1121,8 +1206,12 @@ fn apply_env_ops(
     // Apply global env ops.
     for (name, val) in env_ops {
         match val {
-            Some(v) => { cmd.env(name, v); }
-            None => { cmd.env_remove(name); }
+            Some(v) => {
+                cmd.env(name, v);
+            }
+            None => {
+                cmd.env_remove(name);
+            }
         }
     }
     // MAKELEVEL is always set explicitly.
@@ -1180,10 +1269,21 @@ pub fn parse_recipe_prefix_standalone(line: &str) -> (String, bool, bool, bool) 
 
     while i < bytes.len() {
         match bytes[i] {
-            b'@' => { silent = true; i += 1; }
-            b'-' => { ignore = true; i += 1; }
-            b'+' => { force = true; i += 1; }
-            b' ' | b'\t' => { i += 1; }
+            b'@' => {
+                silent = true;
+                i += 1;
+            }
+            b'-' => {
+                ignore = true;
+                i += 1;
+            }
+            b'+' => {
+                force = true;
+                i += 1;
+            }
+            b' ' | b'\t' => {
+                i += 1;
+            }
             _ => break,
         }
     }

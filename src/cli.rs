@@ -38,8 +38,8 @@ pub struct MakeArgs {
     pub output_sync: Option<String>,
     pub eval_strings: Vec<String>,
     pub what_if: Vec<String>,
-    pub no_silent: bool,  // explicitly set with --no-silent (for MAKEFLAGS output)
-    pub clear_include_dirs: bool,  // -I- was passed (clear default include dirs)
+    pub no_silent: bool, // explicitly set with --no-silent (for MAKEFLAGS output)
+    pub clear_include_dirs: bool, // -I- was passed (clear default include dirs)
     /// Index in `variables` where command-line variables start.
     /// Variables before this index came from the MAKEFLAGS environment variable.
     /// Variables at or after this index came from the command line.
@@ -220,7 +220,8 @@ pub fn parse_args() -> MakeArgs {
                 "--environment-overrides" => result.environment_overrides = true,
                 "--file" | "--makefile" => {
                     i += 1;
-                    let val = require_arg(&args, i, if arg == "--file" { "file" } else { "makefile" });
+                    let val =
+                        require_arg(&args, i, if arg == "--file" { "file" } else { "makefile" });
                     result.makefiles.push(PathBuf::from(val));
                 }
                 "--ignore-errors" => result.ignore_errors = true,
@@ -237,15 +238,39 @@ pub fn parse_args() -> MakeArgs {
                         result.jobs_explicit = true;
                     }
                 }
-                "--keep-going" => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
+                "--keep-going" => {
+                    result.keep_going = true;
+                    result.keep_going_explicit = true;
+                    result.no_keep_going_explicit = false;
+                }
                 "--no-builtin-rules" => result.no_builtin_rules = true,
                 "--no-builtin-variables" => result.no_builtin_variables = true,
-                "--no-print-directory" => { result.no_print_directory = true; result.print_directory = false; result.no_print_directory_explicit = true; result.print_directory_explicit = false; }
-                "--print-directory" => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; result.no_print_directory_explicit = false; }
+                "--no-print-directory" => {
+                    result.no_print_directory = true;
+                    result.print_directory = false;
+                    result.no_print_directory_explicit = true;
+                    result.print_directory_explicit = false;
+                }
+                "--print-directory" => {
+                    result.print_directory = true;
+                    result.no_print_directory = false;
+                    result.print_directory_explicit = true;
+                    result.no_print_directory_explicit = false;
+                }
                 "--print-data-base" => result.print_data_base = true,
                 "--question" => result.question = true,
-                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
-                "--no-silent" => { result.silent = false; result.no_silent = true; result.no_silent_explicit = true; result.silent_explicit = false; }
+                "--silent" | "--quiet" => {
+                    result.silent = true;
+                    result.no_silent = false;
+                    result.silent_explicit = true;
+                    result.no_silent_explicit = false;
+                }
+                "--no-silent" => {
+                    result.silent = false;
+                    result.no_silent = true;
+                    result.no_silent_explicit = true;
+                    result.silent_explicit = false;
+                }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -277,7 +302,7 @@ pub fn parse_args() -> MakeArgs {
                 }
                 s if s.starts_with("--debug") => {
                     if let Some(eq) = s.find('=') {
-                        result.debug.push(s[eq+1..].to_string());
+                        result.debug.push(s[eq + 1..].to_string());
                     } else {
                         result.debug.push("b".to_string());
                     }
@@ -285,7 +310,10 @@ pub fn parse_args() -> MakeArgs {
                 s if s.starts_with("--jobs=") => {
                     let val = &s[7..];
                     match val.parse::<usize>() {
-                        Ok(n) => { result.jobs = n; result.jobs_explicit = true; }
+                        Ok(n) => {
+                            result.jobs = n;
+                            result.jobs_explicit = true;
+                        }
                         Err(_) => {
                             let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
                             eprintln!("{}: invalid option -- '--jobs={}'", progname, val);
@@ -297,7 +325,11 @@ pub fn parse_args() -> MakeArgs {
                     result.directory = accumulate_dir(result.directory.take(), &s[12..]);
                 }
                 s if s.starts_with("--file=") || s.starts_with("--makefile=") => {
-                    let val = if s.starts_with("--file=") { &s[7..] } else { &s[11..] };
+                    let val = if s.starts_with("--file=") {
+                        &s[7..]
+                    } else {
+                        &s[11..]
+                    };
                     result.makefiles.push(PathBuf::from(val));
                 }
                 s if s.starts_with("--include-dir=") => {
@@ -310,18 +342,25 @@ pub fn parse_args() -> MakeArgs {
                     result.eval_strings.push(s[7..].to_string());
                 }
                 s if s.starts_with("--old-file=") || s.starts_with("--assume-old=") => {
-                    let val = if s.starts_with("--old-file=") { &s[11..] } else { &s[13..] };
+                    let val = if s.starts_with("--old-file=") {
+                        &s[11..]
+                    } else {
+                        &s[13..]
+                    };
                     result.old_file.push(val.to_string());
                 }
-                s if s.starts_with("--new-file=") || s.starts_with("--assume-new=") || s.starts_with("--what-if=") => {
+                s if s.starts_with("--new-file=")
+                    || s.starts_with("--assume-new=")
+                    || s.starts_with("--what-if=") =>
+                {
                     let eq = s.find('=').unwrap();
-                    let val = &s[eq+1..];
+                    let val = &s[eq + 1..];
                     result.new_file.push(val.to_string());
                     result.what_if.push(val.to_string());
                 }
                 s if s.starts_with("--load-average") => {
                     if let Some(eq) = s.find('=') {
-                        result.load_average = s[eq+1..].parse().ok();
+                        result.load_average = s[eq + 1..].parse().ok();
                     }
                 }
                 s if s.starts_with("--temp-stdin=") => {
@@ -351,7 +390,10 @@ pub fn parse_args() -> MakeArgs {
                         }
                     });
                 }
-                s if s == "--no-keep-going" || s == "--sync-output" || s.starts_with("--output-sync") => {
+                s if s == "--no-keep-going"
+                    || s == "--sync-output"
+                    || s.starts_with("--output-sync") =>
+                {
                     // Accepted but not implemented
                 }
                 _ => {
@@ -376,7 +418,7 @@ pub fn parse_args() -> MakeArgs {
                     'B' => result.always_make = true,
                     'C' => {
                         // -C dir
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.directory = Some(PathBuf::from(rest));
                         } else {
@@ -393,7 +435,7 @@ pub fn parse_args() -> MakeArgs {
                         result.debug.push("b".to_string());
                     }
                     'E' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.eval_strings.push(rest);
                         } else {
@@ -406,7 +448,7 @@ pub fn parse_args() -> MakeArgs {
                     }
                     'e' => result.environment_overrides = true,
                     'f' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.makefiles.push(PathBuf::from(rest));
                         } else {
@@ -423,7 +465,7 @@ pub fn parse_args() -> MakeArgs {
                     }
                     'i' => result.ignore_errors = true,
                     'I' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             if rest == "-" {
                                 // -I- resets the include search path.  Keep "-" as a
@@ -450,13 +492,16 @@ pub fn parse_args() -> MakeArgs {
                     }
                     'j' => {
                         result.jobs_explicit = true;
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             // -j<value>: if value is not a valid number, it's an error.
                             match rest.parse::<usize>() {
-                                Ok(n) => { result.jobs = n; }
+                                Ok(n) => {
+                                    result.jobs = n;
+                                }
                                 Err(_) => {
-                                    let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
+                                    let progname =
+                                        args.get(0).map(|s| s.as_str()).unwrap_or("make");
                                     eprintln!("{}: invalid option -- 'j{}'", progname, rest);
                                     std::process::exit(2);
                                 }
@@ -481,13 +526,17 @@ pub fn parse_args() -> MakeArgs {
                             }
                         }
                     }
-                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
+                    'k' => {
+                        result.keep_going = true;
+                        result.keep_going_explicit = true;
+                        result.no_keep_going_explicit = false;
+                    }
                     'L' => {
                         // -L = --check-symlink-times (no argument)
                         result.check_symlink_times = true;
                     }
                     'l' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.load_average = rest.parse().ok();
                             j = chars.len();
@@ -504,7 +553,7 @@ pub fn parse_args() -> MakeArgs {
                         result.just_print = true;
                     }
                     'O' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.output_sync = Some(rest);
                         } else {
@@ -517,7 +566,7 @@ pub fn parse_args() -> MakeArgs {
                         continue;
                     }
                     'o' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.old_file.push(rest);
                         } else {
@@ -533,13 +582,27 @@ pub fn parse_args() -> MakeArgs {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
-                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; } // --no-keep-going
+                    's' => {
+                        result.silent = true;
+                        result.no_silent = false;
+                        result.silent_explicit = true;
+                        result.no_silent_explicit = false;
+                    }
+                    'S' => {
+                        result.keep_going = false;
+                        result.no_keep_going_explicit = true;
+                        result.keep_going_explicit = false;
+                    } // --no-keep-going
                     't' => result.touch = true,
                     'v' => result.version = true,
-                    'w' => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; result.no_print_directory_explicit = false; }
+                    'w' => {
+                        result.print_directory = true;
+                        result.no_print_directory = false;
+                        result.print_directory_explicit = true;
+                        result.no_print_directory_explicit = false;
+                    }
                     'W' => {
-                        let rest: String = chars[j+1..].iter().collect();
+                        let rest: String = chars[j + 1..].iter().collect();
                         if !rest.is_empty() {
                             result.new_file.push(rest.clone());
                             result.what_if.push(rest);
@@ -560,7 +623,7 @@ pub fn parse_args() -> MakeArgs {
         } else if let Some(eq_pos) = arg.find('=') {
             // VAR=VALUE on command line
             let name = arg[..eq_pos].to_string();
-            let value = arg[eq_pos+1..].to_string();
+            let value = arg[eq_pos + 1..].to_string();
             result.variables.push((name, value));
         } else {
             // Target
@@ -619,7 +682,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     // IMPORTANT: backslash-escaping is respected: \<space> is a literal space,
     // not a token separator (as in --eval=$(info\ eval)).
 
-    let trimmed = flags.trim();
+    let trimmed = flags.trim_start();
     if trimmed.is_empty() {
         return;
     }
@@ -637,7 +700,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
             // Variable assignment: NAME=value or NAME:=value etc.
             if let Some(eq_pos) = token.find('=') {
                 let name = token[..eq_pos].to_string();
-                let value = token[eq_pos+1..].to_string();
+                let value = token[eq_pos + 1..].to_string();
                 result.variables.push((name, value));
             } else {
                 // Bare token after -- with no '=': treat as bundled single-char flags.
@@ -647,15 +710,32 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         'B' => result.always_make = true,
                         'e' => result.environment_overrides = true,
                         'i' => result.ignore_errors = true,
-                        'k' => { result.keep_going = true; result.keep_going_explicit = true; }
-                        'n' => { result.dry_run = true; result.just_print = true; }
+                        'k' => {
+                            result.keep_going = true;
+                            result.keep_going_explicit = true;
+                        }
+                        'n' => {
+                            result.dry_run = true;
+                            result.just_print = true;
+                        }
                         'q' => result.question = true,
                         'r' => result.no_builtin_rules = true,
                         'R' => result.no_builtin_variables = true,
-                        's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; }
-                        'S' => { result.keep_going = false; result.no_keep_going_explicit = true; }
+                        's' => {
+                            result.silent = true;
+                            result.no_silent = false;
+                            result.silent_explicit = true;
+                        }
+                        'S' => {
+                            result.keep_going = false;
+                            result.no_keep_going_explicit = true;
+                        }
                         't' => result.touch = true,
-                        'w' => { result.print_directory = true; result.no_print_directory = false; result.print_directory_explicit = true; }
+                        'w' => {
+                            result.print_directory = true;
+                            result.no_print_directory = false;
+                            result.print_directory_explicit = true;
+                        }
                         'L' => result.check_symlink_times = true,
                         _ => {}
                     }
@@ -677,8 +757,16 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                 "--always-make" => result.always_make = true,
                 "--environment-overrides" => result.environment_overrides = true,
                 "--ignore-errors" => result.ignore_errors = true,
-                "--keep-going" => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
-                "--no-keep-going" | "--stop" => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
+                "--keep-going" => {
+                    result.keep_going = true;
+                    result.keep_going_explicit = true;
+                    result.no_keep_going_explicit = false;
+                }
+                "--no-keep-going" | "--stop" => {
+                    result.keep_going = false;
+                    result.no_keep_going_explicit = true;
+                    result.keep_going_explicit = false;
+                }
                 "--dry-run" | "--just-print" | "--recon" => {
                     result.dry_run = true;
                     result.just_print = true;
@@ -697,8 +785,18 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     result.print_directory_explicit = true;
                     result.no_print_directory_explicit = false;
                 }
-                "--silent" | "--quiet" => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
-                "--no-silent" => { result.silent = false; result.no_silent = true; result.no_silent_explicit = true; result.silent_explicit = false; }
+                "--silent" | "--quiet" => {
+                    result.silent = true;
+                    result.no_silent = false;
+                    result.silent_explicit = true;
+                    result.no_silent_explicit = false;
+                }
+                "--no-silent" => {
+                    result.silent = false;
+                    result.no_silent = true;
+                    result.no_silent_explicit = true;
+                    result.silent_explicit = false;
+                }
                 "--touch" => result.touch = true,
                 "--trace" => result.trace = true,
                 "--warn-undefined-variables" => result.warn_undefined_variables = true,
@@ -713,7 +811,9 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     result.output_sync = Some(token[14..].to_string());
                 }
                 _ if token.starts_with("--include-dir=") => {
-                    result.include_dirs.push(std::path::PathBuf::from(&token[14..]));
+                    result
+                        .include_dirs
+                        .push(std::path::PathBuf::from(&token[14..]));
                 }
                 _ if token.starts_with("--load-average=") => {
                     result.load_average = token[15..].parse().ok();
@@ -757,19 +857,21 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'e' => result.environment_overrides = true,
                     'i' => result.ignore_errors = true,
                     'I' => {
-                        let arg: String = chars[j+1..].iter().collect();
+                        let arg: String = chars[j + 1..].iter().collect();
                         if !arg.is_empty() {
                             result.include_dirs.push(std::path::PathBuf::from(arg));
                         } else if i + 1 < tokens.len() {
                             i += 1;
-                            result.include_dirs.push(std::path::PathBuf::from(&tokens[i]));
+                            result
+                                .include_dirs
+                                .push(std::path::PathBuf::from(&tokens[i]));
                         }
                         j = chars.len();
                         continue;
                     }
                     'j' => {
                         // -j[N]: job count (N attached or in next token)
-                        let arg: String = chars[j+1..].iter().collect();
+                        let arg: String = chars[j + 1..].iter().collect();
                         if !arg.is_empty() {
                             if let Ok(n) = arg.parse::<usize>() {
                                 result.jobs = n;
@@ -787,13 +889,17 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         j = chars.len();
                         continue;
                     }
-                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
+                    'k' => {
+                        result.keep_going = true;
+                        result.keep_going_explicit = true;
+                        result.no_keep_going_explicit = false;
+                    }
                     'L' => {
                         // -L = --check-symlink-times (no argument)
                         result.check_symlink_times = true;
                     }
                     'l' => {
-                        let arg: String = chars[j+1..].iter().collect();
+                        let arg: String = chars[j + 1..].iter().collect();
                         if !arg.is_empty() {
                             result.load_average = arg.parse().ok();
                         } else if i + 1 < tokens.len() {
@@ -808,7 +914,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         result.just_print = true;
                     }
                     'O' => {
-                        let arg: String = chars[j+1..].iter().collect();
+                        let arg: String = chars[j + 1..].iter().collect();
                         if !arg.is_empty() {
                             result.output_sync = Some(arg);
                         } else if i + 1 < tokens.len() {
@@ -821,8 +927,17 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
-                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
+                    's' => {
+                        result.silent = true;
+                        result.no_silent = false;
+                        result.silent_explicit = true;
+                        result.no_silent_explicit = false;
+                    }
+                    'S' => {
+                        result.keep_going = false;
+                        result.no_keep_going_explicit = true;
+                        result.keep_going_explicit = false;
+                    }
                     't' => result.touch = true,
                     'w' => {
                         result.print_directory = true;
@@ -852,7 +967,7 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
             // Add to variables so it's included in MAKEFLAGS output.
             if let Some(eq_pos) = token.find('=') {
                 let name = token[..eq_pos].to_string();
-                let value = token[eq_pos+1..].to_string();
+                let value = token[eq_pos + 1..].to_string();
                 result.variables.push((name, value));
             }
         } else {
@@ -862,7 +977,11 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'B' => result.always_make = true,
                     'e' => result.environment_overrides = true,
                     'i' => result.ignore_errors = true,
-                    'k' => { result.keep_going = true; result.keep_going_explicit = true; result.no_keep_going_explicit = false; }
+                    'k' => {
+                        result.keep_going = true;
+                        result.keep_going_explicit = true;
+                        result.no_keep_going_explicit = false;
+                    }
                     'n' => {
                         result.dry_run = true;
                         result.just_print = true;
@@ -870,8 +989,17 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     'q' => result.question = true,
                     'r' => result.no_builtin_rules = true,
                     'R' => result.no_builtin_variables = true,
-                    's' => { result.silent = true; result.no_silent = false; result.silent_explicit = true; result.no_silent_explicit = false; }
-                    'S' => { result.keep_going = false; result.no_keep_going_explicit = true; result.keep_going_explicit = false; }
+                    's' => {
+                        result.silent = true;
+                        result.no_silent = false;
+                        result.silent_explicit = true;
+                        result.no_silent_explicit = false;
+                    }
+                    'S' => {
+                        result.keep_going = false;
+                        result.no_keep_going_explicit = true;
+                        result.keep_going_explicit = false;
+                    }
                     't' => result.touch = true,
                     'w' => {
                         result.print_directory = true;

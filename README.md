@@ -8,7 +8,7 @@ Clean-room drop-in replacement for [GNU Make](https://www.gnu.org/software/make/
 
 ## Overview
 
-jmake is a complete reimplementation of GNU Make built from scratch in safe Rust, without referencing the GNU Make source code (clean-room design). It passes 99%+ of the GNU Make 4.4.1 test suite and successfully builds real-world projects including Lua, zlib, pigz, nginx, hostapd, and wpa_supplicant.
+jmake is a complete reimplementation of GNU Make built from scratch in safe Rust, without referencing the GNU Make source code (clean-room design). It passes the full GNU Make 4.4.1 test suite and successfully builds real-world projects including Lua, zlib, pigz, nginx, hostapd, and wpa_supplicant.
 
 ## Features
 
