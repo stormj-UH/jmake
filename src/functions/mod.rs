@@ -351,40 +351,15 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let mut results = Vec::new();
     for pattern in patterns {
         let mut matches = Vec::new();
-        // Extract the directory prefix from the pattern to preserve it in results.
-        // e.g., pattern "./foo*" → prefix "./", pattern "dir/foo*" → prefix "dir/"
-        // GNU Make preserves the directory prefix from the pattern in its output.
-        let prefix = {
-            let p = std::path::Path::new(pattern);
-            if let Some(parent) = p.parent() {
-                let ps = parent.to_string_lossy();
-                if ps.is_empty() || ps == "." {
-                    // Pattern has no explicit dir prefix, or just "./" vs no prefix.
-                    // Check if the pattern literally starts with "./"
-                    if pattern.starts_with("./") {
-                        "./"
-                    } else {
-                        ""
-                    }
-                } else {
-                    // Pattern has a real directory component like "dir/" or "../"
-                    // We need the prefix up to and including the last slash
-                    if let Some(slash) = pattern.rfind('/') {
-                        &pattern[..slash + 1]
-                    } else {
-                        ""
-                    }
-                }
-            } else {
-                ""
-            }
-        };
         if let Ok(paths) = glob::glob(pattern) {
             for entry in paths.flatten() {
                 let s = entry.to_string_lossy().to_string();
-                // If the glob crate stripped the directory prefix, re-add it.
-                if !prefix.is_empty() && !s.starts_with(prefix) && !s.starts_with('/') {
-                    matches.push(format!("{}{}", prefix, s));
+                // Rust's glob crate drops a leading "./" from relative patterns.
+                // GNU Make preserves it, but only that leading "./" component.
+                // Re-prepending the whole directory prefix duplicates paths like
+                // "./src/*.h" -> "./src/src/file.h".
+                if pattern.starts_with("./") && !s.starts_with("./") && !s.starts_with('/') {
+                    matches.push(format!("./{}", s));
                 } else {
                     matches.push(s);
                 }
@@ -440,6 +415,41 @@ fn normalize_path(path: &Path) -> String {
         ".".to_string()
     } else {
         components.join("/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fn_wildcard;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn wildcard_preserves_leading_dot_slash_without_duplicating_dirs() {
+        let _guard = cwd_lock().lock().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("jmake-wildcard-{stamp}"));
+        fs::create_dir_all(temp_root.join("src")).unwrap();
+        fs::write(temp_root.join("src/agentfwd.h"), b"").unwrap();
+        std::env::set_current_dir(&temp_root).unwrap();
+
+        let expand = |s: &str| s.to_string();
+        let result = fn_wildcard(&["./src/*.h".to_string()], &expand);
+
+        std::env::set_current_dir(&old_cwd).unwrap();
+        fs::remove_dir_all(&temp_root).unwrap();
+
+        assert_eq!(result, "./src/agentfwd.h");
     }
 }
 
