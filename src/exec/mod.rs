@@ -3788,9 +3788,9 @@ impl<'a> Executor<'a> {
         let mut compat_rule: Option<(Rule, String)> = None;
 
         // Pass 1: all prereqs immediately satisfiable.
-        // Collect all matching candidates, then pick the one with the shortest stem.
-        let mut pass1_candidates: Vec<(Rule, String)> = Vec::new();
-        for rule in &all_rules {
+        // Try matching candidates in shortest-stem order and stop at the first success.
+        let mut pass1_matches: Vec<(usize, usize, &Rule, String, String)> = Vec::new();
+        for (order, rule) in all_rules.iter().enumerate() {
             // Skip rules with no recipe unless they have SE prereqs (which may produce
             // errors or provide prerequisites at build time) or are terminal rules.
             if rule.recipe.is_empty()
@@ -3801,6 +3801,12 @@ impl<'a> Executor<'a> {
             for pattern_target in &rule.targets {
                 if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
                 if let Some(stem) = match_pattern(pattern_target, target) {
+                    pass1_matches.push((stem.len(), order, rule, pattern_target.clone(), stem));
+                }
+            }
+        }
+        pass1_matches.sort_by_key(|(stem_len, order, _, _, _)| (*stem_len, *order));
+        for (_, _, rule, pattern_target, stem) in pass1_matches {
                     let mut found_compat = false;
                     let prereqs_ok = if rule.prerequisites.is_empty() {
                         true
@@ -3808,7 +3814,7 @@ impl<'a> Executor<'a> {
                         let mut all_ok = true;
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
-                            let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
+                            let resolved = subst_stem_in_prereq_dir(p, &stem, &pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
                             let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
                                 ::glob::glob(&resolved)
@@ -3838,28 +3844,18 @@ impl<'a> Executor<'a> {
                         all_ok
                     };
                     if prereqs_ok {
-                        pass1_candidates.push(((**rule).clone(), stem));
-                        break; // Only take first matching pattern_target per rule
+                        return Some(((*rule).clone(), stem));
                     } else if found_compat && compat_rule.is_none() {
                         // Use as compat (last-resort) candidate. Terminal rules CAN be
                         // used as compat candidates when prereqs are explicitly mentioned
                         // (GNU Make runs .DEFAULT for them).
-                        compat_rule = Some(((**rule).clone(), stem.clone()));
+                        compat_rule = Some(((*rule).clone(), stem.clone()));
                     }
-                }
-            }
-        }
-        if !pass1_candidates.is_empty() {
-            // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
-            let best = pass1_candidates.into_iter()
-                .min_by_key(|(_, stem)| stem.len())
-                .unwrap();
-            return Some(best);
         }
 
         // Pass 2: prereqs can be built via chaining. Terminal rules skipped.
-        let mut pass2_candidates: Vec<(Rule, String)> = Vec::new();
-        for rule in &all_rules {
+        let mut pass2_matches: Vec<(usize, usize, &Rule, String, String)> = Vec::new();
+        for (order, rule) in all_rules.iter().enumerate() {
             if rule.recipe.is_empty()
                 && !rule.is_terminal
                 && rule.second_expansion_prereqs.is_none()
@@ -3869,14 +3865,22 @@ impl<'a> Executor<'a> {
             for pattern_target in &rule.targets {
                 if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
                 if let Some(stem) = match_pattern(pattern_target, target) {
+                    pass2_matches.push((stem.len(), order, rule, pattern_target.clone(), stem));
+                }
+            }
+        }
+        pass2_matches.sort_by_key(|(stem_len, order, _, _, _)| (*stem_len, *order));
+        for (_, rule_id, rule, pattern_target, stem) in pass2_matches {
                     let mut found_compat = false;
                     let prereqs_ok = if rule.prerequisites.is_empty() {
                         true
                     } else {
                         let mut all_ok = true;
+                        let mut active_rules: HashSet<usize> = HashSet::new();
+                        active_rules.insert(rule_id);
                         for p in &rule.prerequisites {
                             if p == ".WAIT" { continue; }
-                            let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
+                            let resolved = subst_stem_in_prereq_dir(p, &stem, &pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
                             let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
                                 ::glob::glob(&resolved)
@@ -3887,7 +3891,7 @@ impl<'a> Executor<'a> {
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
-                                || self.find_pattern_rule_exists(&resolved)
+                                || self.find_pattern_rule_exists_with_active(&resolved, &mut active_rules)
                                 || self.find_in_vpath(&resolved).is_some()
                                 || self.building.contains(&resolved)
                             };
@@ -3904,20 +3908,10 @@ impl<'a> Executor<'a> {
                         all_ok
                     };
                     if prereqs_ok {
-                        pass2_candidates.push(((**rule).clone(), stem));
-                        break; // Only take first matching pattern_target per rule
+                        return Some(((*rule).clone(), stem));
                     } else if found_compat && compat_rule.is_none() {
-                        compat_rule = Some(((**rule).clone(), stem.clone()));
+                        compat_rule = Some(((*rule).clone(), stem.clone()));
                     }
-                }
-            }
-        }
-        if !pass2_candidates.is_empty() {
-            // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
-            let best = pass2_candidates.into_iter()
-                .min_by_key(|(_, stem)| stem.len())
-                .unwrap();
-            return Some(best);
         }
 
         // Pass 3: GNU Make "compatibility rule search" — terminal rules that were
@@ -3968,10 +3962,25 @@ impl<'a> Executor<'a> {
     /// Check if `target` can be built by any pattern rule (recursive/intermediate context).
     /// Non-terminal match-anything rules (%) are skipped: they cannot create intermediates.
     fn find_pattern_rule_exists(&self, target: &str) -> bool {
-        self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new(), 0)
+        self.find_pattern_rule_exists_inner(
+            target,
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            0,
+        )
     }
 
-    fn find_pattern_rule_exists_inner(&self, target: &str, visited: &mut HashSet<String>, depth: usize) -> bool {
+    fn find_pattern_rule_exists_with_active(&self, target: &str, active_rules: &mut HashSet<usize>) -> bool {
+        self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new(), active_rules, 0)
+    }
+
+    fn find_pattern_rule_exists_inner(
+        &self,
+        target: &str,
+        visited: &mut HashSet<String>,
+        active_rules: &mut HashSet<usize>,
+        depth: usize,
+    ) -> bool {
         // If this target is currently being built, treat it as available (cycle case).
         if self.building.contains(target) {
             return true;
@@ -3995,32 +4004,47 @@ impl<'a> Executor<'a> {
         let specific_rule_matched = user_rules.iter().chain(builtin_rules.iter())
             .any(|rule| rule.targets.iter().any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some()));
 
-        for rule in user_rules.iter().chain(builtin_rules.iter()) {
+        // Match GNU Make's implicit-rule chooser more closely: consider all
+        // matching pattern candidates and try the shortest stem first.
+        let mut candidates: Vec<(usize, usize, &Rule, String, String)> = Vec::new();
+        for (order, rule) in user_rules.iter().chain(builtin_rules.iter()).enumerate() {
             if rule.recipe.is_empty() { continue; }
+            if active_rules.contains(&order) { continue; }
             for pattern_target in &rule.targets {
                 // Skip non-terminal match-anything rules in recursive context.
                 if pattern_target == "%" && !rule.is_terminal { continue; }
                 if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
                 if let Some(stem) = match_pattern(pattern_target, target) {
-                    let prereqs_ok = if rule.prerequisites.is_empty() {
-                        true
-                    } else {
-                        rule.prerequisites.iter().all(|p| {
-                            if p == ".WAIT" { return true; }
-                            let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
-                            Path::new(&resolved).exists()
-                                || self.db.rules.contains_key(&resolved)
-                                || self.db.is_phony(&resolved)
-                                || self.find_in_vpath(&resolved).is_some()
-                                || self.building.contains(&resolved)
-                                || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, depth + 1))
-                                || (rule.is_terminal && self.db.explicit_dep_names.contains(&resolved))
-                        })
-                    };
-                    if prereqs_ok { return true; }
+                    candidates.push((stem.len(), order, rule, pattern_target.clone(), stem));
                 }
             }
         }
+        candidates.sort_by_key(|(stem_len, order, _, _, _)| (*stem_len, *order));
+
+        for (_, rule_id, rule, pattern_target, stem) in candidates {
+            active_rules.insert(rule_id);
+            let prereqs_ok = if rule.prerequisites.is_empty() {
+                true
+            } else {
+                rule.prerequisites.iter().all(|p| {
+                    if p == ".WAIT" { return true; }
+                    let resolved = subst_stem_in_prereq_dir(p, &stem, &pattern_target);
+                    Path::new(&resolved).exists()
+                        || self.db.rules.contains_key(&resolved)
+                        || self.db.is_phony(&resolved)
+                        || self.find_in_vpath(&resolved).is_some()
+                        || self.building.contains(&resolved)
+                        || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, active_rules, depth + 1))
+                        || (rule.is_terminal && self.db.explicit_dep_names.contains(&resolved))
+                })
+            };
+            active_rules.remove(&rule_id);
+            if prereqs_ok {
+                visited.remove(target);
+                return true;
+            }
+        }
+        visited.remove(target);
         false
     }
 
