@@ -19,6 +19,19 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
+fn quote_makeflags_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for ch in s.chars() {
+        if ch == '$' {
+            out.push('$');
+        } else if ch == ' ' || ch == '\t' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 // Thread-local re-entry guard for shell_exec_with_env.
 // Prevents infinite recursion when exported variables contain $(shell ...).
 thread_local! {
@@ -157,7 +170,10 @@ pub fn make_progname() -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(&raw)
         .to_string();
-    match env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()) {
+    match env::var("MAKELEVEL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
         Some(level) if level > 0 => format!("{}[{}]", base, level),
         _ => base,
     }
@@ -211,12 +227,18 @@ pub fn execute_include_recipe_expanded(
                             libc::SIGKILL => "Killed",
                             _ => "Signal",
                         };
-                        return Err(format!("[{}:{}: {}] {}", source_file, lineno, target, sig_name));
+                        return Err(format!(
+                            "[{}:{}: {}] {}",
+                            source_file, lineno, target, sig_name
+                        ));
                     }
                 } else {
                     let code = s.code().unwrap_or(1);
                     if !ignore_error {
-                        return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
+                        return Err(format!(
+                            "[{}:{}: {}] Error {}",
+                            source_file, lineno, target, code
+                        ));
                     }
                 }
             }
@@ -284,7 +306,8 @@ impl MakeState {
             // the -C argument and normalizing, so that symlinks in the parent path
             // are preserved (matching shell `cd` behavior).
             let new_logical = {
-                let old_pwd = env::var("PWD").map(std::path::PathBuf::from)
+                let old_pwd = env::var("PWD")
+                    .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| env::current_dir().unwrap_or_default());
                 let joined = if std::path::Path::new(dir).is_absolute() {
                     std::path::PathBuf::from(dir)
@@ -295,7 +318,9 @@ impl MakeState {
                 let mut normalized = std::path::PathBuf::new();
                 for comp in joined.components() {
                     match comp {
-                        std::path::Component::ParentDir => { normalized.pop(); }
+                        std::path::Component::ParentDir => {
+                            normalized.pop();
+                        }
                         std::path::Component::CurDir => {}
                         _ => normalized.push(comp),
                     }
@@ -384,7 +409,10 @@ impl MakeState {
             self.shell = var.value.clone();
         }
         // .SHELLFLAGS
-        let shell_flags = self.db.variables.get(".SHELLFLAGS")
+        let shell_flags = self
+            .db
+            .variables
+            .get(".SHELLFLAGS")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "-c".to_string());
 
@@ -439,7 +467,11 @@ impl MakeState {
         // the string "Updating makefiles" appears in the output whenever --debug=b is
         // active (from any source: cmdline, env, or makefile assignment).
         let debug_basic = self.args.debug_short
-            || self.args.debug.iter().any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
+            || self
+                .args
+                .debug
+                .iter()
+                .any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
         if debug_basic {
             println!("Updating makefiles....");
         }
@@ -481,14 +513,34 @@ impl MakeState {
         let cwd = logical_cwd();
 
         // Set up built-in variables
-        self.db.variables.insert("MAKE_VERSION".into(),
-            Variable::new("4.4.1".into(), VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert("MAKE".into(),
-            Variable::new(env::args().next().unwrap_or_else(|| "make".into()), VarFlavor::Recursive, VarOrigin::Default));
-        self.db.variables.insert("MAKE_COMMAND".into(),
-            Variable::new(env::args().next().unwrap_or_else(|| "make".into()), VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert("CURDIR".into(),
-            Variable::new(cwd.to_string_lossy().to_string(), VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            "MAKE_VERSION".into(),
+            Variable::new("4.4.1".into(), VarFlavor::Simple, VarOrigin::Default),
+        );
+        self.db.variables.insert(
+            "MAKE".into(),
+            Variable::new(
+                env::args().next().unwrap_or_else(|| "make".into()),
+                VarFlavor::Recursive,
+                VarOrigin::Default,
+            ),
+        );
+        self.db.variables.insert(
+            "MAKE_COMMAND".into(),
+            Variable::new(
+                env::args().next().unwrap_or_else(|| "make".into()),
+                VarFlavor::Simple,
+                VarOrigin::Default,
+            ),
+        );
+        self.db.variables.insert(
+            "CURDIR".into(),
+            Variable::new(
+                cwd.to_string_lossy().to_string(),
+                VarFlavor::Simple,
+                VarOrigin::Default,
+            ),
+        );
         self.db.variables.insert(".FEATURES".into(),
             Variable::new("target-specific order-only second-expansion else-if shortest-stem undefine oneshell check-symlink".into(),
             VarFlavor::Simple, VarOrigin::Default));
@@ -496,7 +548,11 @@ impl MakeState {
         // When -I- is given, the default dirs are excluded (only explicit -Idir after -I- count).
         // When -Idir is given without -I-, dirs are added to the defaults.
         {
-            let has_reset = self.args.include_dirs.iter().any(|d| d.to_string_lossy() == "-");
+            let has_reset = self
+                .args
+                .include_dirs
+                .iter()
+                .any(|d| d.to_string_lossy() == "-");
             let explicit_dirs: Vec<String> = if has_reset {
                 // Only include dirs that appear AFTER the last -I-
                 let mut after_reset = Vec::new();
@@ -511,7 +567,10 @@ impl MakeState {
                 after_reset.into_iter().rev().collect()
             } else {
                 // No -I-, include all explicit dirs plus system defaults
-                let mut dirs: Vec<String> = self.args.include_dirs.iter()
+                let mut dirs: Vec<String> = self
+                    .args
+                    .include_dirs
+                    .iter()
                     .map(|d| d.to_string_lossy().to_string())
                     .collect();
                 // Append system defaults
@@ -522,43 +581,48 @@ impl MakeState {
                 }
                 dirs
             };
-            self.db.variables.insert(".INCLUDE_DIRS".into(),
-                Variable::new(explicit_dirs.join(" "), VarFlavor::Simple, VarOrigin::Default));
+            self.db.variables.insert(
+                ".INCLUDE_DIRS".into(),
+                Variable::new(
+                    explicit_dirs.join(" "),
+                    VarFlavor::Simple,
+                    VarOrigin::Default,
+                ),
+            );
         }
-        self.db.variables.insert("SHELL".into(),
-            Variable::new("/bin/sh".into(), VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert(".SHELLFLAGS".into(),
-            Variable::new("-c".into(), VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            "SHELL".into(),
+            Variable::new("/bin/sh".into(), VarFlavor::Simple, VarOrigin::Default),
+        );
+        self.db.variables.insert(
+            ".SHELLFLAGS".into(),
+            Variable::new("-c".into(), VarFlavor::Simple, VarOrigin::Default),
+        );
         // Build $(-*-eval-flags-*-) from --eval strings (used in MAKEFLAGS expansion).
         // Each eval string is quoted: $ → $$, spaces/backslashes → \<char>.
         // GNU Make stores them as "--eval=quoted_string [--eval=quoted_string ...]".
         {
-            fn quote_for_env(s: &str) -> String {
-                let mut out = String::with_capacity(s.len() * 2);
-                for ch in s.chars() {
-                    if ch == '$' {
-                        out.push('$');
-                    } else if ch == ' ' || ch == '\t' || ch == '\\' {
-                        out.push('\\');
-                    }
-                    out.push(ch);
-                }
-                out
-            }
-            let eval_flags: String = self.args.eval_strings.iter()
-                .map(|s| format!("--eval={}", quote_for_env(s)))
+            let eval_flags: String = self
+                .args
+                .eval_strings
+                .iter()
+                .map(|s| format!("--eval={}", quote_makeflags_value(s)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            self.db.variables.insert("-*-eval-flags-*-".into(),
-                Variable::new(eval_flags, VarFlavor::Simple, VarOrigin::Default));
+            self.db.variables.insert(
+                "-*-eval-flags-*-".into(),
+                Variable::new(eval_flags, VarFlavor::Simple, VarOrigin::Default),
+            );
         }
         {
             let mf = self.build_makeflags();
             // Also update the process environment so $(shell echo "$MAKEFLAGS") reflects
             // the canonical merged value from the start.
             env::set_var("MAKEFLAGS", &mf);
-            self.db.variables.insert("MAKEFLAGS".into(),
-                Variable::new(mf, VarFlavor::Recursive, VarOrigin::Default));
+            self.db.variables.insert(
+                "MAKEFLAGS".into(),
+                Variable::new(mf, VarFlavor::Recursive, VarOrigin::Default),
+            );
         }
         // MAKEOVERRIDES: command-line variable assignments portion of MAKEFLAGS.
         // Only include variables that came from the actual command line (not from env MAKEFLAGS).
@@ -568,31 +632,49 @@ impl MakeState {
                 .iter()
                 .map(|(n, v)| format!("{}={}", n, v))
                 .collect();
-            self.db.variables.insert("MAKEOVERRIDES".into(),
-                Variable::new(ov.join(" "), VarFlavor::Recursive, VarOrigin::Default));
+            self.db.variables.insert(
+                "MAKEOVERRIDES".into(),
+                Variable::new(ov.join(" "), VarFlavor::Recursive, VarOrigin::Default),
+            );
         }
         // MAKECMDGOALS: the list of targets specified on the command line.
         // Set before reading makefiles so it's available during makefile processing.
         let cmdgoals = self.args.targets.join(" ");
-        self.db.variables.insert("MAKECMDGOALS".into(),
-            Variable::new(cmdgoals, VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            "MAKECMDGOALS".into(),
+            Variable::new(cmdgoals, VarFlavor::Simple, VarOrigin::Default),
+        );
         // MAKELEVEL: 0 for top-level, incremented for recursive makes.
         // Read from the environment (set by the parent make), defaulting to "0".
         let makelevel_str = env::var("MAKELEVEL").unwrap_or_else(|_| "0".to_string());
-        self.db.variables.insert("MAKELEVEL".into(),
-            Variable::new(makelevel_str, VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            "MAKELEVEL".into(),
+            Variable::new(makelevel_str, VarFlavor::Simple, VarOrigin::Default),
+        );
         // MAKE_RESTARTS: number of times make has re-exec'd itself to reread makefiles.
         // Empty on the first run; set to "1", "2", etc. by the re-exec mechanism.
         // Read from the MAKE_RESTARTS environment variable (set by the reinvoke logic).
         let make_restarts = env::var("MAKE_RESTARTS").unwrap_or_default();
-        self.db.variables.insert("MAKE_RESTARTS".into(),
-            Variable::new(make_restarts, VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert(".DEFAULT_GOAL".into(),
-            Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::Default));
-        self.db.variables.insert(".RECIPEPREFIX".into(),
-            Variable::new(String::new(), VarFlavor::Simple, VarOrigin::Default));
-        self.db.variables.insert("SUFFIXES".into(),
-            Variable::new(self.db.suffixes.join(" "), VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            "MAKE_RESTARTS".into(),
+            Variable::new(make_restarts, VarFlavor::Simple, VarOrigin::Default),
+        );
+        self.db.variables.insert(
+            ".DEFAULT_GOAL".into(),
+            Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::Default),
+        );
+        self.db.variables.insert(
+            ".RECIPEPREFIX".into(),
+            Variable::new(String::new(), VarFlavor::Simple, VarOrigin::Default),
+        );
+        self.db.variables.insert(
+            "SUFFIXES".into(),
+            Variable::new(
+                self.db.suffixes.join(" "),
+                VarFlavor::Simple,
+                VarOrigin::Default,
+            ),
+        );
 
         // Import environment variables and record which names came from the environment.
         // Variables that originally came from the environment are always exported to
@@ -611,7 +693,10 @@ impl MakeState {
             if name.ends_with('+') {
                 // Append operator: strip '+', append value to existing
                 let real_name = name.trim_end_matches('+').to_string();
-                let existing = self.db.variables.get(&real_name)
+                let existing = self
+                    .db
+                    .variables
+                    .get(&real_name)
                     .map(|v| v.value.clone())
                     .unwrap_or_default();
                 let new_val = if existing.is_empty() {
@@ -619,21 +704,28 @@ impl MakeState {
                 } else {
                     format!("{} {}", existing, value)
                 };
-                self.db.variables.insert(real_name,
-                    Variable::new(new_val, VarFlavor::Recursive, VarOrigin::CommandLine));
+                self.db.variables.insert(
+                    real_name,
+                    Variable::new(new_val, VarFlavor::Recursive, VarOrigin::CommandLine),
+                );
             } else if name.ends_with('?') {
                 // Conditional: only set if not already defined
                 let real_name = name.trim_end_matches('?').to_string();
-                self.db.variables.entry(real_name).or_insert_with(||
-                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
+                self.db.variables.entry(real_name).or_insert_with(|| {
+                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine)
+                });
             } else if name.ends_with(':') {
                 // Simple assignment
                 let real_name = name.trim_end_matches(':').to_string();
-                self.db.variables.insert(real_name,
-                    Variable::new(value.clone(), VarFlavor::Simple, VarOrigin::CommandLine));
+                self.db.variables.insert(
+                    real_name,
+                    Variable::new(value.clone(), VarFlavor::Simple, VarOrigin::CommandLine),
+                );
             } else {
-                self.db.variables.insert(name.clone(),
-                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine));
+                self.db.variables.insert(
+                    name.clone(),
+                    Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::CommandLine),
+                );
             }
         }
     }
@@ -681,11 +773,12 @@ impl MakeState {
             }
             let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
             let was_from_env = self.db.env_var_names.contains(name.as_str());
-            let should_export = always_export || match var.export {
-                Some(true) => true,
-                Some(false) => false,
-                None => self.db.export_all || was_from_env,
-            };
+            let should_export = always_export
+                || match var.export {
+                    Some(true) => true,
+                    Some(false) => false,
+                    None => self.db.export_all || was_from_env,
+                };
             if should_export {
                 let value = self.expand(&var.value);
                 extra_env.insert(name.clone(), value);
@@ -709,24 +802,48 @@ impl MakeState {
 
     pub fn build_makeflags_from_args(&self, variables: &[(String, String)]) -> String {
         let mut single_flags = String::new();
-        if self.args.always_make { single_flags.push('B'); }
-        if self.args.debug_short { single_flags.push('d'); }
-        if self.args.environment_overrides { single_flags.push('e'); }
-        if self.args.ignore_errors { single_flags.push('i'); }
+        if self.args.always_make {
+            single_flags.push('B');
+        }
+        if self.args.debug_short {
+            single_flags.push('d');
+        }
+        if self.args.environment_overrides {
+            single_flags.push('e');
+        }
+        if self.args.ignore_errors {
+            single_flags.push('i');
+        }
         if self.args.keep_going {
             single_flags.push('k');
         } else if self.args.no_keep_going_explicit {
             // -S was explicitly set; output 'S' to indicate keep-going was disabled.
             single_flags.push('S');
         }
-        if self.args.dry_run { single_flags.push('n'); }
-        if self.args.question { single_flags.push('q'); }
-        if self.args.no_builtin_rules { single_flags.push('r'); }
-        if self.args.no_builtin_variables { single_flags.push('R'); }
-        if self.args.silent { single_flags.push('s'); }
-        if self.args.touch { single_flags.push('t'); }
-        if self.args.print_directory { single_flags.push('w'); }
-        if self.args.check_symlink_times { single_flags.push('L'); }
+        if self.args.dry_run {
+            single_flags.push('n');
+        }
+        if self.args.question {
+            single_flags.push('q');
+        }
+        if self.args.no_builtin_rules {
+            single_flags.push('r');
+        }
+        if self.args.no_builtin_variables {
+            single_flags.push('R');
+        }
+        if self.args.silent {
+            single_flags.push('s');
+        }
+        if self.args.touch {
+            single_flags.push('t');
+        }
+        if self.args.print_directory {
+            single_flags.push('w');
+        }
+        if self.args.check_symlink_times {
+            single_flags.push('L');
+        }
 
         // Build long_parts: options-with-args first, then no-arg long options.
         // GNU Make orders them: -I, -l, -O, --debug=, then --trace, --no-print-directory, etc.
@@ -755,10 +872,18 @@ impl MakeState {
         }
 
         // No-arg long options (come after options-with-args)
-        if self.args.trace { long_parts.push("--trace".to_string()); }
-        if self.args.no_print_directory { long_parts.push("--no-print-directory".to_string()); }
-        if self.args.no_silent { long_parts.push("--no-silent".to_string()); }
-        if self.args.warn_undefined_variables { long_parts.push("--warn-undefined-variables".to_string()); }
+        if self.args.trace {
+            long_parts.push("--trace".to_string());
+        }
+        if self.args.no_print_directory {
+            long_parts.push("--no-print-directory".to_string());
+        }
+        if self.args.no_silent {
+            long_parts.push("--no-silent".to_string());
+        }
+        if self.args.warn_undefined_variables {
+            long_parts.push("--warn-undefined-variables".to_string());
+        }
 
         // --eval=... strings are appended via the $(-*-eval-flags-*-) reference.
         // Build that reference if we have eval strings.
@@ -804,14 +929,14 @@ impl MakeState {
             for (name, value) in cmdline_vars.iter().rev() {
                 let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
                 if seen_names.insert(key.to_string()) {
-                    var_parts.push(format!("{}={}", name, value));
+                    var_parts.push(format!("{}={}", name, quote_makeflags_value(value)));
                 }
             }
             // Env MAKEFLAGS vars in original order, skipping duplicates of cmdline vars.
             for (name, value) in env_vars.iter() {
                 let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
                 if seen_names.insert(key.to_string()) {
-                    var_parts.push(format!("{}={}", name, value));
+                    var_parts.push(format!("{}={}", name, quote_makeflags_value(value)));
                 }
             }
 
@@ -831,7 +956,10 @@ impl MakeState {
         // the environment OR from a command-line assignment like `make MAKEFILES=x`).
         // Prefer the Make variable (which reflects command-line overrides) over
         // the raw OS environment variable.
-        let makefiles_val = self.db.variables.get("MAKEFILES")
+        let makefiles_val = self
+            .db
+            .variables
+            .get("MAKEFILES")
             .map(|v| v.value.clone())
             .or_else(|| env::var("MAKEFILES").ok())
             .unwrap_or_default();
@@ -910,7 +1038,9 @@ impl MakeState {
                 let mut seen_canonical = std::collections::HashSet::new();
                 for name in &candidates {
                     let canonical = Path::new(name).canonicalize().ok();
-                    let dominated = canonical.as_ref().map_or(false, |c| !seen_canonical.insert(c.clone()));
+                    let dominated = canonical
+                        .as_ref()
+                        .map_or(false, |c| !seen_canonical.insert(c.clone()));
                     if !dominated {
                         self.pending_includes.push(PendingInclude {
                             file: name.to_string(),
@@ -927,10 +1057,13 @@ impl MakeState {
         };
 
         // Check for stdin specified more than once
-        let stdin_count = makefiles.iter().filter(|p| {
-            let s = p.to_string_lossy();
-            s == "-" || s == "/dev/stdin"
-        }).count();
+        let stdin_count = makefiles
+            .iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                s == "-" || s == "/dev/stdin"
+            })
+            .count();
         if stdin_count > 1 {
             return Err("Makefile from standard input specified twice.  Stop.".to_string());
         }
@@ -960,11 +1093,15 @@ impl MakeState {
         }
 
         // Set MAKEFILE_LIST
-        let mf_list: Vec<String> = self.makefile_list.iter()
+        let mf_list: Vec<String> = self
+            .makefile_list
+            .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        self.db.variables.insert("MAKEFILE_LIST".into(),
-            Variable::new(mf_list.join(" "), VarFlavor::Simple, VarOrigin::File));
+        self.db.variables.insert(
+            "MAKEFILE_LIST".into(),
+            Variable::new(mf_list.join(" "), VarFlavor::Simple, VarOrigin::File),
+        );
 
         Ok(())
     }
@@ -975,21 +1112,32 @@ impl MakeState {
 
     /// Like read_makefile but uses `display_name` as the filename shown in error messages.
     /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
-    pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
+    pub fn read_makefile_display(
+        &mut self,
+        path: &Path,
+        display_name: Option<&str>,
+    ) -> Result<(), String> {
         // Guard against infinite include recursion (e.g., a makefile including itself)
         self.include_depth += 1;
         if self.include_depth > 200 {
             self.include_depth -= 1;
             let progname = std::env::args().next().unwrap_or_else(|| "make".into());
-            return Err(format!("{}: *** Recursive include of '{}'. Stop.",
-                progname, path.display()));
+            return Err(format!(
+                "{}: *** Recursive include of '{}'. Stop.",
+                progname,
+                path.display()
+            ));
         }
         let result = self.read_makefile_display_inner(path, display_name);
         self.include_depth -= 1;
         result
     }
 
-    fn read_makefile_display_inner(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
+    fn read_makefile_display_inner(
+        &mut self,
+        path: &Path,
+        display_name: Option<&str>,
+    ) -> Result<(), String> {
         let path_str = path.to_string_lossy();
         let is_stdin = path_str == "-" || path_str == "/dev/stdin";
 
@@ -1022,14 +1170,15 @@ impl MakeState {
                     .join(format!("jmake-stdin-{}.mk", std::process::id()));
                 if let Err(e) = std::fs::write(&temp_path, &raw) {
                     let progname = crate::eval::make_progname();
-                    eprintln!("{}: cannot store makefile from stdin to a temporary file.  Stop.", progname);
+                    eprintln!(
+                        "{}: cannot store makefile from stdin to a temporary file.  Stop.",
+                        progname
+                    );
                     let _ = e;
                     return Err(String::new());
                 }
                 // Register temp file path with signal handler so SIGTERM can clean it up.
-                crate::signal_handler::set_temp_stdin_path(
-                    &temp_path.to_string_lossy()
-                );
+                crate::signal_handler::set_temp_stdin_path(&temp_path.to_string_lossy());
                 self.stdin_temp_path = Some(temp_path);
                 raw
             };
@@ -1062,11 +1211,15 @@ impl MakeState {
         // during parsing of this file (GNU Make updates it incrementally as each file
         // is read, not just at the end of all reading).
         {
-            let mf_list: Vec<String> = self.makefile_list.iter()
+            let mf_list: Vec<String> = self
+                .makefile_list
+                .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            self.db.variables.insert("MAKEFILE_LIST".into(),
-                Variable::new(mf_list.join(" "), VarFlavor::Simple, VarOrigin::File));
+            self.db.variables.insert(
+                "MAKEFILE_LIST".into(),
+                Variable::new(mf_list.join(" "), VarFlavor::Simple, VarOrigin::File),
+            );
         }
         self.process_parsed_lines(&mut parser)
     }
@@ -1101,7 +1254,8 @@ impl MakeState {
                 // Check if this is a nested define start
                 let eff_no_comment = parser::strip_comment(trimmed_line);
                 let eff_trim = eff_no_comment.trim();
-                let is_nested_define = eff_trim.starts_with("define ") || eff_trim.starts_with("define\t")
+                let is_nested_define = eff_trim.starts_with("define ")
+                    || eff_trim.starts_with("define\t")
                     || eff_trim == "define"
                     || eff_trim.starts_with("override define ")
                     || eff_trim.starts_with("export define ");
@@ -1131,7 +1285,10 @@ impl MakeState {
                     // Warn about extraneous text after endef (non-comment text)
                     if no_comment_trimmed != "endef" && !no_comment_trimmed.is_empty() {
                         let fname = parser.filename.to_string_lossy();
-                        eprintln!("{}:{}: extraneous text after 'endef' directive", fname, lineno);
+                        eprintln!(
+                            "{}:{}: extraneous text after 'endef' directive",
+                            fname, lineno
+                        );
                     }
                     parser.in_define = false;
                     let raw_value = parser.define_lines.join("\n");
@@ -1150,16 +1307,13 @@ impl MakeState {
                     };
                     // For PosixSimple (:::=), escape dollar signs in the expanded value
                     // and store as Recursive so subsequent += appends raw (unexpanded) text.
-                    let (stored_value, stored_flavor) = if parser.define_flavor == VarFlavor::PosixSimple {
-                        (value.replace('$', "$$"), VarFlavor::Recursive)
-                    } else {
-                        (value.clone(), parser.define_flavor.clone())
-                    };
-                    let var = Variable::new(
-                        stored_value,
-                        stored_flavor,
-                        VarOrigin::File,
-                    );
+                    let (stored_value, stored_flavor) =
+                        if parser.define_flavor == VarFlavor::PosixSimple {
+                            (value.replace('$', "$$"), VarFlavor::Recursive)
+                        } else {
+                            (value.clone(), parser.define_flavor.clone())
+                        };
+                    let var = Variable::new(stored_value, stored_flavor, VarOrigin::File);
                     if parser.define_override {
                         // override define always wins, even over command-line variables
                         let mut v = var;
@@ -1168,7 +1322,10 @@ impl MakeState {
                     } else {
                         let name = parser.define_name.clone();
                         // Without override, a command-line variable cannot be replaced
-                        let is_cmdline = self.db.variables.get(&name)
+                        let is_cmdline = self
+                            .db
+                            .variables
+                            .get(&name)
                             .map_or(false, |v| v.origin == VarOrigin::CommandLine);
                         if !is_cmdline {
                             match parser.define_flavor {
@@ -1241,7 +1398,9 @@ impl MakeState {
                                 } else if let Some(kind) = maybe_cond {
                                     let active = self.evaluate_condition(kind);
                                     state.active = active;
-                                    if active { state.seen_true = true; }
+                                    if active {
+                                        state.seen_true = true;
+                                    }
                                 } else {
                                     state.active = true;
                                     state.seen_true = true;
@@ -1259,9 +1418,16 @@ impl MakeState {
             }
 
             let custom_recipe_prefix: Option<char> = {
-                let pfx = self.db.variables.get(".RECIPEPREFIX")
+                let pfx = self
+                    .db
+                    .variables
+                    .get(".RECIPEPREFIX")
                     .and_then(|v| v.value.chars().next());
-                if pfx == Some('\t') { None } else { pfx }
+                if pfx == Some('\t') {
+                    None
+                } else {
+                    pfx
+                }
             };
             let is_custom_recipe_line = custom_recipe_prefix
                 .map(|c| line.starts_with(c))
@@ -1292,7 +1458,6 @@ impl MakeState {
                 if trimmed.starts_with('#') {
                     trimmed.to_string()
                 } else
-
                 // Special case: `define` directives (and `override define`, `export define`).
                 // These look like "define VAR_NAME [OP]" where VAR_NAME may contain variable
                 // references.  We must expand VAR_NAME at this point (first expansion), but NOT
@@ -1314,22 +1479,42 @@ impl MakeState {
                         if hint.is_empty() {
                             eprintln!("{}:{}: *** missing separator.  Stop.", fname, lineno);
                         } else {
-                            eprintln!("{}:{}: *** missing separator ({}).  Stop.", fname, lineno, hint);
+                            eprintln!(
+                                "{}:{}: *** missing separator ({}).  Stop.",
+                                fname, lineno, hint
+                            );
                         }
                         std::process::exit(2);
                     }
-                    if let ParsedLine::VariableAssignment { name: raw_name, value: raw_value, flavor: raw_flavor, is_override: raw_is_override, is_export: raw_is_export, is_unexport: raw_is_unexport, is_private: raw_is_private, target: raw_target } = raw_parsed {
+                    if let ParsedLine::VariableAssignment {
+                        name: raw_name,
+                        value: raw_value,
+                        flavor: raw_flavor,
+                        is_override: raw_is_override,
+                        is_export: raw_is_export,
+                        is_unexport: raw_is_unexport,
+                        is_private: raw_is_private,
+                        target: raw_target,
+                    } = raw_parsed
+                    {
                         match raw_flavor {
                             VarFlavor::Simple | VarFlavor::PosixSimple => {
                                 // For := / ::= (Simple) and :::= (PosixSimple), expand value
                                 // immediately. Strip comments from the value first.
                                 let comment_stripped = parser::strip_comment(trimmed);
-                                let stripped_parsed = parser::try_parse_variable_assignment(&comment_stripped);
-                                let (stripped_name, stripped_value) = if let Some(ParsedLine::VariableAssignment { name: sn, value: sv, .. }) = stripped_parsed {
-                                    (sn, sv)
-                                } else {
-                                    (raw_name.clone(), raw_value.clone())
-                                };
+                                let stripped_parsed =
+                                    parser::try_parse_variable_assignment(&comment_stripped);
+                                let (stripped_name, stripped_value) =
+                                    if let Some(ParsedLine::VariableAssignment {
+                                        name: sn,
+                                        value: sv,
+                                        ..
+                                    }) = stripped_parsed
+                                    {
+                                        (sn, sv)
+                                    } else {
+                                        (raw_name.clone(), raw_value.clone())
+                                    };
                                 let expanded_name = self.expand(&stripped_name);
                                 let expanded_value = self.expand(&stripped_value);
                                 if raw_target.is_none() {
@@ -1351,23 +1536,36 @@ impl MakeState {
                                         parser.in_recipe = false;
                                     }
                                     static_rule_siblings.clear();
-                                    self.set_variable(&expanded_name, &expanded_value, &raw_flavor, raw_is_override, raw_is_export);
+                                    self.set_variable(
+                                        &expanded_name,
+                                        &expanded_value,
+                                        &raw_flavor,
+                                        raw_is_override,
+                                        raw_is_export,
+                                    );
                                     // Handle unexport and private flags (not passed through set_variable).
                                     if raw_is_unexport {
-                                        if let Some(var) = self.db.variables.get_mut(&expanded_name) {
+                                        if let Some(var) = self.db.variables.get_mut(&expanded_name)
+                                        {
                                             var.export = Some(false);
                                         }
                                     }
                                     if raw_is_private {
-                                        if let Some(var) = self.db.variables.get_mut(&expanded_name) {
+                                        if let Some(var) = self.db.variables.get_mut(&expanded_name)
+                                        {
                                             var.is_private = true;
                                         }
                                     }
                                     // Drain any eval_pending items queued during value expansion.
                                     loop {
-                                        let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
-                                        if pending.is_empty() { break; }
-                                        for s in pending { self.eval_string(&s)?; }
+                                        let pending: Vec<String> =
+                                            std::mem::take(&mut *self.eval_pending.borrow_mut());
+                                        if pending.is_empty() {
+                                            break;
+                                        }
+                                        for s in pending {
+                                            self.eval_string(&s)?;
+                                        }
                                     }
                                     continue;
                                 }
@@ -1381,11 +1579,12 @@ impl MakeState {
                                 // in the name (e.g. `four:VAR$(FOO)=ok`), do NOT expand the
                                 // name here -- it must be expanded in the target's own variable
                                 // context (where `FOO=x` for target `four` makes `VAR$(FOO)=VARx`).
-                                let expanded_name = if raw_target.is_some() && raw_name.contains('$') {
-                                    raw_name.clone()
-                                } else {
-                                    self.expand(&raw_name)
-                                };
+                                let expanded_name =
+                                    if raw_target.is_some() && raw_name.contains('$') {
+                                        raw_name.clone()
+                                    } else {
+                                        self.expand(&raw_name)
+                                    };
                                 let op_str = match raw_flavor {
                                     VarFlavor::Append => " += ",
                                     VarFlavor::Conditional => " ?= ",
@@ -1399,20 +1598,38 @@ impl MakeState {
                                 // `private` flag).  Reconstructed as "private [override] export ..."
                                 // ensures `try_parse_variable_assignment` handles it.
                                 let mut var_prefix = String::new();
-                                if raw_is_private { var_prefix.push_str("private "); }
-                                if raw_is_override { var_prefix.push_str("override "); }
-                                if raw_is_export { var_prefix.push_str("export "); }
-                                if raw_is_unexport { var_prefix.push_str("unexport "); }
+                                if raw_is_private {
+                                    var_prefix.push_str("private ");
+                                }
+                                if raw_is_override {
+                                    var_prefix.push_str("override ");
+                                }
+                                if raw_is_export {
+                                    var_prefix.push_str("export ");
+                                }
+                                if raw_is_unexport {
+                                    var_prefix.push_str("unexport ");
+                                }
                                 if let Some(tgt) = raw_target {
                                     // Target-specific variable: "target: [modifiers] name op value"
                                     let expanded_target = self.expand(&tgt);
-                                    format!("{}: {}{}{}{}", expanded_target, var_prefix, expanded_name, op_str, raw_value)
+                                    format!(
+                                        "{}: {}{}{}{}",
+                                        expanded_target,
+                                        var_prefix,
+                                        expanded_name,
+                                        op_str,
+                                        raw_value
+                                    )
                                 } else {
                                     // Use var_prefix (built from parsed flags) instead of re-extracting
                                     // from the original line. Re-extracting from the original can produce
                                     // double prefixes when the variable name is also a keyword (e.g.,
                                     // `export export = 456` where "export" is both a prefix and the name).
-                                    format!("{}{}{}{}", var_prefix, expanded_name, op_str, raw_value)
+                                    format!(
+                                        "{}{}{}{}",
+                                        var_prefix, expanded_name, op_str, raw_value
+                                    )
                                 }
                             }
                         }
@@ -1439,32 +1656,37 @@ impl MakeState {
             // rule-colon heuristic below (they look like rules because a recipe line
             // like `> @cmd '...' > $@` may contain a colon).  Detect them here and
             // go directly to parse_line so that parse_line's recipe-prefix check runs.
-            let raw_has_rule_colon_no_assignment = if line.starts_with('\t') || is_custom_recipe_line {
-                // Tab-prefixed and custom-prefix lines are always recipes:
-                // skip the rule-colon heuristic entirely.
-                false
-            } else {
-                let trimmed_raw = line.trim();
-                // Skip the rule-colon heuristic for define directives (e.g. `define simple :=`).
-                // `find_rule_colon` incorrectly returns Some for lines like `define name :=`
-                // because it sees the `:` in `:=` as a rule colon.  These lines are already
-                // handled by `try_expand_define_name` above and must go through `parse_line`
-                // directly so they are recognised as define directive starters.
-                let is_define_directive_line = {
-                    let mut w = trimmed_raw;
-                    // Strip optional override/export prefixes
-                    loop {
-                        if w.starts_with("override ") { w = w["override ".len()..].trim_start(); }
-                        else if w.starts_with("export ") { w = w["export ".len()..].trim_start(); }
-                        else { break; }
-                    }
-                    w.starts_with("define ") || w.starts_with("define\t") || w == "define"
+            let raw_has_rule_colon_no_assignment =
+                if line.starts_with('\t') || is_custom_recipe_line {
+                    // Tab-prefixed and custom-prefix lines are always recipes:
+                    // skip the rule-colon heuristic entirely.
+                    false
+                } else {
+                    let trimmed_raw = line.trim();
+                    // Skip the rule-colon heuristic for define directives (e.g. `define simple :=`).
+                    // `find_rule_colon` incorrectly returns Some for lines like `define name :=`
+                    // because it sees the `:` in `:=` as a rule colon.  These lines are already
+                    // handled by `try_expand_define_name` above and must go through `parse_line`
+                    // directly so they are recognised as define directive starters.
+                    let is_define_directive_line = {
+                        let mut w = trimmed_raw;
+                        // Strip optional override/export prefixes
+                        loop {
+                            if w.starts_with("override ") {
+                                w = w["override ".len()..].trim_start();
+                            } else if w.starts_with("export ") {
+                                w = w["export ".len()..].trim_start();
+                            } else {
+                                break;
+                            }
+                        }
+                        w.starts_with("define ") || w.starts_with("define\t") || w == "define"
+                    };
+                    !trimmed_raw.starts_with('#')
+                        && !is_define_directive_line
+                        && parser::try_parse_variable_assignment(trimmed_raw).is_none()
+                        && parser::find_rule_colon_pub(trimmed_raw).is_some()
                 };
-                !trimmed_raw.starts_with('#')
-                    && !is_define_directive_line
-                    && parser::try_parse_variable_assignment(trimmed_raw).is_none()
-                    && parser::find_rule_colon_pub(trimmed_raw).is_some()
-            };
             let parsed = if raw_has_rule_colon_no_assignment {
                 // Try rule parse with TSV detection DISABLED.  The original line
                 // had no literal `=`, so any `=` in `expanded` came from variable
@@ -1497,7 +1719,9 @@ impl MakeState {
                         } else if let Some(kind) = maybe_cond {
                             let active = self.evaluate_condition(kind);
                             state.active = active;
-                            if active { state.seen_true = true; }
+                            if active {
+                                state.seen_true = true;
+                            }
                         } else {
                             state.active = true;
                             state.seen_true = true;
@@ -1596,7 +1820,14 @@ impl MakeState {
                         parser.posix_mode = true;
                         // POSIX mode sets specific default variable values,
                         // but only if not already overridden by user/environment.
-                        let posix_defaults = [("CC", "c99"), ("CFLAGS", "-O1"), ("FC", "fort77"), ("FFLAGS", "-O1"), ("ARFLAGS", "-rv"), ("SCCSGETFLAGS", "-s")];
+                        let posix_defaults = [
+                            ("CC", "c99"),
+                            ("CFLAGS", "-O1"),
+                            ("FC", "fort77"),
+                            ("FFLAGS", "-O1"),
+                            ("ARFLAGS", "-rv"),
+                            ("SCCSGETFLAGS", "-s"),
+                        ];
                         // POSIX mode: shell runs with -e (exit on error)
                         // Only set if not already overridden
                         let sf_should_set = match self.db.variables.get(".SHELLFLAGS") {
@@ -1604,8 +1835,10 @@ impl MakeState {
                             Some(v) => v.origin == VarOrigin::Default,
                         };
                         if sf_should_set {
-                            self.db.variables.insert(".SHELLFLAGS".into(),
-                                Variable::new("-ec".into(), VarFlavor::Simple, VarOrigin::Default));
+                            self.db.variables.insert(
+                                ".SHELLFLAGS".into(),
+                                Variable::new("-ec".into(), VarFlavor::Simple, VarOrigin::Default),
+                            );
                         }
                         for (name, val) in &posix_defaults {
                             let should_set = match self.db.variables.get(*name) {
@@ -1613,8 +1846,14 @@ impl MakeState {
                                 Some(v) => v.origin == VarOrigin::Default,
                             };
                             if should_set {
-                                self.db.variables.insert(name.to_string(),
-                                    Variable::new(val.to_string(), VarFlavor::Simple, VarOrigin::Default));
+                                self.db.variables.insert(
+                                    name.to_string(),
+                                    Variable::new(
+                                        val.to_string(),
+                                        VarFlavor::Simple,
+                                        VarOrigin::Default,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -1628,8 +1867,10 @@ impl MakeState {
                             let is_special = t.starts_with('.') && !t.contains('/');
                             if !is_special && !t.contains('%') {
                                 self.db.default_target = Some(t.clone());
-                                self.db.variables.insert(".DEFAULT_GOAL".into(),
-                                    Variable::new(t.clone(), VarFlavor::Simple, VarOrigin::Default));
+                                self.db.variables.insert(
+                                    ".DEFAULT_GOAL".into(),
+                                    Variable::new(t.clone(), VarFlavor::Simple, VarOrigin::Default),
+                                );
                                 break;
                             }
                         }
@@ -1709,7 +1950,16 @@ impl MakeState {
                         sib.recipe.push((lineno, recipe.clone()));
                     }
                 }
-                ParsedLine::VariableAssignment { name, value, flavor, is_override, is_export, is_unexport, is_private, target } => {
+                ParsedLine::VariableAssignment {
+                    name,
+                    value,
+                    flavor,
+                    is_override,
+                    is_export,
+                    is_unexport,
+                    is_private,
+                    target,
+                } => {
                     if let Some(prev) = current_rule.take() {
                         for sib in &mut static_rule_siblings {
                             sib.recipe = prev.recipe.clone();
@@ -1724,12 +1974,20 @@ impl MakeState {
 
                     if let Some(target_name) = target {
                         // Target-specific or pattern-specific variable
-                        let var_origin = if is_override { VarOrigin::Override } else { VarOrigin::File };
+                        let var_origin = if is_override {
+                            VarOrigin::Override
+                        } else {
+                            VarOrigin::File
+                        };
                         let targets: Vec<String> = parser::split_words(&target_name);
                         for t in targets {
                             if t.contains('%') {
                                 // Pattern-specific variable: stored separately for lookup at build time
-                                let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                let mut var = Variable::new(
+                                    value.clone(),
+                                    flavor.clone(),
+                                    var_origin.clone(),
+                                );
                                 var.is_private = is_private;
                                 if is_export {
                                     var.export = Some(true);
@@ -1745,14 +2003,20 @@ impl MakeState {
                             } else {
                                 // Target-specific variable: stored in the rule as a Vec
                                 // to support multiple += entries for the same variable.
-                                let mut var = Variable::new(value.clone(), flavor.clone(), var_origin.clone());
+                                let mut var = Variable::new(
+                                    value.clone(),
+                                    flavor.clone(),
+                                    var_origin.clone(),
+                                );
                                 var.is_private = is_private;
                                 if is_export {
                                     var.export = Some(true);
                                 } else if is_unexport {
                                     var.export = Some(false);
                                 }
-                                let rules = self.db.rules.entry(t.clone()).or_insert_with(Vec::new);
+                                let target_key = self.db.remember_rule_name(&t);
+                                let rules =
+                                    self.db.rules.entry(target_key).or_insert_with(Vec::new);
                                 // Add to all rules for this target
                                 for r in rules.iter_mut() {
                                     r.target_specific_vars.push((name.clone(), var.clone()));
@@ -1786,7 +2050,10 @@ impl MakeState {
                         }
                     }
                 }
-                ParsedLine::Include { paths, ignore_missing } => {
+                ParsedLine::Include {
+                    paths,
+                    ignore_missing,
+                } => {
                     if let Some(prev) = current_rule.take() {
                         for sib in &mut static_rule_siblings {
                             sib.recipe = prev.recipe.clone();
@@ -1846,7 +2113,10 @@ impl MakeState {
                         }
                     }
                 }
-                ParsedLine::VpathDirective { pattern, directories } => {
+                ParsedLine::VpathDirective {
+                    pattern,
+                    directories,
+                } => {
                     if let Some(prev) = current_rule.take() {
                         for sib in &mut static_rule_siblings {
                             sib.recipe = prev.recipe.clone();
@@ -1865,7 +2135,8 @@ impl MakeState {
                                 // Clear vpath for this pattern
                                 self.db.vpath.retain(|(p, _)| p != &pat);
                             } else {
-                                let dirs: Vec<PathBuf> = directories.iter().map(PathBuf::from).collect();
+                                let dirs: Vec<PathBuf> =
+                                    directories.iter().map(PathBuf::from).collect();
                                 self.db.vpath.push((pat, dirs));
                             }
                         }
@@ -1887,7 +2158,11 @@ impl MakeState {
                                 if let Some(var) = self.db.variables.get_mut(&n) {
                                     var.export = Some(export);
                                 } else {
-                                    let mut var = Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::File);
+                                    let mut var = Variable::new(
+                                        String::new(),
+                                        VarFlavor::Recursive,
+                                        VarOrigin::File,
+                                    );
                                     var.export = Some(export);
                                     self.db.variables.insert(n, var);
                                 }
@@ -1912,7 +2187,11 @@ impl MakeState {
                                     var.export = Some(false);
                                 } else {
                                     // Create a placeholder to mark as unexported even if not yet defined
-                                    let mut var = Variable::new(String::new(), VarFlavor::Recursive, VarOrigin::File);
+                                    let mut var = Variable::new(
+                                        String::new(),
+                                        VarFlavor::Recursive,
+                                        VarOrigin::File,
+                                    );
                                     var.export = Some(false);
                                     self.db.variables.insert(n, var);
                                 }
@@ -1929,17 +2208,29 @@ impl MakeState {
                         eprintln!("{}:{}: *** empty variable name.  Stop.", fname, lineno);
                         std::process::exit(2);
                     }
-                    let is_cmdline = self.db.variables.get(&name)
+                    let is_cmdline = self
+                        .db
+                        .variables
+                        .get(&name)
                         .map_or(false, |v| v.origin == VarOrigin::CommandLine);
                     if is_override || !is_cmdline {
                         self.db.variables.shift_remove(&name);
                     }
                 }
-                ParsedLine::Define { name, flavor, is_override, is_export, has_extraneous } => {
+                ParsedLine::Define {
+                    name,
+                    flavor,
+                    is_override,
+                    is_export,
+                    has_extraneous,
+                } => {
                     // Warn about extraneous text after define directive
                     if has_extraneous {
                         let fname = parser.filename.to_string_lossy();
-                        eprintln!("{}:{}: extraneous text after 'define' directive", fname, lineno);
+                        eprintln!(
+                            "{}:{}: extraneous text after 'define' directive",
+                            fname, lineno
+                        );
                     }
                     // Expand the variable name (it may contain variable references like $(NAME))
                     let expanded_name = self.expand(&name);
@@ -1967,7 +2258,10 @@ impl MakeState {
                 }
                 ParsedLine::InvalidConditional => {
                     let fname = parser.filename.to_string_lossy();
-                    eprintln!("{}:{}: *** invalid syntax in conditional.  Stop.", fname, lineno);
+                    eprintln!(
+                        "{}:{}: *** invalid syntax in conditional.  Stop.",
+                        fname, lineno
+                    );
                     std::process::exit(2);
                 }
                 ParsedLine::MissingSeparator(hint) => {
@@ -1975,7 +2269,10 @@ impl MakeState {
                     if hint.is_empty() {
                         eprintln!("{}:{}: *** missing separator.  Stop.", fname, lineno);
                     } else {
-                        eprintln!("{}:{}: *** missing separator ({}).  Stop.", fname, lineno, hint);
+                        eprintln!(
+                            "{}:{}: *** missing separator ({}).  Stop.",
+                            fname, lineno, hint
+                        );
                     }
                     std::process::exit(2);
                 }
@@ -1991,7 +2288,10 @@ impl MakeState {
             // next_logical_line can handle backslash-newline continuation
             // in custom-prefix recipe lines correctly.
             {
-                let pfx = self.db.variables.get(".RECIPEPREFIX")
+                let pfx = self
+                    .db
+                    .variables
+                    .get(".RECIPEPREFIX")
                     .and_then(|v| v.value.chars().next());
                 parser.recipe_prefix = if pfx == Some('\t') { None } else { pfx };
             }
@@ -2015,11 +2315,13 @@ impl MakeState {
             // previous rule definition even when subsequent non-recipe lines are processed
             // (blank lines and `$(eval ...)` lines that expand to empty keep in_recipe=true).
             let current_line_is_recipe = {
-                let custom_pfx: Option<char> = self.db.variables.get(".RECIPEPREFIX")
+                let custom_pfx: Option<char> = self
+                    .db
+                    .variables
+                    .get(".RECIPEPREFIX")
                     .and_then(|v| v.value.chars().next())
                     .filter(|&c| c != '\t');
-                line.starts_with('\t')
-                    || custom_pfx.map(|c| line.starts_with(c)).unwrap_or(false)
+                line.starts_with('\t') || custom_pfx.map(|c| line.starts_with(c)).unwrap_or(false)
             };
             if !self.eval_pending.borrow().is_empty() && !current_line_is_recipe {
                 if let Some(prev) = current_rule.take() {
@@ -2035,7 +2337,9 @@ impl MakeState {
             }
             loop {
                 let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
-                if pending.is_empty() { break; }
+                if pending.is_empty() {
+                    break;
+                }
                 for s in pending {
                     self.eval_string(&s)?;
                 }
@@ -2045,7 +2349,10 @@ impl MakeState {
         // Check for unterminated define block (missing endef)
         if parser.in_define {
             let fname = parser.filename.to_string_lossy();
-            eprintln!("{}:{}: *** missing 'endef', unterminated 'define'.  Stop.", fname, parser.define_lineno);
+            eprintln!(
+                "{}:{}: *** missing 'endef', unterminated 'define'.  Stop.",
+                fname, parser.define_lineno
+            );
             return Err(String::new());
         }
 
@@ -2071,13 +2378,15 @@ impl MakeState {
             // Check that none of the grouped targets already has a recipe from a prior rule.
             // If all targets already have recipes, no error; the prior recipe covers them.
             let any_target_has_recipe = rule.targets.iter().any(|t| {
-                self.db.rules.get(t).map_or(false, |rules| {
-                    rules.iter().any(|r| !r.recipe.is_empty())
-                })
+                self.db
+                    .get_rules(t)
+                    .map_or(false, |rules| rules.iter().any(|r| !r.recipe.is_empty()))
             });
             if !any_target_has_recipe {
-                eprintln!("{}:{}: *** grouped targets must provide a recipe.  Stop.",
-                    rule.source_file, rule.lineno);
+                eprintln!(
+                    "{}:{}: *** grouped targets must provide a recipe.  Stop.",
+                    rule.source_file, rule.lineno
+                );
                 std::process::exit(2);
             }
         }
@@ -2088,9 +2397,15 @@ impl MakeState {
                 let prereqs: HashSet<String> = rule.prerequisites.iter().cloned().collect();
 
                 match special {
-                    SpecialTarget::Phony | SpecialTarget::Precious |
-                    SpecialTarget::Silent | SpecialTarget::Ignore => {
-                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                    SpecialTarget::Phony
+                    | SpecialTarget::Precious
+                    | SpecialTarget::Silent
+                    | SpecialTarget::Ignore => {
+                        let set = self
+                            .db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                         set.extend(prereqs);
                     }
                     SpecialTarget::NotIntermediate => {
@@ -2098,7 +2413,8 @@ impl MakeState {
                         let progname = make_progname();
                         if prereqs.is_empty() {
                             // .NOTINTERMEDIATE: (all) conflicts with .SECONDARY: (all)
-                            let secondary_set = self.db.special_targets.get(&SpecialTarget::Secondary);
+                            let secondary_set =
+                                self.db.special_targets.get(&SpecialTarget::Secondary);
                             if secondary_set.map_or(false, |s| s.is_empty()) {
                                 eprintln!("{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
                                     progname);
@@ -2107,42 +2423,63 @@ impl MakeState {
                         } else {
                             // Check each prereq for conflict with .INTERMEDIATE or .SECONDARY
                             for name in &prereqs {
-                                if self.db.special_targets.get(&SpecialTarget::Intermediate)
-                                    .map_or(false, |s| s.contains(name)) {
+                                if self
+                                    .db
+                                    .special_targets
+                                    .get(&SpecialTarget::Intermediate)
+                                    .map_or(false, |s| s.contains(name))
+                                {
                                     eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
                                         progname, name);
                                     std::process::exit(2);
                                 }
-                                if self.db.special_targets.get(&SpecialTarget::Secondary)
-                                    .map_or(false, |s| s.contains(name)) {
+                                if self
+                                    .db
+                                    .special_targets
+                                    .get(&SpecialTarget::Secondary)
+                                    .map_or(false, |s| s.contains(name))
+                                {
                                     eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
                                         progname, name);
                                     std::process::exit(2);
                                 }
                             }
                         }
-                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        let set = self
+                            .db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                         set.extend(prereqs);
                     }
                     SpecialTarget::Intermediate => {
                         // Check for conflicts with .NOTINTERMEDIATE
                         let progname = make_progname();
                         for name in &prereqs {
-                            if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
-                                .map_or(false, |s| s.contains(name) || s.is_empty()) {
+                            if self
+                                .db
+                                .special_targets
+                                .get(&SpecialTarget::NotIntermediate)
+                                .map_or(false, |s| s.contains(name) || s.is_empty())
+                            {
                                 eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .INTERMEDIATE.  Stop.",
                                     progname, name);
                                 std::process::exit(2);
                             }
                         }
-                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        let set = self
+                            .db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                         set.extend(prereqs);
                     }
                     SpecialTarget::Secondary => {
                         let progname = make_progname();
                         if prereqs.is_empty() {
                             // .SECONDARY: (all) conflicts with .NOTINTERMEDIATE: (all)
-                            let ni_set = self.db.special_targets.get(&SpecialTarget::NotIntermediate);
+                            let ni_set =
+                                self.db.special_targets.get(&SpecialTarget::NotIntermediate);
                             if ni_set.map_or(false, |s| s.is_empty()) {
                                 eprintln!("{}: *** .NOTINTERMEDIATE and .SECONDARY are mutually exclusive.  Stop.",
                                     progname);
@@ -2151,15 +2488,23 @@ impl MakeState {
                         } else {
                             // Check each prereq for conflict with .NOTINTERMEDIATE
                             for name in &prereqs {
-                                if self.db.special_targets.get(&SpecialTarget::NotIntermediate)
-                                    .map_or(false, |s| s.contains(name) || s.is_empty()) {
+                                if self
+                                    .db
+                                    .special_targets
+                                    .get(&SpecialTarget::NotIntermediate)
+                                    .map_or(false, |s| s.contains(name) || s.is_empty())
+                                {
                                     eprintln!("{}: *** {} cannot be both .NOTINTERMEDIATE and .SECONDARY.  Stop.",
                                         progname, name);
                                     std::process::exit(2);
                                 }
                             }
                         }
-                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        let set = self
+                            .db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                         set.extend(prereqs);
                     }
                     SpecialTarget::Wait => {
@@ -2167,18 +2512,27 @@ impl MakeState {
                         // It has no prerequisites and no special database state.
                         // Warn if .WAIT has prerequisites or a recipe.
                         if !rule.prerequisites.is_empty() {
-                            eprintln!("{}:{}: .WAIT should not have prerequisites",
-                                rule.source_file, rule.lineno);
+                            eprintln!(
+                                "{}:{}: .WAIT should not have prerequisites",
+                                rule.source_file, rule.lineno
+                            );
                         }
                         if !rule.recipe.is_empty() {
-                            let recipe_lineno = rule.recipe.first().map(|(l, _)| *l).unwrap_or(rule.lineno);
-                            eprintln!("{}:{}: .WAIT should not have commands",
-                                rule.source_file, recipe_lineno);
+                            let recipe_lineno =
+                                rule.recipe.first().map(|(l, _)| *l).unwrap_or(rule.lineno);
+                            eprintln!(
+                                "{}:{}: .WAIT should not have commands",
+                                rule.source_file, recipe_lineno
+                            );
                         }
                     }
                     SpecialTarget::ExportAllVariables => {
                         // .EXPORT_ALL_VARIABLES: causes all variables to be exported
-                        let set = self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        let set = self
+                            .db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                         set.extend(prereqs);
                         self.db.export_all = true;
                     }
@@ -2226,11 +2580,17 @@ impl MakeState {
                     SpecialTarget::DeleteOnError => {
                         // .DELETE_ON_ERROR: causes make to delete the target file on error.
                         // Simply record that this special target was seen.
-                        self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        self.db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                     }
                     SpecialTarget::LowResolutionTime => {
                         // Record that .LOW_RESOLUTION_TIME was seen.
-                        self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
+                        self.db
+                            .special_targets
+                            .entry(special.clone())
+                            .or_insert_with(HashSet::new);
                     }
                     _ => {}
                 }
@@ -2243,13 +2603,17 @@ impl MakeState {
             // with '.' but contain '/' and are valid default targets.
             // Also skip pattern rules (contain '%').
             let is_special_target = target.starts_with('.') && !target.contains('/');
-            if self.db.default_target.is_none() && !is_special_target && !target.contains('%')
+            if self.db.default_target.is_none()
+                && !is_special_target
+                && !target.contains('%')
                 && !self.db.default_goal_explicit
             {
                 self.db.default_target = Some(target.clone());
                 // Also update .DEFAULT_GOAL variable so it's readable at parse time.
-                self.db.variables.insert(".DEFAULT_GOAL".into(),
-                    Variable::new(target.clone(), VarFlavor::Simple, VarOrigin::Default));
+                self.db.variables.insert(
+                    ".DEFAULT_GOAL".into(),
+                    Variable::new(target.clone(), VarFlavor::Simple, VarOrigin::Default),
+                );
             }
         }
 
@@ -2280,14 +2644,16 @@ impl MakeState {
                 let cancel_prereqs: std::collections::HashSet<String> =
                     rule.prerequisites.iter().cloned().collect();
                 let mut i = 0;
-                while i < self.db.builtin_pattern_rules_count
-                    && i < self.db.pattern_rules.len()
-                {
+                while i < self.db.builtin_pattern_rules_count && i < self.db.pattern_rules.len() {
                     // Cancel if both target patterns AND prereq patterns match exactly.
-                    let same_targets = self.db.pattern_rules[i].targets.iter()
+                    let same_targets = self.db.pattern_rules[i]
+                        .targets
+                        .iter()
                         .all(|t| cancel_targets.contains(t))
                         && self.db.pattern_rules[i].targets.len() == cancel_targets.len();
-                    let same_prereqs = self.db.pattern_rules[i].prerequisites.iter()
+                    let same_prereqs = self.db.pattern_rules[i]
+                        .prerequisites
+                        .iter()
                         .all(|p| cancel_prereqs.contains(p))
                         && self.db.pattern_rules[i].prerequisites.len() == cancel_prereqs.len();
                     let remove = same_targets && same_prereqs;
@@ -2332,8 +2698,10 @@ impl MakeState {
                 let has_prereqs = !rule.prerequisites.is_empty();
                 if has_prereqs && !self.db.posix_mode {
                     // Emit warning: ignoring prerequisites on suffix rule definition
-                    eprintln!("{}:{}: warning: ignoring prerequisites on suffix rule definition",
-                        rule.source_file, rule.lineno);
+                    eprintln!(
+                        "{}:{}: warning: ignoring prerequisites on suffix rule definition",
+                        rule.source_file, rule.lineno
+                    );
                 }
                 self.db.suffix_rules.push(rule.clone());
                 // Create a pattern rule only if: no prerequisites, OR non-POSIX mode.
@@ -2341,7 +2709,9 @@ impl MakeState {
                     // Also register as pattern rule, using the actual current suffix list.
                     // The pattern rule has no prerequisites (they're ignored per SV 40657).
                     let suffixes_clone = self.db.suffixes.clone();
-                    if let Some(pattern_rule) = suffix_to_pattern_rule(target, &rule, &suffixes_clone) {
+                    if let Some(pattern_rule) =
+                        suffix_to_pattern_rule(target, &rule, &suffixes_clone)
+                    {
                         // suffix_to_pattern_rule already sets the correct pattern
                         // prerequisites (e.g. %.baz for .baz.biz target).
                         // The explicit prerequisites of the suffix rule (e.g. foo.bar)
@@ -2394,13 +2764,16 @@ impl MakeState {
             // The parser stored ALL targets in grouped_siblings when is_grouped was set.
             let mut rule_for_target = rule.clone();
             if !rule.grouped_siblings.is_empty() {
-                rule_for_target.grouped_siblings = rule.grouped_siblings.iter()
+                rule_for_target.grouped_siblings = rule
+                    .grouped_siblings
+                    .iter()
                     .filter(|t| *t != target)
                     .cloned()
                     .collect();
             }
             let rule = rule_for_target;
-            let rules = self.db.rules.entry(target.clone()).or_insert_with(Vec::new);
+            let target_key = self.db.remember_rule_name(target);
+            let rules = self.db.rules.entry(target_key).or_insert_with(Vec::new);
             if rule.is_double_colon {
                 rules.push(rule.clone());
             } else {
@@ -2413,12 +2786,16 @@ impl MakeState {
                     let new_normal: std::collections::HashSet<&String> =
                         rule.prerequisites.iter().collect();
                     // (a) Promote: remove from existing order-only if also a new normal prereq.
-                    existing.order_only_prerequisites.retain(|p| !new_normal.contains(p));
+                    existing
+                        .order_only_prerequisites
+                        .retain(|p| !new_normal.contains(p));
 
                     let existing_normal: std::collections::HashSet<&String> =
                         existing.prerequisites.iter().collect();
                     // (b) Filter: don't add as order-only if already a normal prereq.
-                    let filtered_order_only: Vec<String> = rule.order_only_prerequisites.iter()
+                    let filtered_order_only: Vec<String> = rule
+                        .order_only_prerequisites
+                        .iter()
                         .filter(|p| !existing_normal.contains(p))
                         .cloned()
                         .collect();
@@ -2439,7 +2816,9 @@ impl MakeState {
                     } else {
                         existing.prerequisites.extend(rule.prerequisites.clone());
                     }
-                    existing.order_only_prerequisites.extend(filtered_order_only);
+                    existing
+                        .order_only_prerequisites
+                        .extend(filtered_order_only);
                     // Merge second-expansion raw prerequisite text.
                     // When new rule has recipe, its SE text comes first.
                     if let Some(ref new_text) = rule.second_expansion_prereqs {
@@ -2512,8 +2891,19 @@ impl MakeState {
         }
     }
 
-    fn set_variable(&mut self, name: &str, value: &str, flavor: &VarFlavor, is_override: bool, is_export: bool) {
-        let origin = if is_override { VarOrigin::Override } else { VarOrigin::File };
+    fn set_variable(
+        &mut self,
+        name: &str,
+        value: &str,
+        flavor: &VarFlavor,
+        is_override: bool,
+        is_export: bool,
+    ) {
+        let origin = if is_override {
+            VarOrigin::Override
+        } else {
+            VarOrigin::File
+        };
         // Capture current source location for error reporting during lazy expansion.
         let src_file = self.current_file.borrow().clone();
         let src_line = *self.current_line.borrow();
@@ -2532,9 +2922,8 @@ impl MakeState {
         // MAKEFLAGS is special: with -e, the makefile cannot change it.
         // This is because -e means the parent make's environment (which set MAKEFLAGS)
         // takes precedence over makefile assignments.
-        let makeflags_protected = name == "MAKEFLAGS"
-            && !is_override
-            && self.args.environment_overrides;
+        let makeflags_protected =
+            name == "MAKEFLAGS" && !is_override && self.args.environment_overrides;
 
         // Helper to create a new Variable with source location attached.
         let make_var = |val: String, fl: VarFlavor, orig: VarOrigin| {
@@ -2556,8 +2945,10 @@ impl MakeState {
                     if makeflags_protected {
                         return; // -e protects MAKEFLAGS from makefile changes
                     }
-                    if !is_override && self.args.environment_overrides
-                        && existing.origin == VarOrigin::Environment {
+                    if !is_override
+                        && self.args.environment_overrides
+                        && existing.origin == VarOrigin::Environment
+                    {
                         return;
                     }
                     Some((existing.flavor.clone(), existing.value.is_empty()))
@@ -2593,15 +2984,18 @@ impl MakeState {
                         existing.source_line = src_line;
                     }
                 } else {
-                    self.db.variables.insert(name.to_string(),
-                        make_var(value.to_string(), VarFlavor::Recursive, origin));
+                    self.db.variables.insert(
+                        name.to_string(),
+                        make_var(value.to_string(), VarFlavor::Recursive, origin),
+                    );
                 }
             }
             VarFlavor::Conditional => {
                 // ?= only sets if not already defined
-                self.db.variables.entry(name.to_string()).or_insert_with(|| {
-                    make_var(value.to_string(), VarFlavor::Recursive, origin)
-                });
+                self.db
+                    .variables
+                    .entry(name.to_string())
+                    .or_insert_with(|| make_var(value.to_string(), VarFlavor::Recursive, origin));
             }
             VarFlavor::Shell => {
                 // != executes value as shell command; expand Make variable references
@@ -2620,8 +3014,10 @@ impl MakeState {
                 // GNU Make stores != results as recursive variables so that
                 // any $(VAR) references in the shell output are re-expanded
                 // when the variable is later used.
-                self.db.variables.insert(name.to_string(),
-                    make_var(result, VarFlavor::Recursive, origin));
+                self.db.variables.insert(
+                    name.to_string(),
+                    make_var(result, VarFlavor::Recursive, origin),
+                );
             }
             VarFlavor::PosixSimple => {
                 // PosixSimple (:::=): the value is already immediately expanded at the
@@ -2642,8 +3038,10 @@ impl MakeState {
                 }
                 // Escape dollar signs in the already-expanded value
                 let escaped = value.replace('$', "$$");
-                self.db.variables.insert(name.to_string(),
-                    make_var(escaped, VarFlavor::Recursive, origin));
+                self.db.variables.insert(
+                    name.to_string(),
+                    make_var(escaped, VarFlavor::Recursive, origin),
+                );
             }
             _ => {
                 let existing = self.db.variables.get(name);
@@ -2657,8 +3055,10 @@ impl MakeState {
                 if makeflags_protected {
                     return; // -e protects MAKEFLAGS from makefile changes
                 }
-                self.db.variables.insert(name.to_string(),
-                    make_var(value.to_string(), flavor.clone(), origin));
+                self.db.variables.insert(
+                    name.to_string(),
+                    make_var(value.to_string(), flavor.clone(), origin),
+                );
             }
         }
 
@@ -2678,7 +3078,7 @@ impl MakeState {
             if !overrides_val.is_empty() {
                 for part in overrides_val.split_whitespace() {
                     if let Some(eq) = part.find('=') {
-                        new_vars.push((part[..eq].to_string(), part[eq+1..].to_string()));
+                        new_vars.push((part[..eq].to_string(), part[eq + 1..].to_string()));
                     }
                 }
             }
@@ -2734,7 +3134,7 @@ impl MakeState {
                 // GNU Make treats this as explicit-empty: no default target,
                 // error "No targets. Stop." at build time.
                 self.db.default_target = None;
-                self.db.default_goal_explicit = true;  // block auto-setting
+                self.db.default_goal_explicit = true; // block auto-setting
                 if let Some(var) = self.db.variables.get_mut(".DEFAULT_GOAL") {
                     var.value = String::new();
                 }
@@ -2742,10 +3142,18 @@ impl MakeState {
                 // Check for multiple words (GNU Make fatal error).
                 let words: Vec<&str> = expanded_goal.split_whitespace().collect();
                 if words.len() > 1 {
-                    let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                    let progname = std::env::args()
+                        .next()
+                        .unwrap_or_else(|| "make".to_string());
                     let progname = std::path::Path::new(&progname)
-                        .file_name().and_then(|n| n.to_str()).unwrap_or("make").to_string();
-                    eprintln!("{}: *** .DEFAULT_GOAL contains more than one target.  Stop.", progname);
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("make")
+                        .to_string();
+                    eprintln!(
+                        "{}: *** .DEFAULT_GOAL contains more than one target.  Stop.",
+                        progname
+                    );
                     std::process::exit(2);
                 }
                 // Set to specific goal; update default_target
@@ -2824,7 +3232,10 @@ impl MakeState {
 
         // Deduplicate include_dirs (cmdline dirs might now appear twice if also in MAKEFLAGS).
         let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let deduped_dirs: Vec<std::path::PathBuf> = self.args.include_dirs.iter()
+        let deduped_dirs: Vec<std::path::PathBuf> = self
+            .args
+            .include_dirs
+            .iter()
             .filter(|d| seen_dirs.insert(d.to_string_lossy().to_string()))
             .cloned()
             .collect();
@@ -2842,7 +3253,8 @@ impl MakeState {
         // (which uses iter().rev() to put cmdline first). So we keep the list in its natural
         // order: env vars first (from cmdline_args baseline), cmdline-specified vars next.
         // For dedup: keep first occurrence only.
-        let mut seen_var_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_var_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut deduped_vars: Vec<(String, String)> = Vec::new();
         for (name, value) in self.args.variables.iter() {
             let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
@@ -2862,13 +3274,18 @@ impl MakeState {
         env::set_var("MAKEFLAGS", &new_makeflags);
 
         // Update .INCLUDE_DIRS to reflect current include_dirs
-        let include_dirs_str: String = self.args.include_dirs.iter()
+        let include_dirs_str: String = self
+            .args
+            .include_dirs
+            .iter()
             .filter(|d| d.to_string_lossy() != "-")
             .map(|d| d.to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        self.db.variables.insert(".INCLUDE_DIRS".into(),
-            Variable::new(include_dirs_str, VarFlavor::Simple, VarOrigin::Default));
+        self.db.variables.insert(
+            ".INCLUDE_DIRS".into(),
+            Variable::new(include_dirs_str, VarFlavor::Simple, VarOrigin::Default),
+        );
 
         // GNU Make: -R implies -r. Apply AFTER MAKEFLAGS rebuild (so parse-time
         // $(info $(MAKEFLAGS)) shows just R) but before builtin removal check.
@@ -2892,14 +3309,30 @@ impl MakeState {
         if self.args.no_builtin_variables && !self.cmdline_args.no_builtin_variables {
             // Remove default built-in variables, but keep MAKEFLAGS/MAKEOVERRIDES/MAKE_RESTARTS
             // and other make-internal variables that must survive -R.
-            let keep = ["MAKEFLAGS", "MAKEOVERRIDES", "MAKE_RESTARTS", "MAKELEVEL",
-                        "MAKECMDGOALS", "CURDIR", "MAKE", "MAKE_VERSION", ".SHELLFLAGS",
-                        "SHELL", ".FEATURES", ".DEFAULT_GOAL", ".INCLUDE_DIRS",
-                        "MAKE_COMMAND", ".RECIPEPREFIX", ".LOADED", "MAKEFILES",
-                        "SUFFIXES", ".LIBPATTERNS"];
-            self.db.variables.retain(|k, v| {
-                v.origin != VarOrigin::Default || keep.contains(&k.as_str())
-            });
+            let keep = [
+                "MAKEFLAGS",
+                "MAKEOVERRIDES",
+                "MAKE_RESTARTS",
+                "MAKELEVEL",
+                "MAKECMDGOALS",
+                "CURDIR",
+                "MAKE",
+                "MAKE_VERSION",
+                ".SHELLFLAGS",
+                "SHELL",
+                ".FEATURES",
+                ".DEFAULT_GOAL",
+                ".INCLUDE_DIRS",
+                "MAKE_COMMAND",
+                ".RECIPEPREFIX",
+                ".LOADED",
+                "MAKEFILES",
+                "SUFFIXES",
+                ".LIBPATTERNS",
+            ];
+            self.db
+                .variables
+                .retain(|k, v| v.origin != VarOrigin::Default || keep.contains(&k.as_str()));
         }
     }
 
@@ -2907,11 +3340,18 @@ impl MakeState {
         match kind {
             ConditionalKind::Ifdef(var) => {
                 let name = self.expand(var);
-                self.db.variables.get(&name).map_or(false, |v| !v.value.is_empty())
+                self.db
+                    .variables
+                    .get(&name)
+                    .map_or(false, |v| !v.value.is_empty())
             }
             ConditionalKind::Ifndef(var) => {
                 let name = self.expand(var);
-                !self.db.variables.get(&name).map_or(false, |v| !v.value.is_empty())
+                !self
+                    .db
+                    .variables
+                    .get(&name)
+                    .map_or(false, |v| !v.value.is_empty())
             }
             ConditionalKind::Ifeq(a, b) => {
                 let ea = self.expand(a);
@@ -2925,8 +3365,6 @@ impl MakeState {
             }
         }
     }
-
-
 
     /// Build prerequisites needed before building an include file.
     /// Returns Ok(()) if all prerequisites exist or were successfully built.
@@ -2958,18 +3396,22 @@ impl MakeState {
 
             // Check if this prereq has ANY explicit rule (even an empty one like `force:`).
             // Empty rules (no recipe, no prereqs) act as "satisfied" prerequisites.
-            let has_any_rule = self.db.rules.get(prereq).map_or(false, |r| !r.is_empty());
+            let has_any_rule = self.db.get_rules(prereq).map_or(false, |r| !r.is_empty());
 
             // Only look at explicit rules (not pattern rules) to avoid infinite
             // recursion through implicit rule chains like %: %.o: %.c etc.
             // Filter out double-colon rules with no prereqs (skippable), but keep
             // rules with a recipe or prerequisites.
-            let explicit_rule = self.db.rules.get(prereq).and_then(|rules| {
-                rules.iter().find(|r| {
-                    !(r.is_double_colon && r.prerequisites.is_empty())
-                    && (!r.recipe.is_empty() || !r.prerequisites.is_empty())
+            let explicit_rule = self
+                .db
+                .get_rules(prereq)
+                .and_then(|rules| {
+                    rules.iter().find(|r| {
+                        !(r.is_double_colon && r.prerequisites.is_empty())
+                            && (!r.recipe.is_empty() || !r.prerequisites.is_empty())
+                    })
                 })
-            }).cloned();
+                .cloned();
 
             if !prereq_path.exists() {
                 if has_any_rule && explicit_rule.is_none() {
@@ -2985,7 +3427,8 @@ impl MakeState {
                             if first_error.is_none() {
                                 first_error = Some(format!(
                                     "No rule to make target '{}', needed by '{}'.  Stop.",
-                                    prereq, include_target));
+                                    prereq, include_target
+                                ));
                             }
                         }
                         continue;
@@ -2994,10 +3437,17 @@ impl MakeState {
                         visited.insert(prereq.clone());
                         if !rule.prerequisites.is_empty() {
                             if let Err(e) = self.build_include_prerequisites(
-                                &rule.prerequisites.clone(), prereq,
-                                shell, shell_flags, silent, ignore_missing, visited,
+                                &rule.prerequisites.clone(),
+                                prereq,
+                                shell,
+                                shell_flags,
+                                silent,
+                                ignore_missing,
+                                visited,
                             ) {
-                                if first_error.is_none() { first_error = Some(e); }
+                                if first_error.is_none() {
+                                    first_error = Some(e);
+                                }
                                 // Continue building siblings even on error.
                             }
                         }
@@ -3010,9 +3460,17 @@ impl MakeState {
                         {
                             let src = rule.source_file.clone();
                             if let Err(e) = self.run_include_recipe(
-                                prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                                prereq,
+                                "",
+                                &rule.recipe.clone(),
+                                shell,
+                                shell_flags,
+                                silent,
+                                &src,
                             ) {
-                                if first_error.is_none() { first_error = Some(e); }
+                                if first_error.is_none() {
+                                    first_error = Some(e);
+                                }
                                 // Continue building siblings.
                             }
                         }
@@ -3025,15 +3483,23 @@ impl MakeState {
                 if !rule.prerequisites.is_empty() {
                     visited.insert(prereq.clone());
                     if let Err(e) = self.build_include_prerequisites(
-                        &rule.prerequisites.clone(), prereq,
-                        shell, shell_flags, silent, ignore_missing, visited,
+                        &rule.prerequisites.clone(),
+                        prereq,
+                        shell,
+                        shell_flags,
+                        silent,
+                        ignore_missing,
+                        visited,
                     ) {
-                        if first_error.is_none() { first_error = Some(e); }
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
                 // Check if any prereq is now newer than this target
                 let needs_rebuild = rule.prerequisites.iter().any(|p| {
-                    std::fs::metadata(p).ok()
+                    std::fs::metadata(p)
+                        .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|pt| prereq_mtime.map(|tt| pt > tt))
                         .unwrap_or(false)
@@ -3041,9 +3507,17 @@ impl MakeState {
                 if needs_rebuild && !rule.recipe.is_empty() {
                     let src = rule.source_file.clone();
                     if let Err(e) = self.run_include_recipe(
-                        prereq, "", &rule.recipe.clone(), shell, shell_flags, silent, &src,
+                        prereq,
+                        "",
+                        &rule.recipe.clone(),
+                        shell,
+                        shell_flags,
+                        silent,
+                        &src,
                     ) {
-                        if first_error.is_none() { first_error = Some(e); }
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
                     }
                 }
             }
@@ -3057,7 +3531,7 @@ impl MakeState {
     /// Information about a rule found for building an include file.
     fn find_include_rule(&self, target: &str) -> Option<IncludeRuleInfo> {
         // Check explicit rules first
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 // Double-colon rules with no prerequisites are never used for include rebuilding
                 if rule.is_double_colon && rule.prerequisites.is_empty() {
@@ -3075,7 +3549,8 @@ impl MakeState {
                 // Single-colon rule with no recipe AND no prerequisites: sv 61226
                 // GNU Make "imagines" the target was updated; no file is created,
                 // no re-exec triggered, no error reported.
-                if !rule.is_double_colon && rule.recipe.is_empty() && rule.prerequisites.is_empty() {
+                if !rule.is_double_colon && rule.recipe.is_empty() && rule.prerequisites.is_empty()
+                {
                     return Some(IncludeRuleInfo {
                         recipe: Vec::new(),
                         source_file: rule.source_file.clone(),
@@ -3115,19 +3590,23 @@ impl MakeState {
             for pat in &rule.targets {
                 if let Some(stem) = parser::match_pattern(target, pat) {
                     if !rule.recipe.is_empty() {
-                        let recipe: Vec<(usize, String)> = rule.recipe.iter()
+                        let recipe: Vec<(usize, String)> = rule
+                            .recipe
+                            .iter()
                             .map(|(ln, cmd)| (*ln, cmd.clone()))
                             .collect();
                         let src = rule.source_file.clone();
                         let ln = recipe.first().map(|(l, _)| *l).unwrap_or(0);
                         // Expand prerequisites for the stem (first % per word only)
-                        let prereqs: Vec<String> = rule.prerequisites.iter()
+                        let prereqs: Vec<String> = rule
+                            .prerequisites
+                            .iter()
                             .map(|p| {
                                 if let Some(pos) = p.find('%') {
                                     let mut s = String::with_capacity(p.len() + stem.len());
                                     s.push_str(&p[..pos]);
                                     s.push_str(&stem);
-                                    s.push_str(&p[pos+1..]);
+                                    s.push_str(&p[pos + 1..]);
                                     s
                                 } else {
                                     p.clone()
@@ -3136,7 +3615,9 @@ impl MakeState {
                             .collect();
                         // Compute sibling targets: other patterns in the same rule
                         // that also match via the same stem (for grouped pattern rules).
-                        let siblings: Vec<String> = rule.targets.iter()
+                        let siblings: Vec<String> = rule
+                            .targets
+                            .iter()
                             .filter(|p2| p2.as_str() != pat)
                             .map(|p2| p2.replace('%', &stem))
                             .collect();
@@ -3162,8 +3643,13 @@ impl MakeState {
     /// Returns Err with formatted "[source_file:lineno: target] Error N" string on failure.
     /// Callers are responsible for printing warnings and propagating the error.
     fn run_include_recipe(
-        &self, target: &str, stem: &str, recipe: &[(usize, String)],
-        shell: &str, shell_flags: &str, silent: bool,
+        &self,
+        target: &str,
+        stem: &str,
+        recipe: &[(usize, String)],
+        shell: &str,
+        shell_flags: &str,
+        silent: bool,
         source_file: &str,
     ) -> Result<(), String> {
         use std::os::unix::process::ExitStatusExt;
@@ -3184,9 +3670,17 @@ impl MakeState {
             let mut ignore_error = false;
             loop {
                 match cmd.chars().next().unwrap_or(' ') {
-                    '@' => { cmd_silent = true; cmd = cmd[1..].to_string(); }
-                    '-' => { ignore_error = true; cmd = cmd[1..].to_string(); }
-                    '+' => { cmd = cmd[1..].to_string(); }
+                    '@' => {
+                        cmd_silent = true;
+                        cmd = cmd[1..].to_string();
+                    }
+                    '-' => {
+                        ignore_error = true;
+                        cmd = cmd[1..].to_string();
+                    }
+                    '+' => {
+                        cmd = cmd[1..].to_string();
+                    }
                     _ => break,
                 }
             }
@@ -3229,14 +3723,20 @@ impl MakeState {
                                 libc::SIGKILL => "Killed",
                                 _ => "Signal",
                             };
-                            return Err(format!("[{}:{}: {}] {}", source_file, lineno, target, sig_name));
+                            return Err(format!(
+                                "[{}:{}: {}] {}",
+                                source_file, lineno, target, sig_name
+                            ));
                         }
                     } else {
                         let code = s.code().unwrap_or(1);
                         // Error format: [source_file:lineno: target] Error N
                         // Caller is responsible for printing the "*** [...]" error message.
                         if !ignore_error {
-                            return Err(format!("[{}:{}: {}] Error {}", source_file, lineno, target, code));
+                            return Err(format!(
+                                "[{}:{}: {}] Error {}",
+                                source_file, lineno, target, code
+                            ));
                         }
                     }
                 }
@@ -3254,27 +3754,41 @@ impl MakeState {
     /// This is used to separate the variable expansion (requires &self) from the execution
     /// (can run in a thread without &self).
     fn expand_include_recipe_lines(
-        &self, target: &str, stem: &str, recipe: &[(usize, String)]
+        &self,
+        target: &str,
+        stem: &str,
+        recipe: &[(usize, String)],
     ) -> Vec<(usize, String, bool, bool)> {
         let mut auto_vars = HashMap::new();
         auto_vars.insert("@".to_string(), target.to_string());
         auto_vars.insert("*".to_string(), stem.to_string());
 
-        recipe.iter().map(|(lineno, cmd_template)| {
-            let mut cmd = cmd_template.trim_start().to_string();
-            let mut cmd_silent = false;
-            let mut ignore_error = false;
-            loop {
-                match cmd.chars().next().unwrap_or(' ') {
-                    '@' => { cmd_silent = true; cmd = cmd[1..].to_string(); }
-                    '-' => { ignore_error = true; cmd = cmd[1..].to_string(); }
-                    '+' => { cmd = cmd[1..].to_string(); }
-                    _ => break,
+        recipe
+            .iter()
+            .map(|(lineno, cmd_template)| {
+                let mut cmd = cmd_template.trim_start().to_string();
+                let mut cmd_silent = false;
+                let mut ignore_error = false;
+                loop {
+                    match cmd.chars().next().unwrap_or(' ') {
+                        '@' => {
+                            cmd_silent = true;
+                            cmd = cmd[1..].to_string();
+                        }
+                        '-' => {
+                            ignore_error = true;
+                            cmd = cmd[1..].to_string();
+                        }
+                        '+' => {
+                            cmd = cmd[1..].to_string();
+                        }
+                        _ => break,
+                    }
                 }
-            }
-            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
-            (*lineno, expanded_cmd, cmd_silent, ignore_error)
-        }).collect()
+                let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
+                (*lineno, expanded_cmd, cmd_silent, ignore_error)
+            })
+            .collect()
     }
 
     fn find_include_file(&self, file: &str) -> Option<PathBuf> {
@@ -3289,7 +3803,10 @@ impl MakeState {
         let has_reset = self.include_dirs.iter().any(|d| d.to_string_lossy() == "-");
         let effective_dirs: Vec<&PathBuf> = if has_reset {
             // Find the position of the LAST "-" sentinel and only use dirs after it.
-            let last_reset_pos = self.include_dirs.iter().rposition(|d| d.to_string_lossy() == "-")
+            let last_reset_pos = self
+                .include_dirs
+                .iter()
+                .rposition(|d| d.to_string_lossy() == "-")
                 .unwrap_or(0);
             self.include_dirs[last_reset_pos + 1..].iter().collect()
         } else {
@@ -3377,7 +3894,11 @@ impl MakeState {
 
         let progname = make_progname();
         let debug_basic = self.args.debug_short
-            || self.args.debug.iter().any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
+            || self
+                .args
+                .debug
+                .iter()
+                .any(|d| d == "b" || d == "basic" || d == "a" || d == "all");
 
         // Get the current executable path.
         let exe = match env::current_exe() {
@@ -3389,15 +3910,19 @@ impl MakeState {
         };
 
         // Build args: skip argv[0] (the program name)
-        let orig_args: Vec<String> = env::args().skip(1)
-            .filter(|a| !a.starts_with("--temp-stdin="))  // strip any previous --temp-stdin
+        let orig_args: Vec<String> = env::args()
+            .skip(1)
+            .filter(|a| !a.starts_with("--temp-stdin=")) // strip any previous --temp-stdin
             .collect();
 
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(&orig_args);
 
         // If -f- was given, pass the temp file path so the re-exec'd process can read stdin content
-        let temp_stdin_path = self.args.temp_stdin.clone()
+        let temp_stdin_path = self
+            .args
+            .temp_stdin
+            .clone()
             .or_else(|| self.stdin_temp_path.clone());
         if let Some(ref tp) = temp_stdin_path {
             cmd.arg(format!("--temp-stdin={}", tp.display()));
@@ -3456,10 +3981,16 @@ impl MakeState {
             return Ok(());
         }
 
-        let shell = self.db.variables.get("SHELL")
+        let shell = self
+            .db
+            .variables
+            .get("SHELL")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "/bin/sh".to_string());
-        let shell_flags = self.db.variables.get(".SHELLFLAGS")
+        let shell_flags = self
+            .db
+            .variables
+            .get(".SHELLFLAGS")
             .map(|v| v.value.clone())
             .unwrap_or_else(|| "-c".to_string());
         let silent = self.args.silent;
@@ -3502,7 +4033,13 @@ impl MakeState {
                 let mut visited = HashSet::new();
                 visited.insert(mf_name.clone());
                 let _ = self.build_include_prerequisites(
-                    &prereqs, &mf_name, &shell, &shell_flags, silent, true, &mut visited,
+                    &prereqs,
+                    &mf_name,
+                    &shell,
+                    &shell_flags,
+                    silent,
+                    true,
+                    &mut visited,
                 );
 
                 // Now determine if the makefile needs rebuild (after prereqs were built).
@@ -3517,7 +4054,9 @@ impl MakeState {
                     // recipe and no prereqs) acts as an "always satisfied" forcing target:
                     // it was effectively "built" by its empty rule and makes the parent
                     // out of date.
-                    let phony_targets = self.db.special_targets
+                    let phony_targets = self
+                        .db
+                        .special_targets
                         .get(&SpecialTarget::Phony)
                         .cloned()
                         .unwrap_or_default();
@@ -3543,11 +4082,12 @@ impl MakeState {
                         // A prereq that has a rule but no file → was "built" (via empty rule
                         // or recipe that produced no file) → forces parent rebuild.
                         if !Path::new(prereq).exists()
-                            && self.db.rules.get(prereq).map_or(false, |r| !r.is_empty())
+                            && self.db.get_rules(prereq).map_or(false, |r| !r.is_empty())
                         {
                             return true;
                         }
-                        std::fs::metadata(prereq).ok()
+                        std::fs::metadata(prereq)
+                            .ok()
                             .and_then(|m| m.modified().ok())
                             .map_or(false, |pt| pt > target_time)
                     })
@@ -3571,7 +4111,12 @@ impl MakeState {
 
                 // Run the recipe
                 let built = self.run_include_recipe(
-                    &mf_name, &rule_info.stem, &rule_info.recipe.clone(), &shell, &shell_flags, silent,
+                    &mf_name,
+                    &rule_info.stem,
+                    &rule_info.recipe.clone(),
+                    &shell,
+                    &shell_flags,
+                    silent,
                     &rule_info.source_file.clone(),
                 );
 
@@ -3643,7 +4188,7 @@ impl MakeState {
         // Outcome of Phase A for a single pending include.
         enum PendingOutcome {
             AlreadyExists,
-            Error(String),    // empty string = silent error (just return Err(""))
+            Error(String), // empty string = silent error (just return Err(""))
             Imagined,
             SiblingAlreadyRan,
             /// This file's recipe was already queued by another work item (primary_idx).
@@ -3703,7 +4248,8 @@ impl MakeState {
                         deferred_no_such_file: false,
                         also_make_siblings: Vec::new(),
                         rule_source_file: String::new(),
-                        rule_lineno: 0, pre_mtime: None,
+                        rule_lineno: 0,
+                        pre_mtime: None,
                     });
                     continue;
                 }
@@ -3714,7 +4260,9 @@ impl MakeState {
             // Track whether the file was unreadable (exists but can't be opened).
             let was_unreadable = file_path.exists() && !std::fs::File::open(file_path).is_ok();
 
-            let is_phony = self.db.special_targets
+            let is_phony = self
+                .db
+                .special_targets
                 .get(&SpecialTarget::Phony)
                 .map_or(false, |set| set.contains(&pi.file));
             if is_phony {
@@ -3736,7 +4284,8 @@ impl MakeState {
                     deferred_no_such_file: !pi.ignore_missing,
                     also_make_siblings: Vec::new(),
                     rule_source_file: String::new(),
-                    rule_lineno: 0, pre_mtime: None,
+                    rule_lineno: 0,
+                    pre_mtime: None,
                 });
                 continue;
             }
@@ -3765,17 +4314,25 @@ impl MakeState {
                                     let s = format!("{}", e);
                                     if let Some(idx) = s.find(" (os error") {
                                         s[..idx].to_string()
-                                    } else { s }
+                                    } else {
+                                        s
+                                    }
                                 })
                                 .unwrap_or_else(|| "Permission denied".to_string());
                             eprintln!("{}:{}: {}: {}", pi.parent, pi.lineno, pi.file, err_msg);
                         }
-                        (PendingOutcome::Error(
-                            format!("No rule to make target '{}'.  Stop.", pi.file)
-                        ), !pi.parent.is_empty() && !was_unreadable)
+                        (
+                            PendingOutcome::Error(format!(
+                                "No rule to make target '{}'.  Stop.",
+                                pi.file
+                            )),
+                            !pi.parent.is_empty() && !was_unreadable,
+                        )
                     }
                 }
-                Some(IncludeRuleInfo { skippable: true, .. }) => {
+                Some(IncludeRuleInfo {
+                    skippable: true, ..
+                }) => {
                     // Double-colon rule with no prereqs: skippable.
                     if pi.ignore_missing {
                         (PendingOutcome::SiblingAlreadyRan, false)
@@ -3783,10 +4340,16 @@ impl MakeState {
                         (PendingOutcome::Error(String::new()), !pi.parent.is_empty())
                     }
                 }
-                Some(IncludeRuleInfo { imagined: true, .. }) => {
-                    (PendingOutcome::Imagined, false)
-                }
-                Some(IncludeRuleInfo { recipe, source_file, recipe_lineno, prerequisites, sibling_targets, stem, .. }) => {
+                Some(IncludeRuleInfo { imagined: true, .. }) => (PendingOutcome::Imagined, false),
+                Some(IncludeRuleInfo {
+                    recipe,
+                    source_file,
+                    recipe_lineno,
+                    prerequisites,
+                    sibling_targets,
+                    stem,
+                    ..
+                }) => {
                     // Capture sibling info for peer-target warning.
                     also_make_siblings_for_work = sibling_targets.clone();
                     rule_source_file_for_work = source_file.clone();
@@ -3797,7 +4360,12 @@ impl MakeState {
                         // Defer to Phase C: resolve using the primary work item's recipe result.
                         let primary_idx = file_to_work_idx.get(&pi.file).copied();
                         let outcome = match primary_idx {
-                            Some(idx) if matches!(work_items[idx].outcome, PendingOutcome::RunRecipe { .. }) => {
+                            Some(idx)
+                                if matches!(
+                                    work_items[idx].outcome,
+                                    PendingOutcome::RunRecipe { .. }
+                                ) =>
+                            {
                                 PendingOutcome::SiblingOf(idx)
                             }
                             _ => {
@@ -3812,8 +4380,13 @@ impl MakeState {
                         let mut visited = HashSet::new();
                         visited.insert(pi.file.clone());
                         let prereq_result = self.build_include_prerequisites(
-                            &prerequisites, &pi.file, &shell, &shell_flags, silent,
-                            pi.ignore_missing, &mut visited,
+                            &prerequisites,
+                            &pi.file,
+                            &shell,
+                            &shell_flags,
+                            silent,
+                            pi.ignore_missing,
+                            &mut visited,
                         );
                         match prereq_result {
                             Err(prereq_err) => {
@@ -3833,9 +4406,8 @@ impl MakeState {
                                     for sib in &sibling_targets {
                                         self.include_recipe_ran.insert(sib.clone());
                                     }
-                                    let expanded = self.expand_include_recipe_lines(
-                                        &pi.file, &stem, &recipe
-                                    );
+                                    let expanded =
+                                        self.expand_include_recipe_lines(&pi.file, &stem, &recipe);
                                     // Record this as the primary work item for siblings.
                                     let idx = work_items.len();
                                     // Register siblings → this work item index.
@@ -3843,10 +4415,13 @@ impl MakeState {
                                         file_to_work_idx.entry(sib.clone()).or_insert(idx);
                                     }
                                     file_to_work_idx.entry(pi.file.clone()).or_insert(idx);
-                                    (PendingOutcome::RunRecipe {
-                                        expanded,
-                                        source_file: source_file.clone(),
-                                    }, false)
+                                    (
+                                        PendingOutcome::RunRecipe {
+                                            expanded,
+                                            source_file: source_file.clone(),
+                                        },
+                                        false,
+                                    )
                                 }
                             }
                         }
@@ -3866,7 +4441,10 @@ impl MakeState {
                 also_make_siblings: also_make_siblings_for_work,
                 rule_source_file: rule_source_file_for_work,
                 rule_lineno: rule_lineno_for_work,
-                pre_mtime: file_path_buf.metadata().ok().and_then(|m| m.modified().ok()),
+                pre_mtime: file_path_buf
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok()),
             });
         }
 
@@ -3874,10 +4452,11 @@ impl MakeState {
         // Run recipes. When jobs > 1 and multiple items need recipes, run them in
         // parallel threads; otherwise run sequentially.
 
-        let mut recipe_results: Vec<Option<Result<(), String>>> =
-            vec![None; work_items.len()];
+        let mut recipe_results: Vec<Option<Result<(), String>>> = vec![None; work_items.len()];
 
-        let recipe_indices: Vec<usize> = work_items.iter().enumerate()
+        let recipe_indices: Vec<usize> = work_items
+            .iter()
+            .enumerate()
             .filter_map(|(i, w)| {
                 if matches!(w.outcome, PendingOutcome::RunRecipe { .. }) {
                     Some(i)
@@ -3895,33 +4474,47 @@ impl MakeState {
                 target: String,
                 source_file: String,
             }
-            let thread_work: Vec<ThreadWork> = recipe_indices.iter().map(|&i| {
-                if let PendingOutcome::RunRecipe { ref expanded, ref source_file } = work_items[i].outcome {
-                    ThreadWork {
-                        idx: i,
-                        expanded: expanded.clone(),
-                        target: work_items[i].pi_file.clone(),
-                        source_file: source_file.clone(),
+            let thread_work: Vec<ThreadWork> = recipe_indices
+                .iter()
+                .map(|&i| {
+                    if let PendingOutcome::RunRecipe {
+                        ref expanded,
+                        ref source_file,
+                    } = work_items[i].outcome
+                    {
+                        ThreadWork {
+                            idx: i,
+                            expanded: expanded.clone(),
+                            target: work_items[i].pi_file.clone(),
+                            source_file: source_file.clone(),
+                        }
+                    } else {
+                        unreachable!()
                     }
-                } else {
-                    unreachable!()
-                }
-            }).collect();
+                })
+                .collect();
 
-            let results: Vec<(usize, Result<(), String>)> =
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = thread_work.into_iter().map(|tw| {
+            let results: Vec<(usize, Result<(), String>)> = std::thread::scope(|s| {
+                let handles: Vec<_> = thread_work
+                    .into_iter()
+                    .map(|tw| {
                         let sh = shell.as_str();
                         let shf = shell_flags.as_str();
                         s.spawn(move || {
                             let r = execute_include_recipe_expanded(
-                                &tw.expanded, &tw.target, sh, shf, silent, &tw.source_file,
+                                &tw.expanded,
+                                &tw.target,
+                                sh,
+                                shf,
+                                silent,
+                                &tw.source_file,
                             );
                             (tw.idx, r)
                         })
-                    }).collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
             for (idx, result) in results {
                 recipe_results[idx] = Some(result);
@@ -3929,10 +4522,19 @@ impl MakeState {
         } else {
             // Sequential execution
             for &i in &recipe_indices {
-                if let PendingOutcome::RunRecipe { ref expanded, ref source_file } = work_items[i].outcome {
+                if let PendingOutcome::RunRecipe {
+                    ref expanded,
+                    ref source_file,
+                } = work_items[i].outcome
+                {
                     let target = work_items[i].pi_file.clone();
                     let r = execute_include_recipe_expanded(
-                        expanded, &target, &shell, &shell_flags, silent, source_file,
+                        expanded,
+                        &target,
+                        &shell,
+                        &shell_flags,
+                        silent,
+                        source_file,
                     );
                     recipe_results[i] = Some(r);
                 }
@@ -3984,8 +4586,10 @@ impl MakeState {
                     if !pi_ignore_missing {
                         // Print deferred "No such file or directory" now (after recipes ran)
                         if deferred_no_such_file && !pi_parent.is_empty() {
-                            eprintln!("{}:{}: {}: No such file or directory",
-                                pi_parent, pi_lineno, pi_file);
+                            eprintln!(
+                                "{}:{}: {}: No such file or directory",
+                                pi_parent, pi_lineno, pi_file
+                            );
                         }
                         if self.args.keep_going {
                             // In -k mode: print error without ".  Stop.", add "Failed to
@@ -4000,8 +4604,10 @@ impl MakeState {
                                 eprintln!("{}: *** {}", progname, clean);
                             }
                             if !pi_parent.is_empty() {
-                                eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                    pi_parent, pi_lineno, pi_file);
+                                eprintln!(
+                                    "{}:{}: Failed to remake makefile '{}'.",
+                                    pi_parent, pi_lineno, pi_file
+                                );
                             }
                             return Err(String::new());
                         }
@@ -4034,8 +4640,10 @@ impl MakeState {
                             // Primary recipe failed (or no result available).
                             if !pi_ignore_missing {
                                 if !pi_parent.is_empty() {
-                                    eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                        pi_parent, pi_lineno, pi_file);
+                                    eprintln!(
+                                        "{}:{}: Failed to remake makefile '{}'.",
+                                        pi_parent, pi_lineno, pi_file
+                                    );
                                 }
                                 return Err(String::new());
                             }
@@ -4058,17 +4666,19 @@ impl MakeState {
                                 // Check if the file was actually modified by the recipe.
                                 // If mtime is unchanged, the recipe ran but didn't modify
                                 // the file (e.g., `@echo force $@`). No re-exec needed.
-                                let post_mtime = file_path.metadata().ok().and_then(|m| m.modified().ok());
+                                let post_mtime =
+                                    file_path.metadata().ok().and_then(|m| m.modified().ok());
                                 let pre = work_items_vec[i].pre_mtime;
                                 let actually_changed = match (pre, post_mtime) {
                                     (Some(old), Some(new)) => new != old,
-                                    (None, Some(_)) => true,  // file created
+                                    (None, Some(_)) => true, // file created
                                     _ => false,
                                 };
                                 if !actually_changed {
                                     // Recipe ran but file unchanged — don't re-exec.
                                     // Still read it if not already read.
-                                    let already_read = self.makefile_list.iter().any(|p| p == &file_path);
+                                    let already_read =
+                                        self.makefile_list.iter().any(|p| p == &file_path);
                                     if !already_read {
                                         let _ = self.read_makefile(file_path.as_path());
                                     }
@@ -4098,8 +4708,10 @@ impl MakeState {
                         Err(recipe_err) => {
                             if !pi_ignore_missing {
                                 if !pi_parent.is_empty() {
-                                    eprintln!("{}:{}: {}: No such file or directory",
-                                        pi_parent, pi_lineno, pi_file);
+                                    eprintln!(
+                                        "{}:{}: {}: No such file or directory",
+                                        pi_parent, pi_lineno, pi_file
+                                    );
                                 }
                                 // With -k (keep-going): encode "Failed to remake" as a
                                 // suffix line in the error string. GNU Make prints this
@@ -4120,8 +4732,10 @@ impl MakeState {
                                         eprintln!("{}: *** {}", progname, e);
                                     }
                                     if !pi_parent.is_empty() {
-                                        eprintln!("{}:{}: Failed to remake makefile '{}'.",
-                                            pi_parent, pi_lineno, pi_file);
+                                        eprintln!(
+                                            "{}:{}: Failed to remake makefile '{}'.",
+                                            pi_parent, pi_lineno, pi_file
+                                        );
                                     }
                                     return Err(String::new()); // Empty = already printed
                                 } else {
@@ -4242,11 +4856,10 @@ fn try_expand_define_name(trimmed: &str, state: &MakeState) -> Option<String> {
     // (e.g. `define = value` defines a variable named "define").
     let assignment_ops = [":::=", "::=", "!=", "?=", "+=", ":=", "="];
     let starts_with_op = assignment_ops.iter().any(|op| {
-        rest_after_define.starts_with(op) && (
-            rest_after_define.len() == op.len()
-            || rest_after_define[op.len()..].starts_with(' ')
-            || rest_after_define[op.len()..].starts_with('\t')
-        )
+        rest_after_define.starts_with(op)
+            && (rest_after_define.len() == op.len()
+                || rest_after_define[op.len()..].starts_with(' ')
+                || rest_after_define[op.len()..].starts_with('\t'))
     });
     // `define : recipe` → rule with target named "define", not a define directive
     let starts_with_rule_colon = rest_after_define.starts_with(':')
@@ -4277,16 +4890,21 @@ fn try_expand_define_name(trimmed: &str, state: &MakeState) -> Option<String> {
         let mut paren_depth: i32 = 0;
         while end < bytes.len() {
             // Track $( and ${ as opening delimiters
-            if bytes[end] == b'$' && end + 1 < bytes.len()
-                && (bytes[end+1] == b'(' || bytes[end+1] == b'{')
+            if bytes[end] == b'$'
+                && end + 1 < bytes.len()
+                && (bytes[end + 1] == b'(' || bytes[end + 1] == b'{')
             {
                 paren_depth += 1;
                 end += 2;
                 continue;
             }
             match bytes[end] {
-                b'(' | b'{' if paren_depth > 0 => { paren_depth += 1; }
-                b')' | b'}' if paren_depth > 0 => { paren_depth -= 1; }
+                b'(' | b'{' if paren_depth > 0 => {
+                    paren_depth += 1;
+                }
+                b')' | b'}' if paren_depth > 0 => {
+                    paren_depth -= 1;
+                }
                 _ => {}
             }
             if paren_depth == 0 {
@@ -4344,4 +4962,31 @@ fn extract_var_prefixes(line: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MakeState;
+    use crate::cli::{parse_makeflags, MakeArgs};
+
+    #[test]
+    fn makeflags_round_trip_preserves_escaped_command_line_variable_values() {
+        let mut args = MakeArgs::default();
+        args.variables = vec![("HELPERS".to_string(), ": ansi2knr yodl ".to_string())];
+
+        let state = MakeState::new(args.clone());
+        let makeflags = state.build_makeflags_from_args(&args.variables);
+
+        assert!(makeflags.contains("HELPERS=:\\ ansi2knr\\ yodl\\ "));
+
+        let mut reparsed = MakeArgs::default();
+        parse_makeflags(&makeflags, &mut reparsed);
+
+        assert_eq!(reparsed.variables, args.variables);
+        assert!(!reparsed.debug_short);
+        assert!(!reparsed.dry_run);
+        assert!(!reparsed.ignore_errors);
+        assert!(!reparsed.no_builtin_rules);
+        assert!(!reparsed.touch);
+    }
 }

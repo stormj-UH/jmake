@@ -35,7 +35,6 @@ jobs:
 
       - name: Run GNU Make test suite
         id: tests
-        continue-on-error: true
         run: |
           set +e
           cd /tmp

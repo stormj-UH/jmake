@@ -14,8 +14,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 pub struct Executor<'a> {
@@ -34,9 +34,9 @@ pub struct Executor<'a> {
     shell_flags: &'a str,
     always_make: bool,
     trace: bool,
-    built: HashMap<String, bool>, // target -> was rebuilt
-    building: HashSet<String>,    // cycle detection
-    building_stack: Vec<String>,  // ordered stack for cycle detection messages
+    built: HashMap<String, bool>,      // target -> was rebuilt
+    building: HashSet<String>,         // cycle detection
+    building_stack: Vec<String>,       // ordered stack for cycle detection messages
     circular_dropped: HashSet<String>, // targets whose circular dep was dropped
     question_out_of_date: bool,
     errors: Vec<String>,
@@ -239,7 +239,9 @@ impl<'a> Executor<'a> {
                     // Normally suppressed when any recipe ran, but grouped-covered siblings
                     // always get the message (GNU Make prints it for them even after recipes ran).
                     let is_grouped_covered = self.grouped_covered.contains(target);
-                    if !rebuilt && !self.silent && !self.question
+                    if !rebuilt
+                        && !self.silent
+                        && !self.question
                         && (!self.any_recipe_ran || is_grouped_covered)
                     {
                         // Grouped-covered siblings always get "Nothing to be done" since
@@ -284,12 +286,16 @@ impl<'a> Executor<'a> {
             let target_list: String = if failed_top_level_targets.len() == 1 {
                 format!("'{}'", failed_top_level_targets[0])
             } else {
-                failed_top_level_targets.iter()
+                failed_top_level_targets
+                    .iter()
                     .map(|t| format!("'{}'", t))
                     .collect::<Vec<_>>()
                     .join(" ")
             };
-            eprintln!("{}: Target {} not remade because of errors.", self.progname, target_list);
+            eprintln!(
+                "{}: Target {} not remade because of errors.",
+                self.progname, target_list
+            );
             // Return an empty error so main.rs does not print a duplicate message.
             return Err(String::new());
         }
@@ -332,7 +338,10 @@ impl<'a> Executor<'a> {
         let makelevel = self.get_makelevel();
         let gnumakeflags_was_set = self.state.args.gnumakeflags_was_set;
         let one_shell = self.db.one_shell;
-        let delete_on_error = self.db.special_targets.contains_key(&SpecialTarget::DeleteOnError);
+        let delete_on_error = self
+            .db
+            .special_targets
+            .contains_key(&SpecialTarget::DeleteOnError);
 
         // ------------------------------------------------------------------
         // Phase 2: Set up worker thread pool and scheduler
@@ -384,7 +393,9 @@ impl<'a> Executor<'a> {
 
                 match job {
                     Some(j) => {
-                        scheduler.states.insert(target.clone(), TargetState::Running);
+                        scheduler
+                            .states
+                            .insert(target.clone(), TargetState::Running);
                         scheduler.running_count += 1;
                         scheduler.send_job(j);
                     }
@@ -393,7 +404,9 @@ impl<'a> Executor<'a> {
                         // going through a worker thread.
                         // We mark it done and propagate to dependents directly.
                         // Do NOT call handle_completion (which does running_count -= 1).
-                        scheduler.states.insert(target.clone(), TargetState::Done(false));
+                        scheduler
+                            .states
+                            .insert(target.clone(), TargetState::Done(false));
                         // Propagate to dependents.
                         if let Some(deps) = scheduler.dependents_of.get(&target).cloned() {
                             for dep in deps {
@@ -496,25 +509,29 @@ impl<'a> Executor<'a> {
         use crate::types::VarOrigin;
         let mut ops: Vec<(String, Option<String>)> = Vec::new();
         for (name, var) in &self.db.variables {
-            if name == "MAKELEVEL" { continue; } // set separately
-            // MAKE_RESTARTS must not be exported to child makes (only relevant for re-exec).
+            if name == "MAKELEVEL" {
+                continue;
+            } // set separately
+              // MAKE_RESTARTS must not be exported to child makes (only relevant for re-exec).
             if name == "MAKE_RESTARTS" {
                 ops.push((name.clone(), None));
                 continue;
             }
             let always_export = matches!(name.as_str(), "MAKEFLAGS" | "MAKE" | "MAKECMDGOALS");
             let was_from_env = self.db.env_var_names.contains(name.as_str());
-            let should_export = !var.is_private && (always_export || match var.export {
-                Some(true) => true,
-                Some(false) => false,
-                None => {
-                    if self.db.unexport_all {
-                        was_from_env && var.origin == VarOrigin::Environment
-                    } else {
-                        self.db.export_all || was_from_env
-                    }
-                }
-            });
+            let should_export = !var.is_private
+                && (always_export
+                    || match var.export {
+                        Some(true) => true,
+                        Some(false) => false,
+                        None => {
+                            if self.db.unexport_all {
+                                was_from_env && var.origin == VarOrigin::Environment
+                            } else {
+                                self.db.export_all || was_from_env
+                            }
+                        }
+                    });
             if should_export {
                 let value = self.state.expand(&var.value);
                 ops.push((name.clone(), Some(value)));
@@ -547,22 +564,37 @@ impl<'a> Executor<'a> {
 
         // Determine effective shell/flags for this target.
         // (target-specific SHELL vars were baked into auto_vars during resolve)
-        let eff_shell = plan.auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(shell);
-        let eff_flags = plan.auto_vars.get(".SHELLFLAGS").map(|s| s.as_str()).unwrap_or(shell_flags);
+        let eff_shell = plan
+            .auto_vars
+            .get("SHELL")
+            .map(|s| s.as_str())
+            .unwrap_or(shell);
+        let eff_flags = plan
+            .auto_vars
+            .get(".SHELLFLAGS")
+            .map(|s| s.as_str())
+            .unwrap_or(shell_flags);
 
         // Pre-expand recipe lines using the stored auto_vars.
         // The recipe lines in TargetPlan are already expanded (done during collect_plans).
-        let pre_expanded: Vec<(usize, String, Vec<String>)> = plan.recipe.iter().map(|(ln, line)| {
-            let sub_lines = parallel::split_recipe_sub_lines_standalone(line);
-            (*ln, line.clone(), sub_lines)
-        }).collect();
+        let pre_expanded: Vec<(usize, String, Vec<String>)> = plan
+            .recipe
+            .iter()
+            .map(|(ln, line)| {
+                let sub_lines = parallel::split_recipe_sub_lines_standalone(line);
+                (*ln, line.clone(), sub_lines)
+            })
+            .collect();
 
         // Re-compute exports here (in the main thread, sequentially) so that recursive
         // variables like `export HI = $(shell $($@.CMD))` are evaluated with $@ set to
         // the current target. This matches GNU Make behavior where the main thread evaluates
         // the recipe environment just before forking the recipe subprocess.
         let mut extra_exports = self.compute_target_exports(target);
-        let extra_unexports = self.compute_target_unexports(target).into_iter().collect::<Vec<_>>();
+        let extra_unexports = self
+            .compute_target_unexports(target)
+            .into_iter()
+            .collect::<Vec<_>>();
 
         // Also re-evaluate globally exported recursive variables that reference $@ (or other
         // auto-vars that vary per-target). Override the pre-computed env_ops values.
@@ -572,11 +604,12 @@ impl<'a> Executor<'a> {
         for (name, var) in &self.db.variables {
             if var.flavor == VarFlavor::Recursive && var.value.contains("$@") {
                 // Check if this variable is exported.
-                let should_export = !var.is_private && match var.export {
-                    Some(true) => true,
-                    Some(false) => false,
-                    None => self.db.export_all || self.db.env_var_names.contains(name.as_str()),
-                };
+                let should_export = !var.is_private
+                    && match var.export {
+                        Some(true) => true,
+                        Some(false) => false,
+                        None => self.db.export_all || self.db.env_var_names.contains(name.as_str()),
+                    };
                 if should_export {
                     let val = self.state.expand_with_auto_vars(&var.value, &at_var_ctx);
                     extra_exports.insert(name.clone(), val);
@@ -662,7 +695,10 @@ impl<'a> Executor<'a> {
         // Strategy: reverse the list, then within each consecutive run of
         // entries that are all prereqs of the same explicit rule, re-reverse
         // to restore forward prereq order.
-        let mut to_delete_raw: Vec<String> = self.intermediate_built.iter().rev()
+        let mut to_delete_raw: Vec<String> = self
+            .intermediate_built
+            .iter()
+            .rev()
             .filter(|t| {
                 !self.top_level_targets.contains(*t)
                     && !self.db.is_precious(t)
@@ -681,7 +717,9 @@ impl<'a> Executor<'a> {
                     for rule in rules {
                         let has_a = rule.prerequisites.iter().any(|p| p == a);
                         let has_b = rule.prerequisites.iter().any(|p| p == b);
-                        if has_a && has_b { return true; }
+                        if has_a && has_b {
+                            return true;
+                        }
                     }
                 }
                 false
@@ -707,12 +745,17 @@ impl<'a> Executor<'a> {
         // Collect files that actually exist and need to be deleted.
         // Exclude files that also exist in VPATH: these were "promoted" from VPATH to a
         // local copy (VPATH+ rename behavior) and should not be deleted.
-        let existing: Vec<String> = to_delete.iter()
+        let existing: Vec<String> = to_delete
+            .iter()
             .filter(|t| {
-                if !Path::new(t.as_str()).exists() { return false; }
+                if !Path::new(t.as_str()).exists() {
+                    return false;
+                }
                 // Skip deletion if this target also exists under a VPATH directory:
                 // the local copy is the updated authoritative version.
-                if self.find_in_vpath(t).is_some() { return false; }
+                if self.find_in_vpath(t).is_some() {
+                    return false;
+                }
                 true
             })
             .cloned()
@@ -762,10 +805,15 @@ impl<'a> Executor<'a> {
             // The "requester" is the most recent target on the building_stack:
             // GNU Make prints "Circular A <- B" where A is the target currently
             // being built (last on the stack) and B is the already-in-progress target.
-            let requester = self.building_stack.last()
+            let requester = self
+                .building_stack
+                .last()
                 .map(|s| s.as_str())
                 .unwrap_or(target);
-            eprintln!("{}: Circular {} <- {} dependency dropped.", self.progname, requester, target);
+            eprintln!(
+                "{}: Circular {} <- {} dependency dropped.",
+                self.progname, requester, target
+            );
             // Mark as built and circular so terminal rule checks know this dep was
             // handled (circular deps are "available" even though no file was created).
             self.built.insert(target.to_string(), false);
@@ -817,7 +865,7 @@ impl<'a> Executor<'a> {
             // to libname.a. Warn that -lname's recipe is ignored and redirect.
             // This matches GNU Make's sv 54549 behavior.
             let lib_a = format!("lib{}.a", lib_name);
-            if let Some(lib_a_rules) = self.db.rules.get(&lib_a) {
+            if let Some(lib_a_rules) = self.db.get_rules(&lib_a) {
                 let lib_a_has_recipe = lib_a_rules.iter().any(|r| !r.recipe.is_empty());
                 if lib_a_has_recipe {
                     // Check if -lname would have a recipe via a pattern rule.
@@ -825,13 +873,19 @@ impl<'a> Executor<'a> {
                         if !pattern_rule.recipe.is_empty() {
                             // Find source info from the pattern rule.
                             let src = &pattern_rule.source_file;
-                            let recipe_lineno = pattern_rule.recipe.first()
+                            let recipe_lineno = pattern_rule
+                                .recipe
+                                .first()
                                 .map(|(l, _)| *l)
                                 .unwrap_or(pattern_rule.lineno);
-                            eprintln!("{}:{}: Recipe was specified for file '{}' at {}:{},",
-                                src, recipe_lineno, target, src, recipe_lineno);
-                            eprintln!("{}:{}: but '{}' is now considered the same file as '{}'.",
-                                src, recipe_lineno, target, lib_a);
+                            eprintln!(
+                                "{}:{}: Recipe was specified for file '{}' at {}:{},",
+                                src, recipe_lineno, target, src, recipe_lineno
+                            );
+                            eprintln!(
+                                "{}:{}: but '{}' is now considered the same file as '{}'.",
+                                src, recipe_lineno, target, lib_a
+                            );
                             eprintln!("{}:{}: Recipe for '{}' will be ignored in favor of the one for '{}'.",
                                 src, recipe_lineno, target, lib_a);
                             // Redirect to libname.a
@@ -844,19 +898,21 @@ impl<'a> Executor<'a> {
         }
 
         // Find rule for this target
-        let rules = self.db.rules.get(target).cloned();
+        let rules = self.db.get_rules(target).cloned();
         let is_phony = self.db.is_phony(target);
 
         // Collect any grouped siblings for this target.
         // Grouped targets (&:) are built together: when any one is built, all
         // siblings are also built (each with their own SE expansion context).
         let grouped_siblings: Vec<String> = if let Some(ref rules) = rules {
-            rules.iter()
+            rules
+                .iter()
                 .flat_map(|r| r.grouped_siblings.iter().cloned())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
-                .filter(|s| !self.built.contains_key(s.as_str())
-                         && !self.building.contains(s.as_str()))
+                .filter(|s| {
+                    !self.built.contains_key(s.as_str()) && !self.building.contains(s.as_str())
+                })
                 .collect()
         } else {
             Vec::new()
@@ -869,23 +925,31 @@ impl<'a> Executor<'a> {
                 // with a recipe, AND the local target also has a recipe, then the VPATH
                 // version takes precedence. Warn and redirect to the VPATH path.
                 // Only applies to non-double-colon rules (single-colon, explicit target rules).
-                let local_has_recipe = rules.iter().any(|r| !r.recipe.is_empty() && !r.is_double_colon);
+                let local_has_recipe = rules
+                    .iter()
+                    .any(|r| !r.recipe.is_empty() && !r.is_double_colon);
                 if local_has_recipe {
                     if let Some(vpath_resolved) = self.find_in_vpath(target) {
                         if vpath_resolved != target {
-                            if let Some(vpath_rules) = self.db.rules.get(&vpath_resolved) {
-                                let vpath_has_recipe = vpath_rules.iter().any(|r| !r.recipe.is_empty());
+                            if let Some(vpath_rules) = self.db.get_rules(&vpath_resolved) {
+                                let vpath_has_recipe =
+                                    vpath_rules.iter().any(|r| !r.recipe.is_empty());
                                 if vpath_has_recipe {
                                     // Find source info for the local rule with a recipe
-                                    let local_rule_with_recipe = rules.iter()
+                                    let local_rule_with_recipe = rules
+                                        .iter()
                                         .find(|r| !r.recipe.is_empty() && !r.is_double_colon);
                                     if let Some(local_rule) = local_rule_with_recipe {
                                         let src = &local_rule.source_file;
-                                        let recipe_lineno = local_rule.recipe.first()
+                                        let recipe_lineno = local_rule
+                                            .recipe
+                                            .first()
                                             .map(|(l, _)| *l)
                                             .unwrap_or(local_rule.lineno);
-                                        eprintln!("{}:{}: Recipe was specified for file '{}' at {}:{},",
-                                            src, recipe_lineno, target, src, recipe_lineno);
+                                        eprintln!(
+                                            "{}:{}: Recipe was specified for file '{}' at {}:{},",
+                                            src, recipe_lineno, target, src, recipe_lineno
+                                        );
                                         eprintln!("{}:{}: but '{}' is now considered the same file as '{}'.",
                                             src, recipe_lineno, target, vpath_resolved);
                                         eprintln!("{}:{}: Recipe for '{}' will be ignored in favor of the one for '{}'.",
@@ -897,22 +961,30 @@ impl<'a> Executor<'a> {
                                     // the vpath target name so that build_with_rules will
                                     // process them AFTER the vpath target's own SE texts,
                                     // preserving the correct output order.
-                                    let local_se_texts: Vec<(String, String)> = rules.iter()
-                                        .filter(|r| !r.is_double_colon
-                                            && r.second_expansion_prereqs.is_some())
-                                        .filter_map(|r| r.second_expansion_prereqs.as_ref()
-                                            .map(|t| (t.clone(), r.static_stem.clone())))
+                                    let local_se_texts: Vec<(String, String)> = rules
+                                        .iter()
+                                        .filter(|r| {
+                                            !r.is_double_colon
+                                                && r.second_expansion_prereqs.is_some()
+                                        })
+                                        .filter_map(|r| {
+                                            r.second_expansion_prereqs
+                                                .as_ref()
+                                                .map(|t| (t.clone(), r.static_stem.clone()))
+                                        })
                                         .collect();
                                     if !local_se_texts.is_empty() {
                                         let vr = vpath_resolved.clone();
                                         // Store (se_text, local_target, stem) for later use.
                                         // Encode as "target\x00stem\x00text" to carry all context.
-                                        let encoded: Vec<String> = local_se_texts.iter()
+                                        let encoded: Vec<String> = local_se_texts
+                                            .iter()
                                             .map(|(text, stem)| {
                                                 format!("{}\x00{}\x00{}", target, stem, text)
                                             })
                                             .collect();
-                                        self.vpath_extra_se_texts.entry(vr)
+                                        self.vpath_extra_se_texts
+                                            .entry(vr)
                                             .or_default()
                                             .extend(encoded);
                                     }
@@ -933,21 +1005,33 @@ impl<'a> Executor<'a> {
                     // If a rule has grouped_siblings, treat it as its own grouped invocation.
                     // This handles `a b c&::; X` + `c d e&::; Y` where c has two groups.
                     let rules_clone = rules.clone();
-                    let any_rule_is_grouped = rules_clone.iter().any(|r| !r.grouped_siblings.is_empty());
+                    let any_rule_is_grouped =
+                        rules_clone.iter().any(|r| !r.grouped_siblings.is_empty());
                     if any_rule_is_grouped {
                         let mut any_rebuilt = false;
                         for rule in &rules_clone {
                             // Compute this rule's siblings (not yet built, not already building)
-                            let rule_siblings: Vec<String> = rule.grouped_siblings.iter()
-                                .filter(|s| !self.built.contains_key(s.as_str())
-                                         && !self.building.contains(s.as_str()))
+                            let rule_siblings: Vec<String> = rule
+                                .grouped_siblings
+                                .iter()
+                                .filter(|s| {
+                                    !self.built.contains_key(s.as_str())
+                                        && !self.building.contains(s.as_str())
+                                })
                                 .cloned()
                                 .collect();
                             let result = self.build_with_rules_grouped(
-                                target, std::slice::from_ref(rule), is_phony, &rule_siblings
+                                target,
+                                std::slice::from_ref(rule),
+                                is_phony,
+                                &rule_siblings,
                             );
                             match result {
-                                Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+                                Ok(rebuilt) => {
+                                    if rebuilt {
+                                        any_rebuilt = true;
+                                    }
+                                }
                                 Err(e) => return Err(e),
                             }
                         }
@@ -957,7 +1041,8 @@ impl<'a> Executor<'a> {
                 // For grouped targets (&:): pass the siblings to build_with_rules so it
                 // can build their prerequisites BEFORE running the recipe, and mark them
                 // as built afterward. The recipe runs ONCE for the primary target only.
-                let result = self.build_with_rules_grouped(target, rules, is_phony, &grouped_siblings);
+                let result =
+                    self.build_with_rules_grouped(target, rules, is_phony, &grouped_siblings);
                 return result;
             }
         }
@@ -967,7 +1052,7 @@ impl<'a> Executor<'a> {
         // explicit rule and VPATH contains `vpa`, that explicit VPATH rule takes
         // priority over any matching pattern rule.
         if let Some(found) = self.find_in_vpath(target) {
-            if found != target && self.db.rules.contains_key(&found) {
+            if found != target && self.db.has_rule(&found) {
                 return self.build_target(&found);
             }
         }
@@ -1046,7 +1131,13 @@ impl<'a> Executor<'a> {
                     self.pending_plan_order_only = Vec::new();
                     self.pending_plan_wait_groups = Vec::new();
                 }
-                let result = self.execute_recipe(target, &default_rule.recipe, &default_rule.source_file, &auto_vars, false);
+                let result = self.execute_recipe(
+                    target,
+                    &default_rule.recipe,
+                    &default_rule.source_file,
+                    &auto_vars,
+                    false,
+                );
                 self.target_extra_exports.clear();
                 self.target_extra_unexports.clear();
                 return result;
@@ -1081,8 +1172,12 @@ impl<'a> Executor<'a> {
         let mut order_only = Vec::new();
         let mut is_order_only = false;
         for token in expanded.split_whitespace() {
-            if token.is_empty() { continue; }
-            if token == ".WAIT" { continue; } // filter .WAIT markers
+            if token.is_empty() {
+                continue;
+            }
+            if token == ".WAIT" {
+                continue;
+            } // filter .WAIT markers
             if token == "|" {
                 is_order_only = true;
                 continue;
@@ -1114,7 +1209,12 @@ impl<'a> Executor<'a> {
         (normal, order_only)
     }
 
-    fn build_with_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
+    fn build_with_rules(
+        &mut self,
+        target: &str,
+        rules: &[Rule],
+        is_phony: bool,
+    ) -> Result<bool, String> {
         // Double-colon rules are treated as independent rules: each is evaluated
         // and executed separately if its prerequisites are out of date.
         // Use any() instead of first() to handle the case where a target-specific
@@ -1134,7 +1234,7 @@ impl<'a> Executor<'a> {
         //   that have deferred ('$$'-escaped) prerequisites.  Expanded at build time with
         //   auto vars ($@, $<, $^, etc.) computed from non-SE prereqs.
 
-        let mut all_prereqs: Vec<String> = Vec::new();  // non-SE prereqs (direct build + auto vars)
+        let mut all_prereqs: Vec<String> = Vec::new(); // non-SE prereqs (direct build + auto vars)
         let mut all_order_only: Vec<String> = Vec::new();
         // SE texts paired with the per-rule static stem (for correct $* expansion when
         // multiple static pattern rules match the same target with different stems).
@@ -1188,7 +1288,8 @@ impl<'a> Executor<'a> {
             // The global static_stem (last rule's stem) is used for $* in the auto-var
             // base, but each rule's SE text is expanded with that rule's own stem so
             // that $$* refers to the correct per-rule match.
-            let global_stem = rules.iter()
+            let global_stem = rules
+                .iter()
                 .rev()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
@@ -1200,8 +1301,13 @@ impl<'a> Executor<'a> {
             for (text, rule_stem) in &se_prereq_texts {
                 // Use per-rule stem for $* so that each static pattern rule's $$*
                 // expands to its own match stem, not the global (last) stem.
-                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
-                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                let effective_stem = if rule_stem.is_empty() {
+                    &global_stem
+                } else {
+                    rule_stem
+                };
+                let mut rule_auto_vars =
+                    self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
                 // $? is always empty in second-expansion context.
                 rule_auto_vars.insert("?".to_string(), String::new());
                 self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
@@ -1216,14 +1322,21 @@ impl<'a> Executor<'a> {
                     let raw_expanded = self.state.expand_with_auto_vars(text, &rule_auto_vars);
                     *self.state.in_second_expansion.borrow_mut() = false;
                     for token in raw_expanded.split_whitespace() {
-                        if token == "|" { continue; } // skip '|' but keep processing
+                        if token == "|" {
+                            continue;
+                        } // skip '|' but keep processing
                         se_raw_tokens_for_wait.push(token.to_string());
                     }
                 }
             }
             for (text, rule_stem) in &se_order_only_texts {
-                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
-                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                let effective_stem = if rule_stem.is_empty() {
+                    &global_stem
+                } else {
+                    rule_stem
+                };
+                let mut rule_auto_vars =
+                    self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
                 rule_auto_vars.insert("?".to_string(), String::new());
                 self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
                 let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
@@ -1299,7 +1412,8 @@ impl<'a> Executor<'a> {
         let mut combined_build_order: Option<Vec<(String, bool)>> = None;
         if self.shuffle.is_some() && !self.db.not_parallel {
             // Tag each prereq with whether it's regular (true) or order-only (false).
-            let mut tagged: Vec<(String, bool)> = all_prereqs.drain(..)
+            let mut tagged: Vec<(String, bool)> = all_prereqs
+                .drain(..)
                 .map(|p| (p, true))
                 .chain(all_order_only.drain(..).map(|p| (p, false)))
                 .collect();
@@ -1338,11 +1452,15 @@ impl<'a> Executor<'a> {
         // When the recipe is empty (no recipe from explicit rules), we also peek at the
         // pattern rule's prerequisites to include them in the check, so that
         // .NOTINTERMEDIATE pattern-rule prereqs correctly trigger a rebuild.
-        if !is_phony && !self.always_make
-            && se_prereq_texts.is_empty() && se_order_only_texts.is_empty() {
-            if let Some(target_time) = self.file_mtime(target).or_else(|| {
-                self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
-            }) {
+        if !is_phony
+            && !self.always_make
+            && se_prereq_texts.is_empty()
+            && se_order_only_texts.is_empty()
+        {
+            if let Some(target_time) = self
+                .file_mtime(target)
+                .or_else(|| self.find_in_vpath(target).and_then(|f| self.file_mtime(&f)))
+            {
                 // Start with the explicitly-collected prereqs.
                 let mut check_prereqs: Vec<String> = all_prereqs.clone();
 
@@ -1361,13 +1479,21 @@ impl<'a> Executor<'a> {
                             // Can't precheck without SE expansion — fall through to full build.
                             pat_rule_has_se = true;
                         } else {
-                            let matched_pt_pre: String = pat_rule.targets.iter()
-                                .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
+                            let matched_pt_pre: String = pat_rule
+                                .targets
+                                .iter()
+                                .find(|pt| {
+                                    match_pattern(pt, target).as_deref() == Some(stem.as_str())
+                                })
                                 .cloned()
                                 .unwrap_or_else(|| "%".to_string());
                             for p in &pat_rule.prerequisites {
                                 if p != ".WAIT" {
-                                    check_prereqs.push(subst_stem_in_prereq_dir(p, &stem, &matched_pt_pre));
+                                    check_prereqs.push(subst_stem_in_prereq_dir(
+                                        p,
+                                        &stem,
+                                        &matched_pt_pre,
+                                    ));
                                 }
                             }
                         }
@@ -1378,132 +1504,155 @@ impl<'a> Executor<'a> {
                     // Skip precheck: pattern rule has SE prereqs that we can't evaluate here.
                     // Fall through to the full build path which handles SE expansion.
                 } else {
-
-                // Collect skipped intermediates so we can visit them for their
-                // PHONY/order-only prereqs even when the target is up to date.
-                let mut skipped_intermediates: Vec<String> = Vec::new();
-                let any_prereq_newer = check_prereqs.iter().any(|p| {
-                    if p == ".WAIT" { return false; }
-                    if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(p)) { return true; }
-                    // Also check VPATH-resolved path against what-if list
-                    if let Some(ref vp) = self.find_in_vpath(p) {
-                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) { return true; }
-                    }
-                    if self.db.is_phony(p) { return true; }
-                    // Use effective_mtime to handle deleted intermediates
-                    match self.effective_mtime(p, 0) {
-                        Some(pt) => pt > target_time,
-                        None => {
-                            // File doesn't exist and has no known sources to determine mtime.
-                            // For secondary/intermediate files whose sources are all up to date
-                            // (effective_mtime could not be determined), we can skip.
-                            // But for explicitly-mentioned files and .NOTINTERMEDIATE files
-                            // that are absent, we MUST build (they are "infinitely new").
-                            // Also treat any non-existent file with a rule as needing rebuild:
-                            // the rule will be run, and the target may then be out of date.
-                            if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
-                                skipped_intermediates.push(p.clone());
-                                return false; // secondary missing file: skip
-                            }
-                            if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
-                                skipped_intermediates.push(p.clone());
-                                return false; // deleted intermediate: skip (sources up to date)
-                            }
-                            // Regular file that doesn't exist: must be built, treat as newer.
-                            true
+                    // Collect skipped intermediates so we can visit them for their
+                    // PHONY/order-only prereqs even when the target is up to date.
+                    let mut skipped_intermediates: Vec<String> = Vec::new();
+                    let any_prereq_newer = check_prereqs.iter().any(|p| {
+                        if p == ".WAIT" {
+                            return false;
                         }
-                    }
-                });
-                if !any_prereq_newer {
-                    // Target is up to date relative to its normal prerequisites.
-                    // However, order-only prerequisites must still be built even when
-                    // the target doesn't need rebuilding.  This is crucial for PHONY
-                    // order-only prereqs (like an output directory or a "baz: touch baz"
-                    // rule) which should always execute regardless of the target's state.
-                    // GNU Make always builds order-only prereqs before deciding whether
-                    // to rebuild the target.
-                    //
-                    // Also visit skipped intermediates so that any PHONY order-only
-                    // prereqs within them still run (e.g. `intermed: | phony`).
-                    // IMPORTANT: We do NOT rebuild the intermediate itself (it was skipped
-                    // because its normal prereqs don't cause a rebuild of the parent).
-                    // We only run its order-only PHONY prereqs.
-
-                    // Collect phony order-only prereqs from skipped intermediates so we
-                    // can build them AND include them in the parallel plan for this target.
-                    let mut transitive_oo_phony: Vec<String> = Vec::new();
-                    for skipped in &skipped_intermediates {
-                        let oo_items: Vec<String> = self.db.rules.get(skipped.as_str())
-                            .map(|rules| rules.iter()
-                                .flat_map(|r| r.order_only_prerequisites.iter().cloned())
-                                .collect())
-                            .unwrap_or_default();
-                        for oo_p in oo_items {
-                            if !transitive_oo_phony.contains(&oo_p) {
-                                transitive_oo_phony.push(oo_p.clone());
-                            }
-                            let _ = self.build_target(&oo_p);
+                        if self
+                            .what_if
+                            .iter()
+                            .any(|w| normalize_path(w) == normalize_path(p))
+                        {
+                            return true;
                         }
-                    }
-                    for prereq in all_order_only.clone() {
-                        let _ = self.build_target(&prereq);
-                    }
-
-                    // In collect_plans_mode (parallel path), create a plan for this target
-                    // so the BFS can reach the transitive PHONY order-only prereqs and run them,
-                    // AND so the dependency chain is preserved for targets that are up-to-date
-                    // but have prerequisites that other targets depend on (e.g. `2.a: 1.c` where
-                    // 2.a is up-to-date but 2.b must still wait for 1.c to be built).
-                    if self.collect_plans_mode {
-                        // Combine direct order-only prereqs with transitive ones from skipped intermediates.
-                        let mut plan_order_only = all_order_only.clone();
-                        for p in &transitive_oo_phony {
-                            if !plan_order_only.contains(p) {
-                                plan_order_only.push(p.clone());
+                        // Also check VPATH-resolved path against what-if list
+                        if let Some(ref vp) = self.find_in_vpath(p) {
+                            if self
+                                .what_if
+                                .iter()
+                                .any(|w| normalize_path(w) == normalize_path(vp))
+                            {
+                                return true;
                             }
                         }
-                        // Always create a plan entry (even when target is up-to-date and has no
-                        // order-only prereqs) so that the parallel scheduler correctly tracks this
-                        // target as a dependency that must complete before its dependents run.
-                        // Without this, targets like `2.a: 1.c` (where 2.a is already up-to-date)
-                        // would not appear in the plan, and targets depending on 2.a (e.g. 2.b)
-                        // would start without waiting for 1.c to complete.
-                        if !all_prereqs.is_empty() || !plan_order_only.is_empty() {
-                            if let Some(ref mut plans) = self.pending_plans {
-                                if !plans.contains_key(target) {
-                                    // Compute effective_wait_groups for .NOTPARALLEL: target
-                                    let effective_wg_uptodate = if wait_groups.is_empty()
-                                        && self.db.not_parallel_targets.contains(target)
-                                        && all_prereqs.len() > 1
-                                    {
-                                        all_prereqs.iter().map(|p| vec![p.clone()]).collect()
-                                    } else {
-                                        wait_groups.clone()
-                                    };
-                                    plans.insert(target.to_string(), parallel::TargetPlan {
-                                        target: target.to_string(),
-                                        prerequisites: all_prereqs.clone(),
-                                        order_only: plan_order_only,
-                                        recipe: Vec::new(),
-                                        source_file: String::new(),
-                                        auto_vars: HashMap::new(),
-                                        is_phony,
-                                        needs_rebuild: false,
-                                        grouped_primary: None,
-                                        grouped_siblings: Vec::new(),
-                                        extra_exports: HashMap::new(),
-                                        extra_unexports: Vec::new(),
-                                        is_intermediate: false,
-                                        wait_groups: effective_wg_uptodate,
-                                        intermediate_also_make: Vec::new(),
-                                    });
+                        if self.db.is_phony(p) {
+                            return true;
+                        }
+                        // Use effective_mtime to handle deleted intermediates
+                        match self.effective_mtime(p, 0) {
+                            Some(pt) => pt > target_time,
+                            None => {
+                                // File doesn't exist and has no known sources to determine mtime.
+                                // For secondary/intermediate files whose sources are all up to date
+                                // (effective_mtime could not be determined), we can skip.
+                                // But for explicitly-mentioned files and .NOTINTERMEDIATE files
+                                // that are absent, we MUST build (they are "infinitely new").
+                                // Also treat any non-existent file with a rule as needing rebuild:
+                                // the rule will be run, and the target may then be out of date.
+                                if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                                    skipped_intermediates.push(p.clone());
+                                    return false; // secondary missing file: skip
+                                }
+                                if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
+                                    skipped_intermediates.push(p.clone());
+                                    return false; // deleted intermediate: skip (sources up to date)
+                                }
+                                // Regular file that doesn't exist: must be built, treat as newer.
+                                true
+                            }
+                        }
+                    });
+                    if !any_prereq_newer {
+                        // Target is up to date relative to its normal prerequisites.
+                        // However, order-only prerequisites must still be built even when
+                        // the target doesn't need rebuilding.  This is crucial for PHONY
+                        // order-only prereqs (like an output directory or a "baz: touch baz"
+                        // rule) which should always execute regardless of the target's state.
+                        // GNU Make always builds order-only prereqs before deciding whether
+                        // to rebuild the target.
+                        //
+                        // Also visit skipped intermediates so that any PHONY order-only
+                        // prereqs within them still run (e.g. `intermed: | phony`).
+                        // IMPORTANT: We do NOT rebuild the intermediate itself (it was skipped
+                        // because its normal prereqs don't cause a rebuild of the parent).
+                        // We only run its order-only PHONY prereqs.
+
+                        // Collect phony order-only prereqs from skipped intermediates so we
+                        // can build them AND include them in the parallel plan for this target.
+                        let mut transitive_oo_phony: Vec<String> = Vec::new();
+                        for skipped in &skipped_intermediates {
+                            let oo_items: Vec<String> = self
+                                .db
+                                .get_rules(skipped.as_str())
+                                .map(|rules| {
+                                    rules
+                                        .iter()
+                                        .flat_map(|r| r.order_only_prerequisites.iter().cloned())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for oo_p in oo_items {
+                                if !transitive_oo_phony.contains(&oo_p) {
+                                    transitive_oo_phony.push(oo_p.clone());
+                                }
+                                let _ = self.build_target(&oo_p);
+                            }
+                        }
+                        for prereq in all_order_only.clone() {
+                            let _ = self.build_target(&prereq);
+                        }
+
+                        // In collect_plans_mode (parallel path), create a plan for this target
+                        // so the BFS can reach the transitive PHONY order-only prereqs and run them,
+                        // AND so the dependency chain is preserved for targets that are up-to-date
+                        // but have prerequisites that other targets depend on (e.g. `2.a: 1.c` where
+                        // 2.a is up-to-date but 2.b must still wait for 1.c to be built).
+                        if self.collect_plans_mode {
+                            // Combine direct order-only prereqs with transitive ones from skipped intermediates.
+                            let mut plan_order_only = all_order_only.clone();
+                            for p in &transitive_oo_phony {
+                                if !plan_order_only.contains(p) {
+                                    plan_order_only.push(p.clone());
+                                }
+                            }
+                            // Always create a plan entry (even when target is up-to-date and has no
+                            // order-only prereqs) so that the parallel scheduler correctly tracks this
+                            // target as a dependency that must complete before its dependents run.
+                            // Without this, targets like `2.a: 1.c` (where 2.a is already up-to-date)
+                            // would not appear in the plan, and targets depending on 2.a (e.g. 2.b)
+                            // would start without waiting for 1.c to complete.
+                            if !all_prereqs.is_empty() || !plan_order_only.is_empty() {
+                                if let Some(ref mut plans) = self.pending_plans {
+                                    if !plans.contains_key(target) {
+                                        // Compute effective_wait_groups for .NOTPARALLEL: target
+                                        let effective_wg_uptodate = if wait_groups.is_empty()
+                                            && self.db.not_parallel_targets.contains(target)
+                                            && all_prereqs.len() > 1
+                                        {
+                                            all_prereqs.iter().map(|p| vec![p.clone()]).collect()
+                                        } else {
+                                            wait_groups.clone()
+                                        };
+                                        plans.insert(
+                                            target.to_string(),
+                                            parallel::TargetPlan {
+                                                target: target.to_string(),
+                                                prerequisites: all_prereqs.clone(),
+                                                order_only: plan_order_only,
+                                                recipe: Vec::new(),
+                                                source_file: String::new(),
+                                                auto_vars: HashMap::new(),
+                                                is_phony,
+                                                needs_rebuild: false,
+                                                grouped_primary: None,
+                                                grouped_siblings: Vec::new(),
+                                                extra_exports: HashMap::new(),
+                                                extra_unexports: Vec::new(),
+                                                is_intermediate: false,
+                                                wait_groups: effective_wg_uptodate,
+                                                intermediate_also_make: Vec::new(),
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    return Ok(false);
-                }
+                        return Ok(false);
+                    }
                 } // end else (pat_rule_has_se == false)
             }
         }
@@ -1538,10 +1687,13 @@ impl<'a> Executor<'a> {
             for prereq in &extra_prereqs {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_prereq_rebuilt = true; }
+                        if rebuilt {
+                            any_prereq_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let is_new = e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '");
                         let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
@@ -1549,7 +1701,9 @@ impl<'a> Executor<'a> {
                             e
                         };
                         if self.keep_going {
-                            if is_new { self.print_error_keep_going(&propagated); }
+                            if is_new {
+                                self.print_error_keep_going(&propagated);
+                            }
                             prereq_errors.push(propagated);
                         } else {
                             self.skip_extra_prereqs = prev_skip;
@@ -1576,7 +1730,9 @@ impl<'a> Executor<'a> {
         let mut pre_pat_se_expansion: Option<(Vec<String>, Vec<String>)> = None;
         let pre_pat_prereqs: Vec<String> = if recipe.is_empty() {
             if let Some((pat_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
-                let matched_pt: String = pat_rule.targets.iter()
+                let matched_pt: String = pat_rule
+                    .targets
+                    .iter()
                     .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                     .cloned()
                     .unwrap_or_else(|| "%".to_string());
@@ -1586,33 +1742,47 @@ impl<'a> Executor<'a> {
                     let mut lit: Vec<String> = Vec::new();
                     let mut pat: Vec<String> = Vec::new();
                     for p_str in pat_rule.prerequisites.iter() {
-                        if p_str.as_str() == ".WAIT" { continue; }
+                        if p_str.as_str() == ".WAIT" {
+                            continue;
+                        }
                         let expanded = subst_stem_in_prereq_dir(p_str, &stem, &matched_pt);
-                        if p_str.contains('%') { pat.push(expanded); } else { lit.push(expanded); }
+                        if p_str.contains('%') {
+                            pat.push(expanded);
+                        } else {
+                            lit.push(expanded);
+                        }
                     }
                     lit.extend(pat);
                     lit
                 };
                 // For SE pattern rules, also compute the SE expansion now (using current
                 // all_prereqs for auto vars) so we can build those prereqs first.
-                if pat_rule.second_expansion_prereqs.is_some() || pat_rule.second_expansion_order_only.is_some() {
+                if pat_rule.second_expansion_prereqs.is_some()
+                    || pat_rule.second_expansion_order_only.is_some()
+                {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                    let mut pat_se_auto_vars =
+                        self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
                     pat_se_auto_vars.insert("?".to_string(), String::new());
                     let collected_target_vars = self.collect_target_vars(target);
-                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
+                    self.apply_target_vars_to_auto_vars(
+                        &collected_target_vars.0,
+                        &mut pat_se_auto_vars,
+                    );
                     let mut se_normal: Vec<String> = Vec::new();
                     let mut se_oo: Vec<String> = Vec::new();
                     if let Some(ref text) = pat_rule.second_expansion_prereqs.clone() {
                         let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        let (normal, oo) =
+                            self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         se_normal.extend(normal.iter().cloned());
                         se_oo.extend(oo.iter().cloned());
                         prereqs.extend(normal);
                     }
                     if let Some(ref text) = pat_rule.second_expansion_order_only.clone() {
                         let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        let (normal, oo) =
+                            self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         se_oo.extend(normal);
                         se_oo.extend(oo);
                     }
@@ -1636,15 +1806,24 @@ impl<'a> Executor<'a> {
             }
             if !pre_pat_built.contains(prereq) {
                 match self.build_target(prereq) {
-                    Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
+                    Ok(rebuilt) => {
+                        if rebuilt {
+                            any_prereq_rebuilt = true;
+                        }
+                    }
                     Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let is_new = e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '");
                         let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
-                        } else { e };
+                        } else {
+                            e
+                        };
                         if self.keep_going {
-                            if is_new { self.print_error_keep_going(&propagated); }
+                            if is_new {
+                                self.print_error_keep_going(&propagated);
+                            }
                             prereq_errors.push(propagated);
                         } else {
                             self.inherited_vars_stack.pop();
@@ -1665,10 +1844,13 @@ impl<'a> Executor<'a> {
                 if is_regular {
                     match self.build_target(&prereq) {
                         Ok(rebuilt) => {
-                            if rebuilt { any_prereq_rebuilt = true; }
+                            if rebuilt {
+                                any_prereq_rebuilt = true;
+                            }
                         }
                         Err(e) => {
-                            let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                            let is_new = e.starts_with("No rule to make target '")
+                                && !e.contains(", needed by '");
                             let propagated = if is_new {
                                 let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                                 format!("{}, needed by '{}'.  Stop.", base, target)
@@ -1676,7 +1858,9 @@ impl<'a> Executor<'a> {
                                 e
                             };
                             if self.keep_going {
-                                if is_new { self.print_error_keep_going(&propagated); }
+                                if is_new {
+                                    self.print_error_keep_going(&propagated);
+                                }
                                 prereq_errors.push(propagated);
                             } else {
                                 self.inherited_vars_stack.pop();
@@ -1694,10 +1878,13 @@ impl<'a> Executor<'a> {
             for prereq in all_prereqs.clone() {
                 match self.build_target(&prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_prereq_rebuilt = true; }
+                        if rebuilt {
+                            any_prereq_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let is_new = e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '");
                         let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
@@ -1706,7 +1893,9 @@ impl<'a> Executor<'a> {
                         };
                         if self.keep_going {
                             // Only print at the first occurrence (when we just added "needed by").
-                            if is_new { self.print_error_keep_going(&propagated); }
+                            if is_new {
+                                self.print_error_keep_going(&propagated);
+                            }
                             prereq_errors.push(propagated);
                         } else {
                             self.inherited_vars_stack.pop();
@@ -1726,10 +1915,13 @@ impl<'a> Executor<'a> {
         for prereq in se_expanded_prereqs.clone() {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
-                    if rebuilt { any_prereq_rebuilt = true; }
+                    if rebuilt {
+                        any_prereq_rebuilt = true;
+                    }
                 }
                 Err(e) => {
-                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let is_new =
+                        e.starts_with("No rule to make target '") && !e.contains(", needed by '");
                     let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
@@ -1737,7 +1929,9 @@ impl<'a> Executor<'a> {
                         e
                     };
                     if self.keep_going {
-                        if is_new { self.print_error_keep_going(&propagated); }
+                        if is_new {
+                            self.print_error_keep_going(&propagated);
+                        }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -1776,17 +1970,23 @@ impl<'a> Executor<'a> {
         let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
                 // Find the matched pattern target for dir-aware stem substitution.
-                let matched_pt: String = pattern_rule.targets.iter()
+                let matched_pt: String = pattern_rule
+                    .targets
+                    .iter()
                     .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                     .cloned()
                     .unwrap_or_else(|| "%".to_string());
                 // Add the pattern rule's prerequisites/order-only to our lists and build them.
-                let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
+                let mut pat_prereqs: Vec<String> = pattern_rule
+                    .prerequisites
+                    .iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
                 // Glob-expand wildcard patterns in pattern rule prereqs (e.g. %.t* -> a.three a.two).
                 pat_prereqs = Self::glob_expand_prereqs(pat_prereqs);
-                let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
+                let mut pat_order_only: Vec<String> = pattern_rule
+                    .order_only_prerequisites
+                    .iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
                 pat_order_only = Self::glob_expand_prereqs(pat_order_only);
@@ -1795,7 +1995,9 @@ impl<'a> Executor<'a> {
                 // If Step 0.5 already performed the SE expansion (and cached the result),
                 // reuse it to avoid double-expansion (which would trigger $(info ...) twice).
                 // Otherwise, perform the SE expansion now using the accumulated explicit prereqs.
-                if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
+                if pattern_rule.second_expansion_prereqs.is_some()
+                    || pattern_rule.second_expansion_order_only.is_some()
+                {
                     if let Some((cached_normal, cached_oo)) = pre_pat_se_expansion.take() {
                         // Use cached expansion from Step 0.5 - already built, just add to lists.
                         // Also mark non-stem-derived prereqs as explicitly mentioned.
@@ -1813,15 +2015,21 @@ impl<'a> Executor<'a> {
                         // Auto vars are built from the ALREADY-accumulated explicit prereqs
                         // (all_prereqs at this point), giving $+ the value from the explicit
                         // rule(s) - which is what GNU Make uses for $+ in SE pattern rules.
-                        let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-                        let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                        let oo_refs: Vec<&str> =
+                            all_order_only.iter().map(|s| s.as_str()).collect();
+                        let mut pat_se_auto_vars =
+                            self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
                         pat_se_auto_vars.insert("?".to_string(), String::new());
                         let collected_target_vars = self.collect_target_vars(target);
-                        self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
+                        self.apply_target_vars_to_auto_vars(
+                            &collected_target_vars.0,
+                            &mut pat_se_auto_vars,
+                        );
 
                         if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                             let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                            let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            let (normal, oo) =
+                                self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                             // Mark non-stem-derived SE prereqs as explicitly mentioned.
                             if !se_text_has_percent(text) {
                                 for p in &normal {
@@ -1833,7 +2041,8 @@ impl<'a> Executor<'a> {
                         }
                         if let Some(ref text) = pattern_rule.second_expansion_order_only {
                             let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt);
-                            let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                            let (normal, oo) =
+                                self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                             if !se_text_has_percent(text) {
                                 for p in &normal {
                                     self.se_explicitly_mentioned.insert(p.clone());
@@ -1855,18 +2064,21 @@ impl<'a> Executor<'a> {
                 //  3. Shared-explicit: explicitly mentioned, but sharing a rule with an intermediate.
                 // Must compute before the mutable borrow loop below.
                 let pat_prereqs_build_order: Vec<String> = {
-                    let standalone: Vec<String> = pat_prereqs.iter()
+                    let standalone: Vec<String> = pat_prereqs
+                        .iter()
                         .filter(|p| {
                             self.is_explicitly_mentioned(p)
                                 && !self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
                         })
                         .cloned()
                         .collect();
-                    let intermediates_list: Vec<String> = pat_prereqs.iter()
+                    let intermediates_list: Vec<String> = pat_prereqs
+                        .iter()
                         .filter(|p| !self.is_explicitly_mentioned(p))
                         .cloned()
                         .collect();
-                    let shared_explicit: Vec<String> = pat_prereqs.iter()
+                    let shared_explicit: Vec<String> = pat_prereqs
+                        .iter()
                         .filter(|p| {
                             self.is_explicitly_mentioned(p)
                                 && self.prereq_shares_rule_with_intermediate(p, &pat_prereqs)
@@ -1879,7 +2091,8 @@ impl<'a> Executor<'a> {
                     ordered
                 };
 
-                let mut already_built: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut already_built: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 // Also collect which prereqs were already in all_prereqs before pattern rule.
                 for p in &all_prereqs {
                     already_built.insert(p.clone());
@@ -1891,9 +2104,15 @@ impl<'a> Executor<'a> {
                 for prereq in &pat_prereqs_build_order {
                     if !already_built.contains(prereq) {
                         match self.build_target(prereq) {
-                            Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
+                            Ok(rebuilt) => {
+                                if rebuilt {
+                                    any_prereq_rebuilt = true;
+                                }
+                            }
                             Err(e) => {
-                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                let propagated = if e.starts_with("No rule to make target '")
+                                    && !e.contains(", needed by '")
+                                {
                                     let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                                     format!("{}, needed by '{}'.  Stop.", base, target)
                                 } else {
@@ -1923,13 +2142,18 @@ impl<'a> Executor<'a> {
                     }
                 }
 
-                (pattern_rule.recipe.clone(), pattern_rule.source_file.clone(), stem)
+                (
+                    pattern_rule.recipe.clone(),
+                    pattern_rule.source_file.clone(),
+                    stem,
+                )
             } else {
                 // No recipe and no matching pattern rule: nothing to execute.
                 // In plan collection mode, still record this target's dependency info.
                 if self.collect_plans_mode {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-                    let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
+                    let auto_vars_for_plan =
+                        self.make_auto_vars(target, &all_prereqs, &oo_refs, "");
                     // Compute effective_wait_groups, accounting for .NOTPARALLEL: target.
                     let effective_wg_here = if wait_groups.is_empty()
                         && self.db.not_parallel_targets.contains(target)
@@ -1964,7 +2188,8 @@ impl<'a> Executor<'a> {
             }
         } else {
             // Use static stem from explicit rule if available.
-            let stem = rules.iter()
+            let stem = rules
+                .iter()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
@@ -1982,10 +2207,13 @@ impl<'a> Executor<'a> {
             for prereq in &extra_prereqs {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_prereq_rebuilt = true; }
+                        if rebuilt {
+                            any_prereq_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let is_new = e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '");
                         let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
@@ -1993,7 +2221,9 @@ impl<'a> Executor<'a> {
                             e
                         };
                         if self.keep_going {
-                            if is_new { self.print_error_keep_going(&propagated); }
+                            if is_new {
+                                self.print_error_keep_going(&propagated);
+                            }
                             extra_prereq_errors.push(propagated);
                         } else {
                             self.skip_extra_prereqs = prev_skip;
@@ -2027,7 +2257,8 @@ impl<'a> Executor<'a> {
         // the dependency graph so the parallel scheduler can track completion ordering.
         if self.collect_plans_mode {
             let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-            let auto_vars_for_plan = self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
+            let auto_vars_for_plan =
+                self.make_auto_vars(target, &all_prereqs, &oo_refs, &pattern_stem);
             // If this target is in .NOTPARALLEL: target_list, force sequential prereqs
             // by putting each prerequisite in its own wait group.
             let effective_wait_groups = if wait_groups.is_empty()
@@ -2084,8 +2315,16 @@ impl<'a> Executor<'a> {
             v.retain(|p| p != ".WAIT");
             v
         };
-        let oo_refs: Vec<&str> = auto_vars_order_only_for_recipe.iter().map(|s| s.as_str()).collect();
-        let mut auto_vars = self.make_auto_vars(target, &auto_vars_prereqs_for_recipe, &oo_refs, &pattern_stem);
+        let oo_refs: Vec<&str> = auto_vars_order_only_for_recipe
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut auto_vars = self.make_auto_vars(
+            target,
+            &auto_vars_prereqs_for_recipe,
+            &oo_refs,
+            &pattern_stem,
+        );
 
         // Merge target-specific and pattern-specific variables into auto_vars,
         // respecting command-line variable priority and override semantics.
@@ -2113,7 +2352,8 @@ impl<'a> Executor<'a> {
             self.pending_plan_order_only = all_order_only.clone();
             self.pending_plan_wait_groups = wait_groups.clone();
         }
-        let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
+        let result =
+            self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
         // Track if this is an intermediate target that was built.
@@ -2136,7 +2376,17 @@ impl<'a> Executor<'a> {
         target: &str,
         rules: &[Rule],
         is_phony: bool,
-    ) -> Result<(bool, Vec<String>, Vec<String>, Vec<(usize, String)>, String, String), String> {
+    ) -> Result<
+        (
+            bool,
+            Vec<String>,
+            Vec<String>,
+            Vec<(usize, String)>,
+            String,
+            String,
+        ),
+        String,
+    > {
         // Double-colon rules are not used for grouped targets, but handle gracefully
         // by delegating — in practice grouped targets use single-colon rules.
 
@@ -2172,7 +2422,8 @@ impl<'a> Executor<'a> {
         let mut se_expanded_order_only: Vec<String> = Vec::new();
 
         if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
-            let global_stem = rules.iter()
+            let global_stem = rules
+                .iter()
                 .rev()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
@@ -2181,8 +2432,13 @@ impl<'a> Executor<'a> {
             let collected_target_vars = self.collect_target_vars(target);
 
             for (text, rule_stem) in &se_prereq_texts {
-                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
-                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                let effective_stem = if rule_stem.is_empty() {
+                    &global_stem
+                } else {
+                    rule_stem
+                };
+                let mut rule_auto_vars =
+                    self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
                 rule_auto_vars.insert("?".to_string(), String::new());
                 self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
                 let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
@@ -2190,8 +2446,13 @@ impl<'a> Executor<'a> {
                 se_expanded_order_only.extend(oo);
             }
             for (text, rule_stem) in &se_order_only_texts {
-                let effective_stem = if rule_stem.is_empty() { &global_stem } else { rule_stem };
-                let mut rule_auto_vars = self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
+                let effective_stem = if rule_stem.is_empty() {
+                    &global_stem
+                } else {
+                    rule_stem
+                };
+                let mut rule_auto_vars =
+                    self.make_auto_vars(target, &auto_var_prereqs, &oo_refs, effective_stem);
                 rule_auto_vars.insert("?".to_string(), String::new());
                 self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut rule_auto_vars);
                 let (normal, oo) = self.second_expand_prereqs(text, &rule_auto_vars, target);
@@ -2212,10 +2473,13 @@ impl<'a> Executor<'a> {
         for prereq in all_prereqs.clone() {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
-                    if rebuilt { any_prereq_rebuilt = true; }
+                    if rebuilt {
+                        any_prereq_rebuilt = true;
+                    }
                 }
                 Err(e) => {
-                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let is_new =
+                        e.starts_with("No rule to make target '") && !e.contains(", needed by '");
                     let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
@@ -2223,7 +2487,9 @@ impl<'a> Executor<'a> {
                         e
                     };
                     if self.keep_going {
-                        if is_new { self.print_error_keep_going(&propagated); }
+                        if is_new {
+                            self.print_error_keep_going(&propagated);
+                        }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -2240,10 +2506,13 @@ impl<'a> Executor<'a> {
         for prereq in se_expanded_prereqs.clone() {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
-                    if rebuilt { any_prereq_rebuilt = true; }
+                    if rebuilt {
+                        any_prereq_rebuilt = true;
+                    }
                 }
                 Err(e) => {
-                    let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                    let is_new =
+                        e.starts_with("No rule to make target '") && !e.contains(", needed by '");
                     let propagated = if is_new {
                         let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                         format!("{}, needed by '{}'.  Stop.", base, target)
@@ -2251,7 +2520,9 @@ impl<'a> Executor<'a> {
                         e
                     };
                     if self.keep_going {
-                        if is_new { self.print_error_keep_going(&propagated); }
+                        if is_new {
+                            self.print_error_keep_going(&propagated);
+                        }
                         prereq_errors.push(propagated);
                     } else {
                         self.inherited_vars_stack.pop();
@@ -2280,49 +2551,72 @@ impl<'a> Executor<'a> {
         // can be used (same logic as build_with_rules).
         let (recipe, recipe_source_file, pattern_stem) = if recipe.is_empty() {
             if let Some((pattern_rule, stem)) = self.find_pattern_rule_inner(target, &all_prereqs) {
-                let matched_pt_bwrp: String = pattern_rule.targets.iter()
+                let matched_pt_bwrp: String = pattern_rule
+                    .targets
+                    .iter()
                     .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                     .cloned()
                     .unwrap_or_else(|| "%".to_string());
-                let mut pat_prereqs: Vec<String> = pattern_rule.prerequisites.iter()
+                let mut pat_prereqs: Vec<String> = pattern_rule
+                    .prerequisites
+                    .iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_bwrp))
                     .collect();
-                let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
+                let mut pat_order_only: Vec<String> = pattern_rule
+                    .order_only_prerequisites
+                    .iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_bwrp))
                     .collect();
 
-                if pattern_rule.second_expansion_prereqs.is_some() || pattern_rule.second_expansion_order_only.is_some() {
+                if pattern_rule.second_expansion_prereqs.is_some()
+                    || pattern_rule.second_expansion_order_only.is_some()
+                {
                     let oo_refs: Vec<&str> = all_order_only.iter().map(|s| s.as_str()).collect();
-                    let mut pat_se_auto_vars = self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
+                    let mut pat_se_auto_vars =
+                        self.make_auto_vars(target, &all_prereqs, &oo_refs, &stem);
                     let collected_target_vars = self.collect_target_vars(target);
-                    self.apply_target_vars_to_auto_vars(&collected_target_vars.0, &mut pat_se_auto_vars);
+                    self.apply_target_vars_to_auto_vars(
+                        &collected_target_vars.0,
+                        &mut pat_se_auto_vars,
+                    );
 
                     if let Some(ref text) = pattern_rule.second_expansion_prereqs {
                         let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt_bwrp);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        let (normal, oo) =
+                            self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_prereqs.extend(normal);
                         pat_order_only.extend(oo);
                     }
                     if let Some(ref text) = pattern_rule.second_expansion_order_only {
                         let stem_subst = subst_stem_in_se_text_dir(text, &stem, &matched_pt_bwrp);
-                        let (normal, oo) = self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
+                        let (normal, oo) =
+                            self.second_expand_prereqs(&stem_subst, &pat_se_auto_vars, target);
                         pat_order_only.extend(normal);
                         pat_order_only.extend(oo);
                     }
                 }
 
-                let mut already_built: std::collections::HashSet<String> = all_prereqs.iter().cloned().collect();
+                let mut already_built: std::collections::HashSet<String> =
+                    all_prereqs.iter().cloned().collect();
                 let orig_explicit_prereqs = all_prereqs.clone();
                 all_prereqs.clear();
                 for prereq in &pat_prereqs {
                     if !already_built.contains(prereq) {
                         match self.build_target(prereq) {
-                            Ok(rebuilt) => { if rebuilt { any_prereq_rebuilt = true; } }
+                            Ok(rebuilt) => {
+                                if rebuilt {
+                                    any_prereq_rebuilt = true;
+                                }
+                            }
                             Err(e) => {
-                                let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                                let propagated = if e.starts_with("No rule to make target '")
+                                    && !e.contains(", needed by '")
+                                {
                                     let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                                     format!("{}, needed by '{}'.  Stop.", base, target)
-                                } else { e };
+                                } else {
+                                    e
+                                };
                                 if !self.keep_going {
                                     return Err(propagated);
                                 }
@@ -2341,24 +2635,37 @@ impl<'a> Executor<'a> {
                     }
                 }
 
-                (pattern_rule.recipe.clone(), pattern_rule.source_file.clone(), stem)
+                (
+                    pattern_rule.recipe.clone(),
+                    pattern_rule.source_file.clone(),
+                    stem,
+                )
             } else {
                 // No recipe and no matching pattern rule.
-                let stem = rules.iter()
+                let stem = rules
+                    .iter()
                     .find(|r| !r.static_stem.is_empty())
                     .map(|r| r.static_stem.clone())
                     .unwrap_or_default();
                 (recipe, recipe_source_file, stem)
             }
         } else {
-            let stem = rules.iter()
+            let stem = rules
+                .iter()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
             (recipe, recipe_source_file, stem)
         };
 
-        Ok((any_prereq_rebuilt, all_prereqs, all_order_only, recipe, recipe_source_file, pattern_stem))
+        Ok((
+            any_prereq_rebuilt,
+            all_prereqs,
+            all_order_only,
+            recipe,
+            recipe_source_file,
+            pattern_stem,
+        ))
     }
 
     /// Wrapper for grouped targets (&:): builds the primary target AND its siblings.
@@ -2379,15 +2686,23 @@ impl<'a> Executor<'a> {
         }
 
         // Collect sibling rules upfront (clone before any mutable borrows)
-        let sibling_rules: Vec<(String, Vec<Rule>)> = grouped_siblings.iter()
-            .filter_map(|s| self.db.rules.get(s).cloned().map(|r| (s.clone(), r)))
+        let sibling_rules: Vec<(String, Vec<Rule>)> = grouped_siblings
+            .iter()
+            .filter_map(|s| self.db.get_rules(s).cloned().map(|r| (s.clone(), r)))
             .collect();
 
         // Phase 1: build primary target's prerequisites (the SE expansion + prereq build
         // for the primary target). We get back (needs_rebuild, all_prereqs, all_order_only,
         // recipe, recipe_source, pattern_stem).
         let primary_result = self.build_with_rules_prereqs(target, rules, is_phony);
-        let (any_prereq_rebuilt, all_prereqs, all_order_only, recipe, recipe_source_file, pattern_stem) = match primary_result {
+        let (
+            any_prereq_rebuilt,
+            all_prereqs,
+            all_order_only,
+            recipe,
+            recipe_source_file,
+            pattern_stem,
+        ) = match primary_result {
             Err(e) => {
                 // Mark siblings as failed
                 for (sibling, _) in &sibling_rules {
@@ -2412,8 +2727,9 @@ impl<'a> Executor<'a> {
         } else {
             // Check if any sibling needs rebuilding (missing or older than a prereq).
             grouped_siblings.iter().any(|sib| {
-                let sib_rules = self.db.rules.get(sib.as_str()).cloned().unwrap_or_default();
-                let sib_prereqs: Vec<String> = sib_rules.iter()
+                let sib_rules = self.db.get_rules(sib.as_str()).cloned().unwrap_or_default();
+                let sib_prereqs: Vec<String> = sib_rules
+                    .iter()
                     .flat_map(|r| r.prerequisites.iter().cloned())
                     .collect();
                 self.needs_rebuild(sib, &sib_prereqs, any_prereq_rebuilt)
@@ -2453,7 +2769,8 @@ impl<'a> Executor<'a> {
             // Grouped targets don't support .WAIT groups; use empty.
             self.pending_plan_wait_groups = Vec::new();
         }
-        let result = self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
+        let result =
+            self.execute_recipe(target, &recipe, &recipe_source_file, &auto_vars, is_phony);
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
 
@@ -2494,7 +2811,8 @@ impl<'a> Executor<'a> {
 
         // Perform SE expansion with $@ = sibling target name
         if !se_prereq_texts.is_empty() || !se_order_only_texts.is_empty() {
-            let stem = rules.iter()
+            let stem = rules
+                .iter()
                 .find(|r| !r.static_stem.is_empty())
                 .map(|r| r.static_stem.clone())
                 .unwrap_or_default();
@@ -2525,7 +2843,12 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn build_with_double_colon_rules(&mut self, target: &str, rules: &[Rule], is_phony: bool) -> Result<bool, String> {
+    fn build_with_double_colon_rules(
+        &mut self,
+        target: &str,
+        rules: &[Rule],
+        is_phony: bool,
+    ) -> Result<bool, String> {
         // Each double-colon rule is an independent rule. Build its prerequisites
         // independently and run its recipe if needed.
         //
@@ -2558,12 +2881,18 @@ impl<'a> Executor<'a> {
 
             // Handle second expansion: for double-colon rules all auto vars except
             // $@ are empty (each rule is independent).
-            if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some() {
-                let stem = if rule.static_stem.is_empty() { "" } else { &rule.static_stem };
+            if rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some()
+            {
+                let stem = if rule.static_stem.is_empty() {
+                    ""
+                } else {
+                    &rule.static_stem
+                };
                 // Build auto vars with empty prereqs (per GNU Make semantics for :: rules)
                 let empty_prereqs: Vec<String> = Vec::new();
                 let empty_oo: Vec<&str> = Vec::new();
-                let mut base_auto_vars = self.make_auto_vars(target, &empty_prereqs, &empty_oo, stem);
+                let mut base_auto_vars =
+                    self.make_auto_vars(target, &empty_prereqs, &empty_oo, stem);
                 base_auto_vars.insert("?".to_string(), String::new());
 
                 if let Some(ref text) = rule.second_expansion_prereqs {
@@ -2589,10 +2918,13 @@ impl<'a> Executor<'a> {
             for prereq in &prereqs {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_prereq_rebuilt = true; }
+                        if rebuilt {
+                            any_prereq_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let is_new = e.starts_with("No rule to make target '") && !e.contains(", needed by '");
+                        let is_new = e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '");
                         let propagated = if is_new {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
@@ -2600,7 +2932,9 @@ impl<'a> Executor<'a> {
                             e
                         };
                         if self.keep_going {
-                            if is_new { self.print_error_keep_going(&propagated); }
+                            if is_new {
+                                self.print_error_keep_going(&propagated);
+                            }
                             prereq_errors.push(propagated);
                         } else {
                             self.inherited_vars_stack.pop();
@@ -2647,7 +2981,11 @@ impl<'a> Executor<'a> {
             }
 
             let oo_refs: Vec<&str> = order_only.iter().map(|s| s.as_str()).collect();
-            let stem = if rule.static_stem.is_empty() { "" } else { &rule.static_stem };
+            let stem = if rule.static_stem.is_empty() {
+                ""
+            } else {
+                &rule.static_stem
+            };
             let mut auto_vars = self.make_auto_vars(target, &prereqs, &oo_refs, stem);
 
             // Apply target-specific and pattern-specific variables
@@ -2682,17 +3020,22 @@ impl<'a> Executor<'a> {
                 let virtual_key = format!("{}::{}", target, rule_idx);
                 rule_idx += 1;
                 let rule_source = rule.source_file.clone();
-                let expanded_lines: Vec<(usize, String)> = rule.recipe.iter().map(|(lineno, line)| {
-                    *self.state.current_file.borrow_mut() = rule_source.clone();
-                    *self.state.current_line.borrow_mut() = *lineno;
-                    let preprocessed = preprocess_recipe_bsnl(line);
-                    let expanded = self.state.expand_with_auto_vars(&preprocessed, &auto_vars);
-                    let sub_lines = split_recipe_sub_lines(&expanded);
-                    let rejoined = sub_lines.join("\n");
-                    (*lineno, rejoined)
-                }).collect();
+                let expanded_lines: Vec<(usize, String)> = rule
+                    .recipe
+                    .iter()
+                    .map(|(lineno, line)| {
+                        *self.state.current_file.borrow_mut() = rule_source.clone();
+                        *self.state.current_line.borrow_mut() = *lineno;
+                        let preprocessed = preprocess_recipe_bsnl(line);
+                        let expanded = self.state.expand_with_auto_vars(&preprocessed, &auto_vars);
+                        let sub_lines = split_recipe_sub_lines(&expanded);
+                        let rejoined = sub_lines.join("\n");
+                        (*lineno, rejoined)
+                    })
+                    .collect();
                 let extra_exports = self.target_extra_exports.clone();
-                let extra_unexports: Vec<String> = self.target_extra_unexports.iter().cloned().collect();
+                let extra_unexports: Vec<String> =
+                    self.target_extra_unexports.iter().cloned().collect();
                 // Build the virtual node's prerequisites: rule's own prereqs + previous virtual node.
                 let mut virtual_prereqs = prereqs.clone();
                 if let Some(ref prev) = last_virtual_key {
@@ -2740,8 +3083,18 @@ impl<'a> Executor<'a> {
                 continue;
             }
 
-            match self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony) {
-                Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+            match self.execute_recipe(
+                target,
+                &rule.recipe,
+                &rule.source_file,
+                &auto_vars,
+                is_phony,
+            ) {
+                Ok(rebuilt) => {
+                    if rebuilt {
+                        any_rebuilt = true;
+                    }
+                }
                 Err(e) => {
                     if self.keep_going {
                         // continue to next double-colon rule
@@ -2766,43 +3119,49 @@ impl<'a> Executor<'a> {
                     // plan for the real target name that depends on the last virtual node.
                     // It has an empty recipe so the scheduler completes it instantly once
                     // its only prerequisite (the last virtual node) is done.
-                    plans.insert(target.to_string(), parallel::TargetPlan {
-                        target: target.to_string(),
-                        prerequisites: vec![last_key],
-                        order_only: Vec::new(),
-                        recipe: Vec::new(),
-                        source_file: String::new(),
-                        auto_vars: HashMap::new(),
-                        is_phony,
-                        needs_rebuild: true,  // run through the scheduler (waits for prereqs)
-                        grouped_primary: None,
-                        grouped_siblings: Vec::new(),
-                        extra_exports: HashMap::new(),
-                        extra_unexports: Vec::new(),
-                        is_intermediate: self.db.is_intermediate(target),
-                        wait_groups: Vec::new(),
-                        intermediate_also_make: Vec::new(),
-                    });
+                    plans.insert(
+                        target.to_string(),
+                        parallel::TargetPlan {
+                            target: target.to_string(),
+                            prerequisites: vec![last_key],
+                            order_only: Vec::new(),
+                            recipe: Vec::new(),
+                            source_file: String::new(),
+                            auto_vars: HashMap::new(),
+                            is_phony,
+                            needs_rebuild: true, // run through the scheduler (waits for prereqs)
+                            grouped_primary: None,
+                            grouped_siblings: Vec::new(),
+                            extra_exports: HashMap::new(),
+                            extra_unexports: Vec::new(),
+                            is_intermediate: self.db.is_intermediate(target),
+                            wait_groups: Vec::new(),
+                            intermediate_also_make: Vec::new(),
+                        },
+                    );
                 } else if !plans.contains_key(target) {
                     // No rules needed rebuilding. Record a no-op plan so the
                     // scheduler can mark this target Done and unblock dependents.
-                    plans.insert(target.to_string(), parallel::TargetPlan {
-                        target: target.to_string(),
-                        prerequisites: Vec::new(),
-                        order_only: Vec::new(),
-                        recipe: Vec::new(),
-                        source_file: String::new(),
-                        auto_vars: HashMap::new(),
-                        is_phony,
-                        needs_rebuild: false,
-                        grouped_primary: None,
-                        grouped_siblings: Vec::new(),
-                        extra_exports: HashMap::new(),
-                        extra_unexports: Vec::new(),
-                        is_intermediate: self.db.is_intermediate(target),
-                        wait_groups: Vec::new(),
-                        intermediate_also_make: Vec::new(),
-                    });
+                    plans.insert(
+                        target.to_string(),
+                        parallel::TargetPlan {
+                            target: target.to_string(),
+                            prerequisites: Vec::new(),
+                            order_only: Vec::new(),
+                            recipe: Vec::new(),
+                            source_file: String::new(),
+                            auto_vars: HashMap::new(),
+                            is_phony,
+                            needs_rebuild: false,
+                            grouped_primary: None,
+                            grouped_siblings: Vec::new(),
+                            extra_exports: HashMap::new(),
+                            extra_unexports: Vec::new(),
+                            is_intermediate: self.db.is_intermediate(target),
+                            wait_groups: Vec::new(),
+                            intermediate_also_make: Vec::new(),
+                        },
+                    );
                 }
             }
         }
@@ -2846,7 +3205,9 @@ impl<'a> Executor<'a> {
             None => return,
         };
         // Find which pattern target matched (for stem-directory substitution).
-        let matched_pat: String = rule.targets.iter()
+        let matched_pat: String = rule
+            .targets
+            .iter()
             .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
             .cloned()
             .unwrap_or_default();
@@ -2868,21 +3229,33 @@ impl<'a> Executor<'a> {
         self.se_search_fired.insert(target.to_string());
     }
 
-    fn build_with_pattern_rule(&mut self, target: &str, rule: &Rule, stem: &str, is_phony: bool) -> Result<bool, String> {
+    fn build_with_pattern_rule(
+        &mut self,
+        target: &str,
+        rule: &Rule,
+        stem: &str,
+        is_phony: bool,
+    ) -> Result<bool, String> {
         // Determine which pattern target in the rule matched `target` (needed for
         // GNU Make "stem directory" behaviour in prerequisite substitution).
-        let matched_pattern_target: &str = rule.targets.iter()
+        let matched_pattern_target: &str = rule
+            .targets
+            .iter()
             .find(|pt| match_pattern(pt, target).as_deref() == Some(stem))
             .map(|s| s.as_str())
             .unwrap_or("%"); // fallback
 
         // For grouped pattern rules (`a.% b.%&: ; recipe`): compute concrete sibling targets
         // by substituting % with the stem, then filter out the current target and already-built ones.
-        let concrete_grouped_siblings: Vec<String> = rule.grouped_siblings.iter()
+        let concrete_grouped_siblings: Vec<String> = rule
+            .grouped_siblings
+            .iter()
             .map(|pat| pat.replace('%', stem))
-            .filter(|s| s != target
+            .filter(|s| {
+                s != target
                     && !self.built.contains_key(s.as_str())
-                    && !self.building.contains(s.as_str()))
+                    && !self.building.contains(s.as_str())
+            })
             .collect();
 
         // For multi-target pattern rules (e.g. `%.h %.c: %.in`): compute "also_make" targets.
@@ -2891,15 +3264,36 @@ impl<'a> Executor<'a> {
         // This is different from grouped targets (&:): here there's no coordination,
         // we just mark them as covered after the recipe runs.
         // Only applies when there are multiple targets AND no grouped_siblings (not &:).
-        let also_make_siblings: Vec<String> = if rule.grouped_siblings.is_empty() && rule.targets.len() > 1 {
-            rule.targets.iter()
-                .filter(|pat| {
-                    // Only include patterns that match target (same stem)
-                    match_pattern(pat, target).is_none()
-                })
-                .map(|pat| replace_first_percent(pat, stem))
-                .filter(|s| s != target)
-                .collect()
+        let also_make_siblings: Vec<String> =
+            if rule.grouped_siblings.is_empty() && rule.targets.len() > 1 {
+                rule.targets
+                    .iter()
+                    .filter(|pat| {
+                        // Only include patterns that match target (same stem)
+                        match_pattern(pat, target).is_none()
+                    })
+                    .map(|pat| replace_first_percent(pat, stem))
+                    .filter(|s| s != target)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let also_make_plan_prereqs: Vec<String> = if self.collect_plans_mode {
+            let mut prereqs = Vec::new();
+            for sib in &also_make_siblings {
+                if let Some(sib_rules) = self.db.get_rules(sib).cloned() {
+                    for sib_rule in &sib_rules {
+                        for sib_prereq in &sib_rule.prerequisites {
+                            if sib_prereq == ".WAIT" || prereqs.contains(sib_prereq) {
+                                continue;
+                            }
+                            prereqs.push(sib_prereq.clone());
+                        }
+                    }
+                }
+            }
+            prereqs
         } else {
             Vec::new()
         };
@@ -2911,17 +3305,23 @@ impl<'a> Executor<'a> {
         // and the directory is prepended to the result.
         // Collect raw prereqs (with .WAIT) for wait_groups extraction before filtering.
         let prereqs_with_wait: Vec<String> = if self.collect_plans_mode {
-            rule.prerequisites.iter()
+            rule.prerequisites
+                .iter()
                 .map(|p| {
-                    if p == ".WAIT" { ".WAIT".to_string() }
-                    else { subst_stem_in_prereq_dir(p, stem, matched_pattern_target) }
+                    if p == ".WAIT" {
+                        ".WAIT".to_string()
+                    } else {
+                        subst_stem_in_prereq_dir(p, stem, matched_pattern_target)
+                    }
                 })
                 .collect()
         } else {
             Vec::new()
         };
         // .WAIT markers are filtered since they are ordering hints, not real targets.
-        let mut prereqs: Vec<String> = rule.prerequisites.iter()
+        let mut prereqs: Vec<String> = rule
+            .prerequisites
+            .iter()
             .filter(|p| p.as_str() != ".WAIT")
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
@@ -2933,7 +3333,9 @@ impl<'a> Executor<'a> {
         // (Already handled via all_prereqs in build_target_inner for explicit rules.)
 
         // Handle second-expansion prerequisites for pattern rules.
-        let mut order_only: Vec<String> = rule.order_only_prerequisites.iter()
+        let mut order_only: Vec<String> = rule
+            .order_only_prerequisites
+            .iter()
             .filter(|p| p.as_str() != ".WAIT")
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
@@ -2943,7 +3345,8 @@ impl<'a> Executor<'a> {
         // This matches GNU Make behavior where $(info ...) in SE prereqs fires after
         // the immediately-available (non-SE) prerequisites have been visited.
         // `has_se` tracks whether we need to do SE expansion later.
-        let has_se = rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some();
+        let has_se =
+            rule.second_expansion_prereqs.is_some() || rule.second_expansion_order_only.is_some();
 
         // Save original prereq order before shuffling, so auto vars ($^, $<, etc.)
         // reflect the original declaration order (shuffle only affects BUILD order,
@@ -2973,23 +3376,51 @@ impl<'a> Executor<'a> {
         // rule has SE prerequisites that might expand to explicitly-mentioned files
         // (we cannot determine up-to-date status until SE is done and those files
         // are recognized as explicitly mentioned — sv 60188 subtest 2).
-        if !is_phony && !self.always_make && !self.collect_plans_mode
-            && !rule.second_expansion_prereqs.as_deref().map_or(false, se_text_has_non_pattern_word)
-            && !rule.second_expansion_order_only.as_deref().map_or(false, se_text_has_non_pattern_word)
+        if !is_phony
+            && !self.always_make
+            && !self.collect_plans_mode
+            && !rule
+                .second_expansion_prereqs
+                .as_deref()
+                .map_or(false, se_text_has_non_pattern_word)
+            && !rule
+                .second_expansion_order_only
+                .as_deref()
+                .map_or(false, se_text_has_non_pattern_word)
         {
-            if let Some(target_time) = self.file_mtime(target).or_else(|| {
-                self.find_in_vpath(target).and_then(|f| self.file_mtime(&f))
-            }) {
+            if let Some(target_time) = self
+                .file_mtime(target)
+                .or_else(|| self.find_in_vpath(target).and_then(|f| self.file_mtime(&f)))
+            {
                 let any_prereq_newer = prereqs.iter().any(|p| {
-                    if p == ".WAIT" { return false; }
-                    if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(p)) { return true; }
-                    if let Some(ref vp) = self.find_in_vpath(p) {
-                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) { return true; }
+                    if p == ".WAIT" {
+                        return false;
                     }
-                    if self.db.is_phony(p) { return true; }
+                    if self
+                        .what_if
+                        .iter()
+                        .any(|w| normalize_path(w) == normalize_path(p))
+                    {
+                        return true;
+                    }
+                    if let Some(ref vp) = self.find_in_vpath(p) {
+                        if self
+                            .what_if
+                            .iter()
+                            .any(|w| normalize_path(w) == normalize_path(vp))
+                        {
+                            return true;
+                        }
+                    }
+                    if self.db.is_phony(p) {
+                        return true;
+                    }
                     // Check if the file actually exists on disk.
                     let file_exists = self.file_mtime(p).is_some()
-                        || self.find_in_vpath(p).and_then(|f| self.file_mtime(&f)).is_some();
+                        || self
+                            .find_in_vpath(p)
+                            .and_then(|f| self.file_mtime(&f))
+                            .is_some();
                     if !file_exists {
                         // File doesn't exist. Determine if it needs to be built:
                         if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
@@ -2999,7 +3430,8 @@ impl<'a> Executor<'a> {
                         // Exception: if the file is also declared .INTERMEDIATE, treat it as
                         // intermediate regardless of explicit mentions (sv 60188).
                         if (self.is_explicitly_mentioned(p) && !self.db.is_intermediate(p))
-                            || self.db.is_notintermediate(p) {
+                            || self.db.is_notintermediate(p)
+                        {
                             return true;
                         }
                         // Intermediate file: use effective mtime of its sources.
@@ -3053,18 +3485,21 @@ impl<'a> Executor<'a> {
             //  3. Shared-explicit: explicitly mentioned, but SHARING a rule with an intermediate.
             //     Built last; typically they will already be built as also-make siblings of the
             //     intermediate and can be skipped.
-            let standalone: Vec<String> = prereqs.iter()
+            let standalone: Vec<String> = prereqs
+                .iter()
                 .filter(|p| {
                     self.is_explicitly_mentioned(p)
                         && !self.prereq_shares_rule_with_intermediate(p, &prereqs)
                 })
                 .cloned()
                 .collect();
-            let intermediates: Vec<String> = prereqs.iter()
+            let intermediates: Vec<String> = prereqs
+                .iter()
                 .filter(|p| !self.is_explicitly_mentioned(p))
                 .cloned()
                 .collect();
-            let shared_explicit: Vec<String> = prereqs.iter()
+            let shared_explicit: Vec<String> = prereqs
+                .iter()
                 .filter(|p| {
                     self.is_explicitly_mentioned(p)
                         && self.prereq_shares_rule_with_intermediate(p, &prereqs)
@@ -3100,10 +3535,14 @@ impl<'a> Executor<'a> {
             for prereq in &extra_prereqs {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_rebuilt = true; }
+                        if rebuilt {
+                            any_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let propagated = if e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '")
+                        {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
                         } else {
@@ -3125,7 +3564,9 @@ impl<'a> Executor<'a> {
         for prereq in prereqs_ordered {
             match self.build_target(&prereq) {
                 Ok(rebuilt) => {
-                    if rebuilt { any_rebuilt = true; }
+                    if rebuilt {
+                        any_rebuilt = true;
+                    }
                     // For terminal pattern rules (%::), prerequisites built via implicit
                     // (pattern) rules must ACTUALLY EXIST on disk — chaining through
                     // implicit rules that produce no file is not allowed.
@@ -3135,26 +3576,36 @@ impl<'a> Executor<'a> {
                     // "must exist" check if it has an explicit rule WITH a recipe.
                     // Just being mentioned as a prerequisite (e.g. `unrelated: hello.x`)
                     // doesn't count — it must be buildable by an explicit (non-pattern) rule.
-                    let has_explicit_recipe = self.db.rules.get(prereq.as_str())
+                    let has_explicit_recipe = self
+                        .db
+                        .get_rules(prereq.as_str())
                         .map_or(false, |rules| rules.iter().any(|r| !r.recipe.is_empty()));
                     // Skip the terminal existence check if the prereq was a
                     // circular dep that was dropped — it's available by definition.
                     let was_circular = self.circular_dropped.contains(prereq.as_str());
-                    if rule.is_terminal && !self.db.is_phony(&prereq)
-                        && !has_explicit_recipe && !was_circular
+                    if rule.is_terminal
+                        && !self.db.is_phony(&prereq)
+                        && !has_explicit_recipe
+                        && !was_circular
                     {
                         let exists = std::path::Path::new(&prereq).exists()
                             || self.find_in_vpath(&prereq).is_some();
                         if !exists {
-                            let err = format!("No rule to make target '{}', needed by '{}'.  Stop.", prereq, target);
+                            let err = format!(
+                                "No rule to make target '{}', needed by '{}'.  Stop.",
+                                prereq, target
+                            );
                             self.inherited_vars_stack.pop();
                             return Err(err);
                         }
                     }
                 }
                 Err(e) => {
-                    if e.starts_with("No rule to make target '") && !e.contains(", needed by '") && !rule.recipe.is_empty()
-                        && (!rule.is_compat || !self.is_explicitly_mentioned(&prereq)) {
+                    if e.starts_with("No rule to make target '")
+                        && !e.contains(", needed by '")
+                        && !rule.recipe.is_empty()
+                        && (!rule.is_compat || !self.is_explicitly_mentioned(&prereq))
+                    {
                         // GNU Make behavior: if a prerequisite doesn't exist and has
                         // no rule, but the parent target HAS a recipe, just consider
                         // the parent out of date. For compat rules, only prune prereqs
@@ -3163,7 +3614,9 @@ impl<'a> Executor<'a> {
                         any_rebuilt = true;
                     } else {
                         // Propagate "No rule to make target" errors correctly
-                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let propagated = if e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '")
+                        {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
                         } else {
@@ -3245,8 +3698,10 @@ impl<'a> Executor<'a> {
                         std::collections::HashSet::new()
                     } else {
                         let pat_text = pat_words.join(" ");
-                        let pat_subst = subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
-                        let (pd_normal, _) = self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
+                        let pat_subst =
+                            subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
+                        let (pd_normal, _) =
+                            self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
                         pd_normal.into_iter().collect()
                     };
                     for p in &normal {
@@ -3273,8 +3728,10 @@ impl<'a> Executor<'a> {
                         std::collections::HashSet::new()
                     } else {
                         let pat_text = pat_words.join(" ");
-                        let pat_subst = subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
-                        let (pd_normal, _) = self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
+                        let pat_subst =
+                            subst_stem_in_se_text_dir(&pat_text, stem, matched_pattern_target);
+                        let (pd_normal, _) =
+                            self.second_expand_prereqs(&pat_subst, &base_auto_vars, target);
                         pd_normal.into_iter().collect()
                     };
                     for p in &normal {
@@ -3317,7 +3774,7 @@ impl<'a> Executor<'a> {
             if !rule.is_compat {
                 for se_prereq in &se_added_prereqs {
                     let satisfiable = Path::new(se_prereq).exists()
-                        || self.db.rules.contains_key(se_prereq.as_str())
+                        || self.db.has_rule(se_prereq.as_str())
                         || self.db.is_phony(se_prereq)
                         || self.find_in_vpath(se_prereq).is_some()
                         || self.find_pattern_rule_exists(se_prereq)
@@ -3338,12 +3795,16 @@ impl<'a> Executor<'a> {
             for se_prereq in &se_added_prereqs {
                 match self.build_target(se_prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_rebuilt = true; }
+                        if rebuilt {
+                            any_rebuilt = true;
+                        }
                     }
                     Err(e) => {
                         // SE prereq errors are propagated without the no-rule swallowing
                         // (SE-generated prereqs that don't exist ARE real errors).
-                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let propagated = if e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '")
+                        {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
                         } else {
@@ -3379,14 +3840,22 @@ impl<'a> Executor<'a> {
         // Example: `x.t2: dep` combined with `%.t1 %.t2:` — when building x.t1 via
         // the pattern rule, `dep` must be built as a prereq of the also-make sibling x.t2.
         for sib in &also_make_siblings {
-            if let Some(sib_rules) = self.db.rules.get(sib).cloned() {
+            if let Some(sib_rules) = self.db.get_rules(sib).cloned() {
                 for sib_rule in &sib_rules {
                     for sib_prereq in &sib_rule.prerequisites {
-                        if sib_prereq == ".WAIT" { continue; }
+                        if sib_prereq == ".WAIT" {
+                            continue;
+                        }
                         match self.build_target(sib_prereq) {
-                            Ok(rebuilt) => { if rebuilt { any_rebuilt = true; } }
+                            Ok(rebuilt) => {
+                                if rebuilt {
+                                    any_rebuilt = true;
+                                }
+                            }
                             Err(e) => {
-                                if !e.starts_with("No rule to make target '") || e.contains(", needed by '") {
+                                if !e.starts_with("No rule to make target '")
+                                    || e.contains(", needed by '")
+                                {
                                     self.inherited_vars_stack.pop();
                                     return Err(e);
                                 }
@@ -3404,10 +3873,14 @@ impl<'a> Executor<'a> {
             for prereq in &extra_prereqs {
                 match self.build_target(prereq) {
                     Ok(rebuilt) => {
-                        if rebuilt { any_rebuilt = true; }
+                        if rebuilt {
+                            any_rebuilt = true;
+                        }
                     }
                     Err(e) => {
-                        let propagated = if e.starts_with("No rule to make target '") && !e.contains(", needed by '") {
+                        let propagated = if e.starts_with("No rule to make target '")
+                            && !e.contains(", needed by '")
+                        {
                             let base = e.trim_end_matches(".  Stop.").trim_end_matches(".");
                             format!("{}, needed by '{}'.  Stop.", base, target)
                         } else {
@@ -3440,9 +3913,9 @@ impl<'a> Executor<'a> {
             true
         } else {
             // For grouped pattern rules, also rebuild if any concrete sibling is missing.
-            concrete_grouped_siblings.iter().any(|sib| {
-                self.needs_rebuild(sib, &[], false)
-            })
+            concrete_grouped_siblings
+                .iter()
+                .any(|sib| self.needs_rebuild(sib, &[], false))
         };
 
         if !needs_rebuild {
@@ -3461,7 +3934,10 @@ impl<'a> Executor<'a> {
 
         // Use original (pre-shuffle) order for auto vars so $^, $<, etc. reflect
         // declaration order regardless of shuffle mode (GNU Make behavior).
-        let oo_refs: Vec<&str> = order_only_original_order.iter().map(|s| s.as_str()).collect();
+        let oo_refs: Vec<&str> = order_only_original_order
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let mut auto_vars = self.make_auto_vars(target, &prereqs_original_order, &oo_refs, stem);
 
         // Apply target-specific and pattern-specific variables
@@ -3476,7 +3952,9 @@ impl<'a> Executor<'a> {
                 return Ok(true);
             }
             // Only make-functions would run; not out-of-date in terms of shell work.
-            if !self.any_recipe_ran { self.any_recipe_ran = true; }
+            if !self.any_recipe_ran {
+                self.any_recipe_ran = true;
+            }
             return Ok(true);
         }
 
@@ -3486,24 +3964,83 @@ impl<'a> Executor<'a> {
             self.pending_plan_prereqs = prereqs.clone();
             self.pending_plan_order_only = order_only.clone();
             // If this target is in .NOTPARALLEL: target_list, force sequential prereqs.
-            self.pending_plan_wait_groups = if self.db.not_parallel_targets.contains(target)
-                && prereqs.len() > 1
-            {
-                // Each prereq in its own group to force sequential execution.
-                prereqs.iter().map(|p| vec![p.clone()]).collect()
-            } else if prereqs_with_wait.iter().any(|p| p == ".WAIT") {
-                // Pattern rule has .WAIT markers in prerequisites: extract wait groups.
-                extract_wait_groups(&prereqs_with_wait)
-            } else {
-                Vec::new()
-            };
+            self.pending_plan_wait_groups =
+                if self.db.not_parallel_targets.contains(target) && prereqs.len() > 1 {
+                    // Each prereq in its own group to force sequential execution.
+                    prereqs.iter().map(|p| vec![p.clone()]).collect()
+                } else if prereqs_with_wait.iter().any(|p| p == ".WAIT") {
+                    // Pattern rule has .WAIT markers in prerequisites: extract wait groups.
+                    extract_wait_groups(&prereqs_with_wait)
+                } else {
+                    Vec::new()
+                };
         }
         // Capture primary target mtime BEFORE running recipe, so we can detect if it changed.
         // The peer-target warning fires only when the primary was actually created/updated.
         let primary_mtime_before = self.file_mtime(target);
-        let result = self.execute_recipe(target, &rule.recipe, &rule.source_file, &auto_vars, is_phony);
+        let result = self.execute_recipe(
+            target,
+            &rule.recipe,
+            &rule.source_file,
+            &auto_vars,
+            is_phony,
+        );
         self.target_extra_exports.clear();
         self.target_extra_unexports.clear();
+        if self.collect_plans_mode {
+            let previous_primary = self
+                .pending_plans
+                .as_ref()
+                .and_then(|plans| plans.get(target))
+                .and_then(|plan| plan.grouped_primary.clone());
+            if let Some(ref mut plans) = self.pending_plans {
+                if let Some(old_primary) = previous_primary {
+                    if let Some(old_plan) = plans.get_mut(&old_primary) {
+                        old_plan.grouped_siblings.retain(|sib| sib != target);
+                    }
+                }
+
+                if let Some(plan) = plans.get_mut(target) {
+                    plan.grouped_primary = None;
+                    for prereq in &also_make_plan_prereqs {
+                        if !plan.prerequisites.contains(prereq) {
+                            plan.prerequisites.push(prereq.clone());
+                        }
+                    }
+                    for sib in &also_make_siblings {
+                        if !plan.grouped_siblings.contains(sib) {
+                            plan.grouped_siblings.push(sib.clone());
+                        }
+                    }
+                }
+
+                for sib in &also_make_siblings {
+                    if plans.contains_key(sib) {
+                        continue;
+                    }
+                    plans.insert(
+                        sib.clone(),
+                        parallel::TargetPlan {
+                            target: sib.clone(),
+                            prerequisites: Vec::new(),
+                            order_only: Vec::new(),
+                            recipe: Vec::new(),
+                            source_file: String::new(),
+                            auto_vars: std::collections::HashMap::new(),
+                            is_phony: self.db.is_phony(sib),
+                            needs_rebuild: false,
+                            grouped_primary: Some(target.to_string()),
+                            grouped_siblings: Vec::new(),
+                            extra_exports: std::collections::HashMap::new(),
+                            extra_unexports: Vec::new(),
+                            is_intermediate: false,
+                            wait_groups: Vec::new(),
+                            intermediate_also_make: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
         // Track if this is an intermediate target that was built via pattern rule.
         // Targets built by implicit rules are potentially intermediate UNLESS they are:
         // 1. Top-level targets
@@ -3522,7 +4059,9 @@ impl<'a> Executor<'a> {
             // Pattern prereqs like %.in do NOT count even if the expanded form (e.g. foo.in)
             // happens to be explicitly mentioned elsewhere.
             // Note: literal prereqs in a pattern rule have no % so they are already concrete.
-            let literal_rule_prereqs: std::collections::HashSet<&str> = rule.prerequisites.iter()
+            let literal_rule_prereqs: std::collections::HashSet<&str> = rule
+                .prerequisites
+                .iter()
                 .filter(|p| !p.contains('%'))
                 .map(|p| p.as_str())
                 .collect();
@@ -3537,13 +4076,14 @@ impl<'a> Executor<'a> {
                 && !self.db.is_notintermediate(target)
                 && !self.db.is_secondary(target)
             {
-                let is_explicit = self.top_level_targets.contains(target)
-                    || self.is_explicitly_mentioned(target);
+                let is_explicit =
+                    self.top_level_targets.contains(target) || self.is_explicitly_mentioned(target);
                 !is_explicit
             } else {
                 false
             };
-            is_target_intermediate = primary_is_intermediate_explicit || primary_is_intermediate_implicit;
+            is_target_intermediate =
+                primary_is_intermediate_explicit || primary_is_intermediate_implicit;
 
             // Mark all siblings as built/covered (order doesn't matter for these).
             for sib in &also_make_siblings {
@@ -3580,7 +4120,8 @@ impl<'a> Executor<'a> {
                     // top-level target, OR if any LITERAL (non-%) prereq of the rule
                     // is explicitly mentioned (sv 60188: literal non-% prereqs of a
                     // pattern rule make the entire rule invocation "explicit").
-                    let any_literal_prereq_explicit = literal_rule_prereqs.iter()
+                    let any_literal_prereq_explicit = literal_rule_prereqs
+                        .iter()
                         .any(|p| self.is_explicitly_mentioned(*p) && !self.db.is_intermediate(*p));
                     // Also: if any EXPANDED (stem-substituted) prereq is explicitly mentioned
                     // AND is NOT an explicit rule TARGET (only in explicitly_mentioned, not in
@@ -3589,10 +4130,11 @@ impl<'a> Executor<'a> {
                     // → hello.x is explicitly mentioned (not a rule target) → hello.q not intermediate.
                     // Note: we exclude targets in db.rules to avoid falsely protecting intermediates
                     // when the prereq has its own explicit recipe (e.g. `foo.in: ; touch $@`).
-                    let any_expanded_prereq_explicit_no_rule = prereqs.iter()
-                        .any(|p| self.db.explicitly_mentioned.contains(p.as_str())
-                            && !self.db.rules.contains_key(p.as_str())
-                            && !self.db.is_intermediate(p));
+                    let any_expanded_prereq_explicit_no_rule = prereqs.iter().any(|p| {
+                        self.db.explicitly_mentioned.contains(p.as_str())
+                            && !self.db.has_rule(p.as_str())
+                            && !self.db.is_intermediate(p)
+                    });
                     let is_explicit = self.top_level_targets.contains(sib.as_str())
                         || self.is_explicitly_mentioned(sib)
                         || any_literal_prereq_explicit
@@ -3633,7 +4175,8 @@ impl<'a> Executor<'a> {
                 // the scheduler will add all entries from intermediate_also_make to
                 // intermediate_built. This is necessary because siblings don't have their own
                 // jobs and handle_completion is never called for them directly.
-                let intermediate_sibs: Vec<String> = also_make_siblings.iter()
+                let intermediate_sibs: Vec<String> = also_make_siblings
+                    .iter()
                     .filter(|sib| self.intermediate_built.contains(*sib))
                     .cloned()
                     .collect();
@@ -3655,25 +4198,26 @@ impl<'a> Executor<'a> {
                 for sib in &also_make_siblings {
                     if self.intermediate_built.contains(sib) {
                         if let Some(ref mut plans) = self.pending_plans {
-                            let plan = plans.entry(sib.clone()).or_insert_with(|| {
-                                parallel::TargetPlan {
-                                    target: sib.clone(),
-                                    prerequisites: Vec::new(),
-                                    order_only: Vec::new(),
-                                    recipe: Vec::new(),
-                                    source_file: String::new(),
-                                    auto_vars: std::collections::HashMap::new(),
-                                    is_phony: false,
-                                    needs_rebuild: false,
-                                    grouped_primary: None,
-                                    grouped_siblings: Vec::new(),
-                                    extra_exports: std::collections::HashMap::new(),
-                                    extra_unexports: Vec::new(),
-                                    is_intermediate: false,
-                                    wait_groups: Vec::new(),
-                                    intermediate_also_make: Vec::new(),
-                                }
-                            });
+                            let plan =
+                                plans
+                                    .entry(sib.clone())
+                                    .or_insert_with(|| parallel::TargetPlan {
+                                        target: sib.clone(),
+                                        prerequisites: Vec::new(),
+                                        order_only: Vec::new(),
+                                        recipe: Vec::new(),
+                                        source_file: String::new(),
+                                        auto_vars: std::collections::HashMap::new(),
+                                        is_phony: false,
+                                        needs_rebuild: false,
+                                        grouped_primary: None,
+                                        grouped_siblings: Vec::new(),
+                                        extra_exports: std::collections::HashMap::new(),
+                                        extra_unexports: Vec::new(),
+                                        is_intermediate: false,
+                                        wait_groups: Vec::new(),
+                                        intermediate_also_make: Vec::new(),
+                                    });
                             plan.is_intermediate = true;
                         }
                     }
@@ -3698,7 +4242,7 @@ impl<'a> Executor<'a> {
             //   - it didn't exist before (None → Some), OR
             //   - its mtime changed (before != after)
             let primary_updated = match (primary_mtime_before, primary_mtime_after) {
-                (None, Some(_)) => true,                       // newly created
+                (None, Some(_)) => true,                        // newly created
                 (Some(before), Some(after)) => after != before, // mtime changed
                 _ => false,
             };
@@ -3711,7 +4255,10 @@ impl<'a> Executor<'a> {
                         } else {
                             String::new()
                         };
-                        eprintln!("{}warning: pattern recipe did not update peer target '{}'.", loc, sib);
+                        eprintln!(
+                            "{}warning: pattern recipe did not update peer target '{}'.",
+                            loc, sib
+                        );
                     }
                 }
             }
@@ -3731,7 +4278,11 @@ impl<'a> Executor<'a> {
 
     /// Core pattern rule search.
     /// `explicit_prereqs`: already-known explicit deps of `target` (they "ought to exist").
-    fn find_pattern_rule_inner(&self, target: &str, explicit_prereqs: &[String]) -> Option<(Rule, String)> {
+    fn find_pattern_rule_inner(
+        &self,
+        target: &str,
+        explicit_prereqs: &[String],
+    ) -> Option<(Rule, String)> {
         // GNU Make implicit rule search (implicit.c):
         //
         // - User-defined rules (after builtin_count) have priority over built-ins.
@@ -3748,8 +4299,11 @@ impl<'a> Executor<'a> {
         let builtin_rules = &self.db.pattern_rules[0..n_builtins];
 
         // Check if a specific (non-%) rule matches this target.
-        let specific_rule_matched = user_rules.iter().chain(builtin_rules.iter())
-            .any(|rule| rule.targets.iter().any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some()));
+        let specific_rule_matched = user_rules.iter().chain(builtin_rules.iter()).any(|rule| {
+            rule.targets
+                .iter()
+                .any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some())
+        });
 
         // User rules first (higher priority), then built-ins.
         let all_rules: Vec<&Rule> = user_rules.iter().chain(builtin_rules.iter()).collect();
@@ -3766,9 +4320,13 @@ impl<'a> Executor<'a> {
                 && !rule.is_terminal
                 && rule.second_expansion_prereqs.is_none()
                 && rule.second_expansion_order_only.is_none()
-            { continue; }
+            {
+                continue;
+            }
             for pattern_target in &rule.targets {
-                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
+                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal {
+                    continue;
+                }
                 if let Some(stem) = match_pattern(pattern_target, target) {
                     let mut found_compat = false;
                     let prereqs_ok = if rule.prerequisites.is_empty() {
@@ -3776,17 +4334,22 @@ impl<'a> Executor<'a> {
                     } else {
                         let mut all_ok = true;
                         for p in &rule.prerequisites {
-                            if p == ".WAIT" { continue; }
+                            if p == ".WAIT" {
+                                continue;
+                            }
                             let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
-                            let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
+                            let ok = if resolved.contains('*')
+                                || resolved.contains('?')
+                                || resolved.contains('[')
+                            {
                                 ::glob::glob(&resolved)
                                     .ok()
                                     .map_or(false, |mut it| it.next().is_some())
                             } else {
                                 Path::new(&resolved).exists()
                                 || self.db.is_phony(&resolved)
-                                || self.db.rules.contains_key(&resolved)
+                                || self.db.has_rule(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
                                 || self.find_in_vpath(&resolved).is_some()
                                 // A prerequisite currently being built (cycle) counts as
@@ -3796,7 +4359,7 @@ impl<'a> Executor<'a> {
                             };
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
-                                    && !self.db.rules.contains_key(&resolved)
+                                    && !self.db.has_rule(&resolved)
                                 {
                                     found_compat = true;
                                 }
@@ -3820,7 +4383,8 @@ impl<'a> Executor<'a> {
         }
         if !pass1_candidates.is_empty() {
             // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
-            let best = pass1_candidates.into_iter()
+            let best = pass1_candidates
+                .into_iter()
                 .min_by_key(|(_, stem)| stem.len())
                 .unwrap();
             return Some(best);
@@ -3833,10 +4397,16 @@ impl<'a> Executor<'a> {
                 && !rule.is_terminal
                 && rule.second_expansion_prereqs.is_none()
                 && rule.second_expansion_order_only.is_none()
-            { continue; }
-            if rule.is_terminal { continue; }
+            {
+                continue;
+            }
+            if rule.is_terminal {
+                continue;
+            }
             for pattern_target in &rule.targets {
-                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
+                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal {
+                    continue;
+                }
                 if let Some(stem) = match_pattern(pattern_target, target) {
                     let mut found_compat = false;
                     let prereqs_ok = if rule.prerequisites.is_empty() {
@@ -3844,25 +4414,30 @@ impl<'a> Executor<'a> {
                     } else {
                         let mut all_ok = true;
                         for p in &rule.prerequisites {
-                            if p == ".WAIT" { continue; }
+                            if p == ".WAIT" {
+                                continue;
+                            }
                             let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
-                            let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
+                            let ok = if resolved.contains('*')
+                                || resolved.contains('?')
+                                || resolved.contains('[')
+                            {
                                 ::glob::glob(&resolved)
                                     .ok()
                                     .map_or(false, |mut it| it.next().is_some())
                             } else {
                                 Path::new(&resolved).exists()
-                                || self.db.rules.contains_key(&resolved)
-                                || self.db.is_phony(&resolved)
-                                || explicit_prereqs.iter().any(|ep| ep == &resolved)
-                                || self.find_pattern_rule_exists(&resolved)
-                                || self.find_in_vpath(&resolved).is_some()
-                                || self.building.contains(&resolved)
+                                    || self.db.has_rule(&resolved)
+                                    || self.db.is_phony(&resolved)
+                                    || explicit_prereqs.iter().any(|ep| ep == &resolved)
+                                    || self.find_pattern_rule_exists(&resolved)
+                                    || self.find_in_vpath(&resolved).is_some()
+                                    || self.building.contains(&resolved)
                             };
                             if !ok {
                                 if self.db.explicit_dep_names.contains(&resolved)
-                                    && !self.db.rules.contains_key(&resolved)
+                                    && !self.db.has_rule(&resolved)
                                 {
                                     found_compat = true;
                                 }
@@ -3883,7 +4458,8 @@ impl<'a> Executor<'a> {
         }
         if !pass2_candidates.is_empty() {
             // Pick the candidate with the shortest stem (GNU Make "shortest stem" rule).
-            let best = pass2_candidates.into_iter()
+            let best = pass2_candidates
+                .into_iter()
                 .min_by_key(|(_, stem)| stem.len())
                 .unwrap();
             return Some(best);
@@ -3898,15 +4474,21 @@ impl<'a> Executor<'a> {
         // cycles, PHONY, VPATH, or have explicit rules). NO chaining allowed.
         if compat_rule.is_none() {
             for rule in &all_rules {
-                if !rule.is_terminal { continue; }
-                if rule.recipe.is_empty() { continue; }
+                if !rule.is_terminal {
+                    continue;
+                }
+                if rule.recipe.is_empty() {
+                    continue;
+                }
                 for pattern_target in &rule.targets {
                     if let Some(stem) = match_pattern(pattern_target, target) {
                         let prereqs_ok = if rule.prerequisites.is_empty() {
                             true
                         } else {
                             rule.prerequisites.iter().all(|p| {
-                                if p == ".WAIT" { return true; }
+                                if p == ".WAIT" {
+                                    return true;
+                                }
                                 let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                                 Path::new(&resolved).exists()
                                     || self.db.is_phony(&resolved)
@@ -3922,7 +4504,9 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
-                if compat_rule.is_some() { break; }
+                if compat_rule.is_some() {
+                    break;
+                }
             }
         }
 
@@ -3940,7 +4524,12 @@ impl<'a> Executor<'a> {
         self.find_pattern_rule_exists_inner(target, &mut std::collections::HashSet::new(), 0)
     }
 
-    fn find_pattern_rule_exists_inner(&self, target: &str, visited: &mut HashSet<String>, depth: usize) -> bool {
+    fn find_pattern_rule_exists_inner(
+        &self,
+        target: &str,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> bool {
         // If this target is currently being built, treat it as available (cycle case).
         if self.building.contains(target) {
             return true;
@@ -3961,32 +4550,51 @@ impl<'a> Executor<'a> {
         let user_rules = &self.db.pattern_rules[n_builtins..n_total];
         let builtin_rules = &self.db.pattern_rules[0..n_builtins];
 
-        let specific_rule_matched = user_rules.iter().chain(builtin_rules.iter())
-            .any(|rule| rule.targets.iter().any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some()));
+        let specific_rule_matched = user_rules.iter().chain(builtin_rules.iter()).any(|rule| {
+            rule.targets
+                .iter()
+                .any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some())
+        });
 
         for rule in user_rules.iter().chain(builtin_rules.iter()) {
-            if rule.recipe.is_empty() { continue; }
+            if rule.recipe.is_empty() {
+                continue;
+            }
             for pattern_target in &rule.targets {
                 // Skip non-terminal match-anything rules in recursive context.
-                if pattern_target == "%" && !rule.is_terminal { continue; }
-                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal { continue; }
+                if pattern_target == "%" && !rule.is_terminal {
+                    continue;
+                }
+                if specific_rule_matched && pattern_target == "%" && !rule.is_terminal {
+                    continue;
+                }
                 if let Some(stem) = match_pattern(pattern_target, target) {
                     let prereqs_ok = if rule.prerequisites.is_empty() {
                         true
                     } else {
                         rule.prerequisites.iter().all(|p| {
-                            if p == ".WAIT" { return true; }
+                            if p == ".WAIT" {
+                                return true;
+                            }
                             let resolved = subst_stem_in_prereq_dir(p, &stem, pattern_target);
                             Path::new(&resolved).exists()
-                                || self.db.rules.contains_key(&resolved)
+                                || self.db.has_rule(&resolved)
                                 || self.db.is_phony(&resolved)
                                 || self.find_in_vpath(&resolved).is_some()
                                 || self.building.contains(&resolved)
-                                || (!rule.is_terminal && self.find_pattern_rule_exists_inner(&resolved, visited, depth + 1))
-                                || (rule.is_terminal && self.db.explicit_dep_names.contains(&resolved))
+                                || (!rule.is_terminal
+                                    && self.find_pattern_rule_exists_inner(
+                                        &resolved,
+                                        visited,
+                                        depth + 1,
+                                    ))
+                                || (rule.is_terminal
+                                    && self.db.explicit_dep_names.contains(&resolved))
                         })
                     };
-                    if prereqs_ok { return true; }
+                    if prereqs_ok {
+                        return true;
+                    }
                 }
             }
         }
@@ -4003,12 +4611,20 @@ impl<'a> Executor<'a> {
     ///
     /// If the explicit prereq does NOT share a rule with any intermediate, it is a
     /// "standalone explicit" prereq and should be built before the intermediates.
-    fn prereq_shares_rule_with_intermediate(&self, explicit_prereq: &str, all_prereqs: &[String]) -> bool {
+    fn prereq_shares_rule_with_intermediate(
+        &self,
+        explicit_prereq: &str,
+        all_prereqs: &[String],
+    ) -> bool {
         if let Some((rule, stem)) = self.find_pattern_rule(explicit_prereq) {
             for other in all_prereqs {
-                if other == explicit_prereq { continue; }
+                if other == explicit_prereq {
+                    continue;
+                }
                 // Only consider non-explicitly-mentioned prereqs (intermediates)
-                if self.is_explicitly_mentioned(other) { continue; }
+                if self.is_explicitly_mentioned(other) {
+                    continue;
+                }
                 // Check if `other` matches any target pattern in the SAME rule with the SAME stem
                 for pat in &rule.targets {
                     if match_pattern(pat, other).as_deref() == Some(stem.as_str()) {
@@ -4027,7 +4643,7 @@ impl<'a> Executor<'a> {
         //   (b) there is an explicit rule for the resolved path in the database.
         // This allows patterns like `vpath %.te vpath-d/` to resolve `fail.te`
         // to `vpath-d/fail.te` even when `vpath-d/fail.te` doesn't exist but has a rule.
-        let has_rule = |path: &str| self.db.rules.contains_key(path);
+        let has_rule = |path: &str| self.db.has_rule(path);
 
         for (pattern, dirs) in &self.db.vpath {
             if vpath_pattern_matches(pattern, target) {
@@ -4071,7 +4687,9 @@ impl<'a> Executor<'a> {
         if let Some(var) = self.db.variables.get("GPATH") {
             // Expand the GPATH value (it may contain variable references like $(VPATH))
             let gpath = &self.state.expand(&var.value);
-            if gpath.is_empty() { return false; }
+            if gpath.is_empty() {
+                return false;
+            }
             for gdir in gpath.split(|c: char| c == ':' || c == ' ' || c == '\t') {
                 let gdir = gdir.trim();
                 if !gdir.is_empty() {
@@ -4109,7 +4727,8 @@ impl<'a> Executor<'a> {
         for (pattern, dirs) in &self.db.vpath {
             for candidate_name in &[format!("lib{}.a", name), format!("lib{}.so", name)] {
                 if vpath_pattern_matches(pattern, candidate_name)
-                    || pattern == "%" || pattern == "*"
+                    || pattern == "%"
+                    || pattern == "*"
                 {
                     for dir in dirs {
                         if !search_dirs.contains(dir) {
@@ -4155,8 +4774,10 @@ impl<'a> Executor<'a> {
         for pattern in lib_patterns_val.split_ascii_whitespace() {
             // Pattern must contain '%'; if not, emit warning and skip.
             if !pattern.contains('%') {
-                eprintln!("{}: .LIBPATTERNS element '{}' is not a pattern",
-                    self.progname, pattern);
+                eprintln!(
+                    "{}: .LIBPATTERNS element '{}' is not a pattern",
+                    self.progname, pattern
+                );
                 continue;
             }
             // Replace '%' with the library name.
@@ -4185,7 +4806,13 @@ impl<'a> Executor<'a> {
     ///                    pre-override inherited values, so that `b: private F = b` does
     ///                    NOT block `a: F = a` from reaching `c` through `b`)
     /// Pattern-specific variables are matched with shortest-stem semantics.
-    fn collect_target_vars(&self, target: &str) -> (HashMap<String, (String, bool, bool)>, HashMap<String, (String, bool, bool, Option<bool>)>) {
+    fn collect_target_vars(
+        &self,
+        target: &str,
+    ) -> (
+        HashMap<String, (String, bool, bool)>,
+        HashMap<String, (String, bool, bool, Option<bool>)>,
+    ) {
         // We use a two-pass approach for Recursive variables:
         //  Pass 1: collect Simple/Conditional/Shell vars (expanded immediately) and
         //          store Recursive/Append vars' raw values.
@@ -4209,17 +4836,26 @@ impl<'a> Executor<'a> {
         // inherited_vars_stack before building this target as a prerequisite.
         if let Some(inherited) = self.inherited_vars_stack.last() {
             for (name, (val, is_override, is_private_flag, _export_status)) in inherited {
-                if *is_private_flag { continue; } // private vars are not inherited
+                if *is_private_flag {
+                    continue;
+                } // private vars are not inherited
                 let idx = staging.len();
-                staging.push((name.clone(), val.clone(), true, *is_override, VarFlavor::Simple));
+                staging.push((
+                    name.clone(),
+                    val.clone(),
+                    true,
+                    *is_override,
+                    VarFlavor::Simple,
+                ));
                 staging_idx.insert(name.clone(), idx);
             }
         }
 
         // Helper: get raw value and is_expanded flag for var_name from staging.
         let get_staging_entry = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
-                                  staging_idx: &HashMap<String, usize>,
-                                  var_name: &str| -> Option<(String, bool)> {
+                                 staging_idx: &HashMap<String, usize>,
+                                 var_name: &str|
+         -> Option<(String, bool)> {
             staging_idx.get(var_name).map(|&i| {
                 let (_, val, is_expanded, _, _) = &staging[i];
                 (val.clone(), *is_expanded)
@@ -4227,17 +4863,20 @@ impl<'a> Executor<'a> {
         };
         let get_global_val = |state: &MakeState, var_name: &str| -> Option<String> {
             state.db.variables.get(var_name).map(|v| {
-                if v.flavor == VarFlavor::Simple { v.value.clone() } else { state.expand(&v.value) }
+                if v.flavor == VarFlavor::Simple {
+                    v.value.clone()
+                } else {
+                    state.expand(&v.value)
+                }
             })
         };
         // Helper: expand a value immediately using the state.
-        let expand_imm = |state: &MakeState, val: &str| -> String {
-            state.expand(val)
-        };
+        let expand_imm = |state: &MakeState, val: &str| -> String { state.expand(val) };
         // Helper: get the expanded value for var_name from staging.
         let get_staging_val = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
-                                staging_idx: &HashMap<String, usize>,
-                                var_name: &str| -> Option<String> {
+                               staging_idx: &HashMap<String, usize>,
+                               var_name: &str|
+         -> Option<String> {
             staging_idx.get(var_name).map(|&i| {
                 let (_, val, is_expanded, _, _) = &staging[i];
                 if *is_expanded {
@@ -4270,12 +4909,19 @@ impl<'a> Executor<'a> {
                     // Already expanded at assignment; use as-is.
                     let val = psv.var.value.clone();
                     let idx = staging.len();
-                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Simple));
+                    staging.push((
+                        psv.var_name.clone(),
+                        val,
+                        true,
+                        psv.is_override,
+                        VarFlavor::Simple,
+                    ));
                     staging_idx.insert(psv.var_name.clone(), idx);
                 }
                 VarFlavor::Append => {
                     // A non-override Append is blocked if the existing var has override flag.
-                    let existing_is_override = staging_idx.get(&psv.var_name)
+                    let existing_is_override = staging_idx
+                        .get(&psv.var_name)
                         .map_or(false, |&i| staging[i].3);
                     if !psv.is_override && existing_is_override {
                         // Skip this non-override append; preserve existing override value.
@@ -4284,11 +4930,21 @@ impl<'a> Executor<'a> {
                         let base = get_staging_val(&staging, &staging_idx, &psv.var_name)
                             .or_else(|| get_global_val(&self.state, &psv.var_name))
                             .unwrap_or_default();
-                        let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                        let val = if base.is_empty() {
+                            rhs
+                        } else {
+                            format!("{} {}", base, rhs)
+                        };
                         // Preserve override flag if existing entry was override.
                         let new_is_override = psv.is_override || existing_is_override;
                         let idx = staging.len();
-                        staging.push((psv.var_name.clone(), val, true, new_is_override, VarFlavor::Append));
+                        staging.push((
+                            psv.var_name.clone(),
+                            val,
+                            true,
+                            new_is_override,
+                            VarFlavor::Append,
+                        ));
                         staging_idx.insert(psv.var_name.clone(), idx);
                     }
                 }
@@ -4297,7 +4953,13 @@ impl<'a> Executor<'a> {
                     if !staging_idx.contains_key(&psv.var_name) {
                         let val = expand_imm(&self.state, &psv.var.value);
                         let idx = staging.len();
-                        staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Conditional));
+                        staging.push((
+                            psv.var_name.clone(),
+                            val,
+                            true,
+                            psv.is_override,
+                            VarFlavor::Conditional,
+                        ));
                         staging_idx.insert(psv.var_name.clone(), idx);
                     }
                 }
@@ -4305,14 +4967,26 @@ impl<'a> Executor<'a> {
                     // Already-run shell command value; store as-is
                     let val = psv.var.value.clone();
                     let idx = staging.len();
-                    staging.push((psv.var_name.clone(), val, true, psv.is_override, VarFlavor::Shell));
+                    staging.push((
+                        psv.var_name.clone(),
+                        val,
+                        true,
+                        psv.is_override,
+                        VarFlavor::Shell,
+                    ));
                     staging_idx.insert(psv.var_name.clone(), idx);
                 }
                 VarFlavor::Recursive | VarFlavor::PosixSimple => {
                     // Store raw value for second-pass expansion
                     let raw = psv.var.value.clone();
                     let idx = staging.len();
-                    staging.push((psv.var_name.clone(), raw, false, psv.is_override, VarFlavor::Recursive));
+                    staging.push((
+                        psv.var_name.clone(),
+                        raw,
+                        false,
+                        psv.is_override,
+                        VarFlavor::Recursive,
+                    ));
                     staging_idx.insert(psv.var_name.clone(), idx);
                 }
             }
@@ -4322,7 +4996,8 @@ impl<'a> Executor<'a> {
         // This is used to build the "for_prereqs" result: when a target-specific private
         // var overrides an inherited value, the inherited value should still pass through
         // to prerequisites (GNU Make private semantics: only blocks THIS target's override).
-        let pre_step2_snap: HashMap<String, (String, bool)> = staging_idx.iter()
+        let pre_step2_snap: HashMap<String, (String, bool)> = staging_idx
+            .iter()
             .map(|(name, &i)| {
                 let (_, val, _is_expanded, is_override, _) = &staging[i];
                 // For snapshot we just want to know the key existed and its is_override
@@ -4335,7 +5010,7 @@ impl<'a> Executor<'a> {
         let step1_private_flags: HashSet<String> = private_flags.clone();
 
         // 2. Apply target-specific variables (they override pattern-specific).
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 for (raw_var_name, var) in &rule.target_specific_vars {
                     // Expand the variable name using already-collected target vars.
@@ -4344,7 +5019,8 @@ impl<'a> Executor<'a> {
                     // expanding recursive ones immediately so that `VAR$(FOO)` with FOO=x gives VARx.
                     let expanded_var_name: String;
                     let var_name: &str = if raw_var_name.contains('$') {
-                        let ctx: HashMap<String, String> = staging.iter()
+                        let ctx: HashMap<String, String> = staging
+                            .iter()
                             .map(|(n, v, is_exp, _, _)| {
                                 let val = if *is_exp {
                                     v.clone()
@@ -4370,28 +5046,43 @@ impl<'a> Executor<'a> {
                         VarFlavor::Simple => {
                             let val = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Simple);
+                                staging[i] = (
+                                    var_name.to_string(),
+                                    val,
+                                    true,
+                                    is_override,
+                                    VarFlavor::Simple,
+                                );
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Simple));
+                                staging.push((
+                                    var_name.to_string(),
+                                    val,
+                                    true,
+                                    is_override,
+                                    VarFlavor::Simple,
+                                ));
                                 staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Append => {
                             // A non-override Append is blocked if the existing var has override flag.
-                            let existing_is_override = staging_idx.get(var_name)
-                                .map_or(false, |&i| staging[i].3);
+                            let existing_is_override =
+                                staging_idx.get(var_name).map_or(false, |&i| staging[i].3);
                             if !is_override && existing_is_override {
                                 // Skip this non-override append.
                             } else {
                                 // Determine if the base is simple (already expanded) or recursive.
                                 // For recursive base: keep result recursive (don't expand rhs yet).
                                 // For simple base: expand rhs immediately with staging context.
-                                let base_is_expanded = staging_idx.get(var_name)
+                                let base_is_expanded = staging_idx
+                                    .get(var_name)
                                     .map(|&i| staging[i].2)
                                     .unwrap_or_else(|| {
                                         // Check global var flavor
-                                        self.db.variables.get(var_name)
+                                        self.db
+                                            .variables
+                                            .get(var_name)
                                             .map(|v| v.flavor == VarFlavor::Simple)
                                             .unwrap_or(false)
                                     });
@@ -4399,36 +5090,75 @@ impl<'a> Executor<'a> {
                                 if base_is_expanded {
                                     // Simple base: expand rhs with staging context for
                                     // correct target-specific var references.
-                                    let staging_ctx: HashMap<String, String> = staging.iter()
+                                    let staging_ctx: HashMap<String, String> = staging
+                                        .iter()
                                         .filter(|(_, _, is_exp, _, _)| *is_exp)
                                         .map(|(n, v, _, _, _)| (n.clone(), v.clone()))
                                         .collect();
-                                    let rhs = self.state.expand_with_auto_vars(&var.value, &staging_ctx);
+                                    let rhs =
+                                        self.state.expand_with_auto_vars(&var.value, &staging_ctx);
                                     let base = get_staging_val(&staging, &staging_idx, var_name)
-                                        .or_else(|| self.db.variables.get(var_name).map(|v| v.value.clone()))
+                                        .or_else(|| {
+                                            self.db.variables.get(var_name).map(|v| v.value.clone())
+                                        })
                                         .unwrap_or_default();
-                                    let val = if base.is_empty() { rhs } else { format!("{} {}", base, rhs) };
+                                    let val = if base.is_empty() {
+                                        rhs
+                                    } else {
+                                        format!("{} {}", base, rhs)
+                                    };
                                     if let Some(&i) = staging_idx.get(var_name) {
-                                        staging[i] = (var_name.to_string(), val, true, new_is_override, VarFlavor::Append);
+                                        staging[i] = (
+                                            var_name.to_string(),
+                                            val,
+                                            true,
+                                            new_is_override,
+                                            VarFlavor::Append,
+                                        );
                                     } else {
                                         let idx = staging.len();
-                                        staging.push((var_name.to_string(), val, true, new_is_override, VarFlavor::Append));
+                                        staging.push((
+                                            var_name.to_string(),
+                                            val,
+                                            true,
+                                            new_is_override,
+                                            VarFlavor::Append,
+                                        ));
                                         staging_idx.insert(var_name.to_string(), idx);
                                     }
                                 } else {
                                     // Recursive base: keep result recursive.
                                     // Get raw (unexpanded) base value from staging or global.
-                                    let base_raw = staging_idx.get(var_name)
+                                    let base_raw = staging_idx
+                                        .get(var_name)
                                         .map(|&i| staging[i].1.clone())
-                                        .or_else(|| self.db.variables.get(var_name).map(|v| v.value.clone()))
+                                        .or_else(|| {
+                                            self.db.variables.get(var_name).map(|v| v.value.clone())
+                                        })
                                         .unwrap_or_default();
                                     let rhs_raw = &var.value;
-                                    let val = if base_raw.is_empty() { rhs_raw.clone() } else { format!("{} {}", base_raw, rhs_raw) };
+                                    let val = if base_raw.is_empty() {
+                                        rhs_raw.clone()
+                                    } else {
+                                        format!("{} {}", base_raw, rhs_raw)
+                                    };
                                     if let Some(&i) = staging_idx.get(var_name) {
-                                        staging[i] = (var_name.to_string(), val, false, new_is_override, VarFlavor::Recursive);
+                                        staging[i] = (
+                                            var_name.to_string(),
+                                            val,
+                                            false,
+                                            new_is_override,
+                                            VarFlavor::Recursive,
+                                        );
                                     } else {
                                         let idx = staging.len();
-                                        staging.push((var_name.to_string(), val, false, new_is_override, VarFlavor::Recursive));
+                                        staging.push((
+                                            var_name.to_string(),
+                                            val,
+                                            false,
+                                            new_is_override,
+                                            VarFlavor::Recursive,
+                                        ));
                                         staging_idx.insert(var_name.to_string(), idx);
                                     }
                                 }
@@ -4438,27 +5168,57 @@ impl<'a> Executor<'a> {
                             if !staging_idx.contains_key(var_name) {
                                 let val = expand_imm(&self.state, &var.value);
                                 let idx = staging.len();
-                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Conditional));
+                                staging.push((
+                                    var_name.to_string(),
+                                    val,
+                                    true,
+                                    is_override,
+                                    VarFlavor::Conditional,
+                                ));
                                 staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Shell => {
                             let val = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.to_string(), val, true, is_override, VarFlavor::Shell);
+                                staging[i] = (
+                                    var_name.to_string(),
+                                    val,
+                                    true,
+                                    is_override,
+                                    VarFlavor::Shell,
+                                );
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.to_string(), val, true, is_override, VarFlavor::Shell));
+                                staging.push((
+                                    var_name.to_string(),
+                                    val,
+                                    true,
+                                    is_override,
+                                    VarFlavor::Shell,
+                                ));
                                 staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
                         VarFlavor::Recursive | VarFlavor::PosixSimple => {
                             let raw = var.value.clone();
                             if let Some(&i) = staging_idx.get(var_name) {
-                                staging[i] = (var_name.to_string(), raw, false, is_override, VarFlavor::Recursive);
+                                staging[i] = (
+                                    var_name.to_string(),
+                                    raw,
+                                    false,
+                                    is_override,
+                                    VarFlavor::Recursive,
+                                );
                             } else {
                                 let idx = staging.len();
-                                staging.push((var_name.to_string(), raw, false, is_override, VarFlavor::Recursive));
+                                staging.push((
+                                    var_name.to_string(),
+                                    raw,
+                                    false,
+                                    is_override,
+                                    VarFlavor::Recursive,
+                                ));
                                 staging_idx.insert(var_name.to_string(), idx);
                             }
                         }
@@ -4515,7 +5275,7 @@ impl<'a> Executor<'a> {
         }
 
         // Target-specific vars override the export status (if explicitly set).
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     if var.export.is_some() {
@@ -4537,7 +5297,10 @@ impl<'a> Executor<'a> {
                     if let Some((pre_val, pre_is_override)) = pre_step2_snap.get(name) {
                         // Carry through the pre-override value, marking it as non-private.
                         let export_st = var_export_status.get(name.as_str()).copied().flatten();
-                        for_prereqs.insert(name.clone(), (pre_val.clone(), *pre_is_override, false, export_st));
+                        for_prereqs.insert(
+                            name.clone(),
+                            (pre_val.clone(), *pre_is_override, false, export_st),
+                        );
                     }
                     // If no pre-step-2 entry: don't include in for_prereqs (new private var).
                 }
@@ -4579,7 +5342,10 @@ impl<'a> Executor<'a> {
         }
         for (var_name, (value, is_override, _is_private)) in target_vars {
             // Non-override target-specific vars don't override command-line vars
-            let is_cmdline = self.db.variables.get(var_name.as_str())
+            let is_cmdline = self
+                .db
+                .variables
+                .get(var_name.as_str())
                 .map_or(false, |v| v.origin == VarOrigin::CommandLine);
             if is_cmdline && !is_override {
                 continue;
@@ -4594,7 +5360,7 @@ impl<'a> Executor<'a> {
     ///   - `foo.a: ; touch $@` (non-empty recipe) — rebuild needed
     fn intermediate_has_buildable_recipe(&self, target: &str) -> bool {
         // Check explicit rules first
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             if rules.iter().any(|r| !r.recipe.is_empty()) {
                 return true;
             }
@@ -4614,7 +5380,9 @@ impl<'a> Executor<'a> {
     /// Returns None if the target doesn't exist and has no known sources.
     fn effective_mtime(&self, target: &str, depth: usize) -> Option<SystemTime> {
         // Prevent infinite recursion
-        if depth > 10 { return None; }
+        if depth > 10 {
+            return None;
+        }
         // If target exists, use its actual mtime — but check if what-if or rule prereqs
         // would cause a rebuild; if so, treat this target as infinitely new.
         // With GPATH: prefer VPATH location for timestamp (GPATH files are authoritative)
@@ -4629,15 +5397,23 @@ impl<'a> Executor<'a> {
         };
         if let Some(t) = target_mtime {
             // Check explicit rules for this target
-            if let Some(rules) = self.db.rules.get(target) {
+            if let Some(rules) = self.db.get_rules(target) {
                 for rule in rules {
                     for prereq in &rule.prerequisites {
                         // If a prereq is what-if (or its VPATH-resolved path is), target would rebuild
-                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(prereq)) {
+                        if self
+                            .what_if
+                            .iter()
+                            .any(|w| normalize_path(w) == normalize_path(prereq))
+                        {
                             return Some(SystemTime::now());
                         }
                         if let Some(ref vp) = self.find_in_vpath(prereq) {
-                            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
+                            if self
+                                .what_if
+                                .iter()
+                                .any(|w| normalize_path(w) == normalize_path(vp))
+                            {
                                 return Some(SystemTime::now());
                             }
                         }
@@ -4656,18 +5432,30 @@ impl<'a> Executor<'a> {
                 // is newer — without this check effective_mtime would return the stale
                 // mtime of foo.b and the parent would never be rebuilt.
                 if let Some((rule, stem)) = self.find_pattern_rule(target) {
-                    let matched_pt_em: String = rule.targets.iter()
+                    let matched_pt_em: String = rule
+                        .targets
+                        .iter()
                         .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                         .cloned()
                         .unwrap_or_else(|| "%".to_string());
                     for prereq_pat in &rule.prerequisites {
-                        if prereq_pat.as_str() == ".WAIT" { continue; }
+                        if prereq_pat.as_str() == ".WAIT" {
+                            continue;
+                        }
                         let prereq = subst_stem_in_prereq_dir(prereq_pat, &stem, &matched_pt_em);
-                        if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(&prereq)) {
+                        if self
+                            .what_if
+                            .iter()
+                            .any(|w| normalize_path(w) == normalize_path(&prereq))
+                        {
                             return Some(SystemTime::now());
                         }
                         if let Some(ref vp) = self.find_in_vpath(&prereq) {
-                            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
+                            if self
+                                .what_if
+                                .iter()
+                                .any(|w| normalize_path(w) == normalize_path(vp))
+                            {
                                 return Some(SystemTime::now());
                             }
                         }
@@ -4687,8 +5475,9 @@ impl<'a> Executor<'a> {
         }
         // Look for a rule that would build this target and find its sources' max mtime.
         // Check explicit rules first.
-        if let Some(rules) = self.db.rules.get(target) {
-            let max_prereq_time = rules.iter()
+        if let Some(rules) = self.db.get_rules(target) {
+            let max_prereq_time = rules
+                .iter()
                 .flat_map(|r| r.prerequisites.iter())
                 .filter_map(|p| self.effective_mtime(p, depth + 1))
                 .max();
@@ -4696,11 +5485,15 @@ impl<'a> Executor<'a> {
         }
         // Check pattern rules
         if let Some((rule, stem)) = self.find_pattern_rule(target) {
-            let matched_pt_em: String = rule.targets.iter()
+            let matched_pt_em: String = rule
+                .targets
+                .iter()
                 .find(|pt| match_pattern(pt, target).as_deref() == Some(stem.as_str()))
                 .cloned()
                 .unwrap_or_else(|| "%".to_string());
-            let max_prereq_time = rule.prerequisites.iter()
+            let max_prereq_time = rule
+                .prerequisites
+                .iter()
                 .filter(|p| p.as_str() != ".WAIT")
                 .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt_em))
                 .filter_map(|p| self.effective_mtime(&p, depth + 1))
@@ -4731,11 +5524,19 @@ impl<'a> Executor<'a> {
         // Also check the VPATH-resolved path (e.g., prereq "x" found as "x-dir/x" via VPATH,
         // and "-W x-dir/x" was given).
         for prereq in prereqs {
-            if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(prereq)) {
+            if self
+                .what_if
+                .iter()
+                .any(|w| normalize_path(w) == normalize_path(prereq))
+            {
                 return true;
             }
             if let Some(ref vp) = self.find_in_vpath(prereq) {
-                if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) {
+                if self
+                    .what_if
+                    .iter()
+                    .any(|w| normalize_path(w) == normalize_path(vp))
+                {
                     return true;
                 }
             }
@@ -4748,7 +5549,9 @@ impl<'a> Executor<'a> {
 
         for prereq in prereqs {
             // Skip .WAIT markers (should already be filtered, but be safe)
-            if prereq == ".WAIT" { continue; }
+            if prereq == ".WAIT" {
+                continue;
+            }
 
             let prereq_time = match self.file_mtime(prereq) {
                 Some(t) => t,
@@ -4779,7 +5582,8 @@ impl<'a> Executor<'a> {
                         // Intermediate files that are absent use effective_mtime instead.
                         // Exception: if the prereq is .INTERMEDIATE, treat as intermediate
                         // even if it was also explicitly mentioned (sv 60188).
-                        if self.is_explicitly_mentioned(prereq) && !self.db.is_intermediate(prereq) {
+                        if self.is_explicitly_mentioned(prereq) && !self.db.is_intermediate(prereq)
+                        {
                             return true;
                         }
                         // For non-existent non-phony prereqs (potentially intermediate files
@@ -4844,22 +5648,23 @@ impl<'a> Executor<'a> {
         // (which also handles inheritance, pattern-specific vars, etc.).
         let collected = self.collect_target_vars(target);
         // The value from collect_target_vars is already fully expanded.
-        let (expanded, is_target_specific) = if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
-            (val.clone(), true)
-        } else {
-            // Fall back to global .EXTRA_PREREQS.
-            match self.db.variables.get(".EXTRA_PREREQS") {
-                Some(v) => {
-                    let val = if v.flavor == VarFlavor::Simple {
-                        v.value.clone()
-                    } else {
-                        self.state.expand(&v.value)
-                    };
-                    (val, false)
+        let (expanded, is_target_specific) =
+            if let Some((val, _, _)) = collected.0.get(".EXTRA_PREREQS") {
+                (val.clone(), true)
+            } else {
+                // Fall back to global .EXTRA_PREREQS.
+                match self.db.variables.get(".EXTRA_PREREQS") {
+                    Some(v) => {
+                        let val = if v.flavor == VarFlavor::Simple {
+                            v.value.clone()
+                        } else {
+                            self.state.expand(&v.value)
+                        };
+                        (val, false)
+                    }
+                    None => return (Vec::new(), false),
                 }
-                None => return (Vec::new(), false),
-            }
-        };
+            };
 
         if expanded.trim().is_empty() {
             return (Vec::new(), is_target_specific);
@@ -4899,7 +5704,13 @@ impl<'a> Executor<'a> {
         (result, is_target_specific)
     }
 
-    fn make_auto_vars(&self, target: &str, prereqs: &[String], order_only: &[&str], stem: &str) -> HashMap<String, String> {
+    fn make_auto_vars(
+        &self,
+        target: &str,
+        prereqs: &[String],
+        order_only: &[&str],
+        stem: &str,
+    ) -> HashMap<String, String> {
         let mut vars = HashMap::new();
 
         // $@ - target
@@ -4936,16 +5747,15 @@ impl<'a> Executor<'a> {
 
         // $^ - all prerequisites (no duplicates)
         let mut seen = HashSet::new();
-        let unique_prereqs: Vec<String> = prereqs.iter()
+        let unique_prereqs: Vec<String> = prereqs
+            .iter()
             .filter(|p| seen.insert(p.to_string()))
             .map(|p| resolve_prereq(p))
             .collect();
         vars.insert("^".to_string(), unique_prereqs.join(" "));
 
         // $+ - all prerequisites (with duplicates)
-        let all_prereqs: Vec<String> = prereqs.iter()
-            .map(|p| resolve_prereq(p))
-            .collect();
+        let all_prereqs: Vec<String> = prereqs.iter().map(|p| resolve_prereq(p)).collect();
         vars.insert("+".to_string(), all_prereqs.join(" "));
 
         // $? - prerequisites that are newer than the target.
@@ -4955,7 +5765,8 @@ impl<'a> Executor<'a> {
         //   - target doesn't exist but prereq exists on disk
         //   - prereq doesn't exist on disk but was visited/built this make run and target doesn't exist
         let target_time = self.file_mtime(target);
-        let newer: Vec<String> = prereqs.iter()
+        let newer: Vec<String> = prereqs
+            .iter()
             .filter(|p| {
                 if self.always_make {
                     // -B: all prerequisites are considered newer than the target
@@ -4963,10 +5774,11 @@ impl<'a> Executor<'a> {
                 }
                 let resolved = resolve_prereq(p);
                 let prereq_mtime = self.file_mtime(&resolved).or_else(|| {
-                    self.find_in_vpath(p).and_then(|found| self.file_mtime(&found))
+                    self.find_in_vpath(p)
+                        .and_then(|found| self.file_mtime(&found))
                 });
                 match (target_time, prereq_mtime) {
-                    (None, Some(_)) => true,       // target doesn't exist, prereq does: newer
+                    (None, Some(_)) => true,         // target doesn't exist, prereq does: newer
                     (Some(tt), Some(pt)) => pt > tt, // both exist: compare times
                     (_, None) => {
                         // prereq doesn't exist as file: include if prereq was visited
@@ -5004,7 +5816,8 @@ impl<'a> Executor<'a> {
 
         // $| - order-only prerequisites (deduplicated, preserving first occurrence order)
         let mut oo_seen = HashSet::new();
-        let oo_list: Vec<String> = order_only.iter()
+        let oo_list: Vec<String> = order_only
+            .iter()
             .filter(|s| oo_seen.insert(s.to_string()))
             .map(|s| s.to_string())
             .collect();
@@ -5023,7 +5836,11 @@ impl<'a> Executor<'a> {
     /// Check whether the recipe has any real shell commands (not just make-function side-effects).
     /// Also runs make-function side-effects (like $(info)) as a side-effect of expansion.
     /// Used in question mode to determine if the target is "out of date".
-    fn recipe_has_real_commands(&mut self, recipe: &[(usize, String)], auto_vars: &HashMap<String, String>) -> bool {
+    fn recipe_has_real_commands(
+        &mut self,
+        recipe: &[(usize, String)],
+        auto_vars: &HashMap<String, String>,
+    ) -> bool {
         for (_lineno, line) in recipe {
             let expanded = self.state.expand_with_auto_vars(line, auto_vars);
             let cmd = strip_recipe_prefixes(&expanded);
@@ -5038,7 +5855,14 @@ impl<'a> Executor<'a> {
         false
     }
 
-    fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
+    fn execute_recipe(
+        &mut self,
+        target: &str,
+        recipe: &[(usize, String)],
+        source_file: &str,
+        auto_vars: &HashMap<String, String>,
+        _is_phony: bool,
+    ) -> Result<bool, String> {
         // ------------------------------------------------------------------
         // Plan collection mode: store a TargetPlan instead of running the recipe.
         // This is used during parallel graph resolution (Phase 1 of -j N builds).
@@ -5046,16 +5870,19 @@ impl<'a> Executor<'a> {
         if self.collect_plans_mode {
             // Expand recipe lines now (on main thread, with full state access).
             // This is the ONLY place where expansion happens for the parallel path.
-            let expanded_recipe: Vec<(usize, String)> = recipe.iter().map(|(lineno, line)| {
-                *self.state.current_file.borrow_mut() = source_file.to_string();
-                *self.state.current_line.borrow_mut() = *lineno;
-                let preprocessed = preprocess_recipe_bsnl(line);
-                let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-                // Join sub-lines into a single string; the worker will re-split them.
-                let sub_lines = split_recipe_sub_lines(&expanded);
-                let rejoined = sub_lines.join("\n");
-                (*lineno, rejoined)
-            }).collect();
+            let expanded_recipe: Vec<(usize, String)> = recipe
+                .iter()
+                .map(|(lineno, line)| {
+                    *self.state.current_file.borrow_mut() = source_file.to_string();
+                    *self.state.current_line.borrow_mut() = *lineno;
+                    let preprocessed = preprocess_recipe_bsnl(line);
+                    let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                    // Join sub-lines into a single string; the worker will re-split them.
+                    let sub_lines = split_recipe_sub_lines(&expanded);
+                    let rejoined = sub_lines.join("\n");
+                    (*lineno, rejoined)
+                })
+                .collect();
 
             // Update the existing plan (created in build_with_rules) with the expanded recipe.
             // If no plan exists yet (e.g., called from .DEFAULT or pattern rules), create one.
@@ -5237,14 +6064,22 @@ impl<'a> Executor<'a> {
                     Ok(code) if code != 0 => {
                         if effective_ignore {
                             let loc = make_location(source_file, last_lineno);
-                            eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
+                            eprintln!(
+                                "{}: [{}{}] Error {} (ignored)",
+                                self.progname, loc, target, code
+                            );
                         } else {
                             let loc = make_location(source_file, last_lineno);
                             eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
                             // Delete target on error only if .DELETE_ON_ERROR is set.
-                            let delete_on_error = self.db.special_targets
+                            let delete_on_error = self
+                                .db
+                                .special_targets
                                 .contains_key(&SpecialTarget::DeleteOnError);
-                            if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
+                            if delete_on_error
+                                && !self.db.is_precious(target)
+                                && !self.db.is_phony(target)
+                            {
                                 if Path::new(target).exists() {
                                     eprintln!("{}: *** Deleting file '{}'", self.progname, target);
                                     let _ = fs::remove_file(target);
@@ -5273,14 +6108,17 @@ impl<'a> Executor<'a> {
         // Signal that we are inside recipe expansion so $(eval) can detect
         // and reject new prerequisite definitions (GNU Make bug #12124).
         *self.state.in_recipe_execution.borrow_mut() = true;
-        let pre_expanded: Vec<(usize, String, Vec<String>)> = recipe.iter().map(|(lineno, line)| {
-            *self.state.current_file.borrow_mut() = source_file.to_string();
-            *self.state.current_line.borrow_mut() = *lineno;
-            let preprocessed = preprocess_recipe_bsnl(line);
-            let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
-            let sub_lines = split_recipe_sub_lines(&expanded);
-            (*lineno, line.clone(), sub_lines)
-        }).collect();
+        let pre_expanded: Vec<(usize, String, Vec<String>)> = recipe
+            .iter()
+            .map(|(lineno, line)| {
+                *self.state.current_file.borrow_mut() = source_file.to_string();
+                *self.state.current_line.borrow_mut() = *lineno;
+                let preprocessed = preprocess_recipe_bsnl(line);
+                let expanded = self.state.expand_with_auto_vars(&preprocessed, auto_vars);
+                let sub_lines = split_recipe_sub_lines(&expanded);
+                (*lineno, line.clone(), sub_lines)
+            })
+            .collect();
         *self.state.in_recipe_execution.borrow_mut() = false;
 
         // Execute each recipe line separately.
@@ -5300,19 +6138,25 @@ impl<'a> Executor<'a> {
             // These flags propagate to ALL sub-lines from the expansion.
             // For example, `@$(MULTI_LINE_VAR)` silences every line in the expansion,
             // not just the first one.
-            let (_outer_display, outer_silent, outer_ignore, outer_force) = parse_recipe_prefix(line);
+            let (_outer_display, outer_silent, outer_ignore, outer_force) =
+                parse_recipe_prefix(line);
 
             // sub_lines were already computed during pre-expansion above.
             // Each sub-line is an independent recipe command.
             'sub_line_loop: for sub_line in sub_lines {
-                let (display_line, line_silent, ignore_error, force_sub) = parse_recipe_prefix(sub_line);
+                let (display_line, line_silent, ignore_error, force_sub) =
+                    parse_recipe_prefix(sub_line);
                 // Outer flags (from the original recipe line before expansion) propagate to
                 // all sub-lines.  This handles `@$(MULTI)` where MULTI has multiple lines.
                 let force = force_sub || outer_force;
 
                 // With --trace or --dry-run (-n), the @ prefix does NOT suppress echoing.
                 // GNU Make prints all commands in -n mode regardless of @.
-                let at_silent = if self.trace || self.dry_run { false } else { line_silent || outer_silent };
+                let at_silent = if self.trace || self.dry_run {
+                    false
+                } else {
+                    line_silent || outer_silent
+                };
                 let effective_silent = at_silent || self.silent || is_silent_target;
                 let effective_ignore = ignore_error || outer_ignore || self.ignore_errors;
 
@@ -5347,7 +6191,10 @@ impl<'a> Executor<'a> {
 
                 // Use target-specific SHELL/.SHELLFLAGS if present in auto_vars,
                 // otherwise fall back to the global defaults.
-                let eff_shell_raw = auto_vars.get("SHELL").map(|s| s.as_str()).unwrap_or(self.shell);
+                let eff_shell_raw = auto_vars
+                    .get("SHELL")
+                    .map(|s| s.as_str())
+                    .unwrap_or(self.shell);
                 let eff_flags_owned;
                 let eff_flags = {
                     let base = if let Some(f) = auto_vars.get(".SHELLFLAGS") {
@@ -5362,7 +6209,10 @@ impl<'a> Executor<'a> {
                     let has_target_specific_sf = auto_vars.contains_key(".SHELLFLAGS");
                     let posix_added_e = self.db.posix_mode
                         && !has_target_specific_sf
-                        && self.db.variables.get(".SHELLFLAGS")
+                        && self
+                            .db
+                            .variables
+                            .get(".SHELLFLAGS")
                             .map_or(false, |v| v.origin == crate::types::VarOrigin::Default);
                     if effective_ignore && posix_added_e && base.contains("-e") {
                         eff_flags_owned = base.replace("-ec", "-c").replace("-e", "");
@@ -5400,14 +6250,22 @@ impl<'a> Executor<'a> {
                     Ok(code) if code != 0 => {
                         let loc = make_location(source_file, lineno);
                         if effective_ignore {
-                            eprintln!("{}: [{}{}] Error {} (ignored)", self.progname, loc, target, code);
+                            eprintln!(
+                                "{}: [{}{}] Error {} (ignored)",
+                                self.progname, loc, target, code
+                            );
                         } else {
                             eprintln!("{}: *** [{}{}] Error {}", self.progname, loc, target, code);
                             // Delete target on error only if .DELETE_ON_ERROR is set
                             // and the target is not .PRECIOUS.
-                            let delete_on_error = self.db.special_targets
+                            let delete_on_error = self
+                                .db
+                                .special_targets
                                 .contains_key(&SpecialTarget::DeleteOnError);
-                            if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
+                            if delete_on_error
+                                && !self.db.is_precious(target)
+                                && !self.db.is_phony(target)
+                            {
                                 if Path::new(target).exists() {
                                     eprintln!("{}: *** Deleting file '{}'", self.progname, target);
                                     let _ = fs::remove_file(target);
@@ -5419,7 +6277,10 @@ impl<'a> Executor<'a> {
                     Err(e) => {
                         if effective_ignore {
                             let loc = make_location(source_file, lineno);
-                            eprintln!("{}: [{}{}] Error: {} (ignored)", self.progname, loc, target, e);
+                            eprintln!(
+                                "{}: [{}{}] Error: {} (ignored)",
+                                self.progname, loc, target, e
+                            );
                         } else {
                             let loc = make_location(source_file, lineno);
                             eprintln!("{}: *** [{}{}] Error: {}", self.progname, loc, target, e);
@@ -5453,7 +6314,7 @@ impl<'a> Executor<'a> {
                 !stripped.trim().is_empty()
             })
         };
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 if rule_has_recipe(rule) {
                     return true;
@@ -5508,21 +6369,24 @@ impl<'a> Executor<'a> {
                 && var.origin != VarOrigin::Environment
                 && var.export != Some(true)
                 && !self.db.export_all;
-            let should_export = !var.is_private && !shell_blocks_auto_export && (always_export || match var.export {
-                Some(true) => true,
-                Some(false) => false,
-                None => {
-                    if self.db.unexport_all {
-                        // Global unexport: only export if var originated from env AND
-                        // was not changed by the makefile (still Environment origin).
-                        // If the makefile explicitly set the var, it must have been
-                        // explicitly `export`ed to be exported.
-                        was_from_env && var.origin == VarOrigin::Environment
-                    } else {
-                        self.db.export_all || was_from_env
-                    }
-                }
-            });
+            let should_export = !var.is_private
+                && !shell_blocks_auto_export
+                && (always_export
+                    || match var.export {
+                        Some(true) => true,
+                        Some(false) => false,
+                        None => {
+                            if self.db.unexport_all {
+                                // Global unexport: only export if var originated from env AND
+                                // was not changed by the makefile (still Environment origin).
+                                // If the makefile explicitly set the var, it must have been
+                                // explicitly `export`ed to be exported.
+                                was_from_env && var.origin == VarOrigin::Environment
+                            } else {
+                                self.db.export_all || was_from_env
+                            }
+                        }
+                    });
             if should_export {
                 let value = self.state.expand(&var.value);
                 cmd.env(name, &value);
@@ -5613,7 +6477,7 @@ impl<'a> Executor<'a> {
         }
 
         // Process target-specific vars for this exact target to find unexports.
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     if var.export == Some(false) {
@@ -5635,7 +6499,7 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     if var.export == Some(true) {
@@ -5694,10 +6558,11 @@ impl<'a> Executor<'a> {
             // POSIX special case for SHELL: target-specific SHELL without explicit export
             // must NOT be exported to the child's environment.  Only an explicit `export`
             // declaration causes the target-specific SHELL value to be exported.
-            let target_shell_blocks_export = var_name == "SHELL"
-                && !target_explicitly_exported
-                && !self.db.export_all;
-            if !target_shell_blocks_export && (target_explicitly_exported || global_should_export(var_name)) {
+            let target_shell_blocks_export =
+                var_name == "SHELL" && !target_explicitly_exported && !self.db.export_all;
+            if !target_shell_blocks_export
+                && (target_explicitly_exported || global_should_export(var_name))
+            {
                 exports.insert(var_name.clone(), value.clone());
             }
         }
@@ -5722,7 +6587,7 @@ impl<'a> Executor<'a> {
         }
 
         // Check target-specific vars for this exact target
-        if let Some(rules) = self.db.rules.get(target) {
+        if let Some(rules) = self.db.get_rules(target) {
             for rule in rules {
                 for (var_name, var) in &rule.target_specific_vars {
                     if var.export == Some(false) {
@@ -5742,13 +6607,21 @@ impl<'a> Executor<'a> {
             for (var_name, (_, _, _, export_status)) in inherited {
                 if *export_status == Some(false) && !unexports.contains(var_name.as_str()) {
                     // Check that this target doesn't explicitly re-export the var.
-                    let target_explicitly_exports = self.db.rules.get(target)
-                        .map(|rules| rules.iter().any(|r| r.target_specific_vars.iter().any(|(n, v)| n == var_name && v.export == Some(true))))
+                    let target_explicitly_exports = self
+                        .db
+                        .get_rules(target)
+                        .map(|rules| {
+                            rules.iter().any(|r| {
+                                r.target_specific_vars
+                                    .iter()
+                                    .any(|(n, v)| n == var_name && v.export == Some(true))
+                            })
+                        })
                         .unwrap_or(false)
                         || self.db.pattern_specific_vars.iter().any(|psv| {
                             match_pattern_simple(&psv.pattern, target).is_some()
-                            && &psv.var_name == var_name
-                            && psv.var.export == Some(true)
+                                && &psv.var_name == var_name
+                                && psv.var.export == Some(true)
                         });
                     if !target_explicitly_exports {
                         unexports.insert(var_name.clone());
@@ -5763,7 +6636,11 @@ impl<'a> Executor<'a> {
     fn get_makelevel(&self) -> String {
         // The MAKELEVEL env var for sub-make processes is the current level + 1.
         // The current level is stored in the MAKELEVEL variable (0 for top-level).
-        let level: u32 = self.state.db.variables.get("MAKELEVEL")
+        let level: u32 = self
+            .state
+            .db
+            .variables
+            .get("MAKELEVEL")
             .and_then(|v| v.value.parse().ok())
             .unwrap_or(0);
         (level + 1).to_string()
@@ -5775,7 +6652,8 @@ impl<'a> Executor<'a> {
         self.state.args.debug_short
             || self.state.args.debug.iter().any(|d| {
                 d == flag
-                    || d == "a" || d == "all"
+                    || d == "a"
+                    || d == "all"
                     || (flag == "b" && (d == "basic"))
                     || (flag == "j" && (d == "jobs"))
             })
@@ -5811,7 +6689,9 @@ impl<'a> Executor<'a> {
                 for i in (1..n).rev() {
                     // Advance xorshift64
                     let mut s = *seed;
-                    if s == 0 { s = 1; }
+                    if s == 0 {
+                        s = 1;
+                    }
                     s ^= s << 13;
                     s ^= s >> 7;
                     s ^= s << 17;
@@ -5829,23 +6709,26 @@ impl<'a> Executor<'a> {
     fn record_leaf_plan(&mut self, target: &str, is_phony: bool) {
         if let Some(ref mut plans) = self.pending_plans {
             if !plans.contains_key(target) {
-                plans.insert(target.to_string(), parallel::TargetPlan {
-                    target: target.to_string(),
-                    prerequisites: Vec::new(),
-                    order_only: Vec::new(),
-                    recipe: Vec::new(),
-                    source_file: String::new(),
-                    auto_vars: HashMap::new(),
-                    is_phony,
-                    needs_rebuild: false,
-                    grouped_primary: None,
-                    grouped_siblings: Vec::new(),
-                    extra_exports: HashMap::new(),
-                    extra_unexports: Vec::new(),
-                    is_intermediate: false,
-                    wait_groups: Vec::new(),
-                    intermediate_also_make: Vec::new(),
-                });
+                plans.insert(
+                    target.to_string(),
+                    parallel::TargetPlan {
+                        target: target.to_string(),
+                        prerequisites: Vec::new(),
+                        order_only: Vec::new(),
+                        recipe: Vec::new(),
+                        source_file: String::new(),
+                        auto_vars: HashMap::new(),
+                        is_phony,
+                        needs_rebuild: false,
+                        grouped_primary: None,
+                        grouped_siblings: Vec::new(),
+                        extra_exports: HashMap::new(),
+                        extra_unexports: Vec::new(),
+                        is_intermediate: false,
+                        wait_groups: Vec::new(),
+                        intermediate_also_make: Vec::new(),
+                    },
+                );
             }
         }
     }
@@ -5934,10 +6817,13 @@ fn parse_shell_flags(flags: &str) -> Vec<String> {
 fn match_pattern(pattern: &str, target: &str) -> Option<String> {
     if let Some(percent_pos) = pattern.find('%') {
         let prefix = &pattern[..percent_pos];
-        let suffix = &pattern[percent_pos+1..];
+        let suffix = &pattern[percent_pos + 1..];
 
-        if target.starts_with(prefix) && target.ends_with(suffix) && target.len() >= prefix.len() + suffix.len() {
-            let stem = &target[prefix.len()..target.len()-suffix.len()];
+        if target.starts_with(prefix)
+            && target.ends_with(suffix)
+            && target.len() >= prefix.len() + suffix.len()
+        {
+            let stem = &target[prefix.len()..target.len() - suffix.len()];
             return Some(stem.to_string());
         }
     } else if pattern == target {
@@ -5960,7 +6846,7 @@ fn replace_first_percent(word: &str, stem: &str) -> String {
         let mut result = String::with_capacity(word.len() + stem.len());
         result.push_str(&word[..pos]);
         result.push_str(stem);
-        result.push_str(&word[pos+1..]);
+        result.push_str(&word[pos + 1..]);
         result
     } else {
         word.to_string()
@@ -5990,17 +6876,21 @@ fn se_extract_non_dollar_words(text: &str) -> Vec<String> {
         while i < n && (bytes[i] == b' ' || bytes[i] == b'\t') {
             i += 1;
         }
-        if i >= n { break; }
+        if i >= n {
+            break;
+        }
         // Collect one top-level word, tracking nesting depth.
         let word_start = i;
         let mut depth: i32 = 0;
         let mut has_dollar = false;
         while i < n {
             let b = bytes[i];
-            if (b == b' ' || b == b'\t') && depth == 0 { break; }
+            if (b == b' ' || b == b'\t') && depth == 0 {
+                break;
+            }
             if b == b'$' {
                 has_dollar = true;
-                if i + 1 < n && (bytes[i+1] == b'(' || bytes[i+1] == b'{') {
+                if i + 1 < n && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') {
                     depth += 1;
                     i += 2;
                     continue;
@@ -6061,12 +6951,17 @@ fn se_text_has_non_pattern_word(text: &str) -> bool {
                             let mut depth = 1;
                             i += 2;
                             while i < n && depth > 0 {
-                                if bytes[i] == open { depth += 1; }
-                                else if bytes[i] == close { depth -= 1; }
+                                if bytes[i] == open {
+                                    depth += 1;
+                                } else if bytes[i] == close {
+                                    depth -= 1;
+                                }
                                 i += 1;
                             }
                         }
-                        _ => { i += 2; } // $x single-char variable
+                        _ => {
+                            i += 2;
+                        } // $x single-char variable
                     }
                 } else {
                     i += 1;
@@ -6134,12 +7029,17 @@ fn se_non_pattern_words(text: &str) -> Vec<String> {
                             let mut depth = 1;
                             i += 2;
                             while i < n && depth > 0 {
-                                if bytes[i] == open { depth += 1; }
-                                else if bytes[i] == close { depth -= 1; }
+                                if bytes[i] == open {
+                                    depth += 1;
+                                } else if bytes[i] == close {
+                                    depth -= 1;
+                                }
                                 i += 1;
                             }
                         }
-                        _ => { i += 2; }
+                        _ => {
+                            i += 2;
+                        }
                     }
                 } else {
                     i += 1;
@@ -6193,7 +7093,10 @@ fn se_pattern_words(text: &str) -> Vec<String> {
                 i += 1;
             }
             b'$' => {
-                if !in_word { word_start = i; in_word = true; }
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
                 if i + 1 < n {
                     match bytes[i + 1] {
                         b'(' | b'{' => {
@@ -6202,22 +7105,35 @@ fn se_pattern_words(text: &str) -> Vec<String> {
                             let mut depth = 1;
                             i += 2;
                             while i < n && depth > 0 {
-                                if bytes[i] == open { depth += 1; }
-                                else if bytes[i] == close { depth -= 1; }
+                                if bytes[i] == open {
+                                    depth += 1;
+                                } else if bytes[i] == close {
+                                    depth -= 1;
+                                }
                                 i += 1;
                             }
                         }
-                        _ => { i += 2; }
+                        _ => {
+                            i += 2;
+                        }
                     }
-                } else { i += 1; }
+                } else {
+                    i += 1;
+                }
             }
             b'%' => {
-                if !in_word { word_start = i; in_word = true; }
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
                 word_has_percent = true;
                 i += 1;
             }
             _ => {
-                if !in_word { word_start = i; in_word = true; }
+                if !in_word {
+                    word_start = i;
+                    in_word = true;
+                }
                 i += 1;
             }
         }
@@ -6273,7 +7189,9 @@ fn subst_stem_in_se_text(text: &str, stem: &str) -> String {
         while i < n {
             let c = chars[i];
             // Whitespace at top level ends the word.
-            if c.is_whitespace() && depth == 0 { break; }
+            if c.is_whitespace() && depth == 0 {
+                break;
+            }
             // Whitespace inside a function call (depth > 0) is also a word boundary
             // for % substitution.  Reset the flag and copy the whitespace verbatim.
             if c.is_whitespace() && depth > 0 {
@@ -6393,7 +7311,9 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
         let mut j = i;
         while j < n {
             let c = chars[j];
-            if c.is_whitespace() && depth == 0 { break; }
+            if c.is_whitespace() && depth == 0 {
+                break;
+            }
             if c == '$' && j + 1 < n && (chars[j + 1] == '(' || chars[j + 1] == '{') {
                 depth += 1;
                 j += 2;
@@ -6416,11 +7336,16 @@ fn subst_stem_in_se_text_dir(text: &str, full_stem: &str, pattern_target: &str) 
             // If '%' is the very first character of the word: use full stem, no dir prepend.
             // Otherwise: use base stem and apply dir prepend.
             let use_full = pct_pos == word_start;
-            let stem_for_subst = if use_full { escaped_full.as_str() } else { escaped_base.as_str() };
+            let stem_for_subst = if use_full {
+                escaped_full.as_str()
+            } else {
+                escaped_base.as_str()
+            };
             // Determine if wrapping with addprefix is needed.
             // Wrapping is needed when: !use_full AND the word is a function call
             // (starts with '$(' or '${'), because dir-prepend must apply to each expanded word.
-            let needs_addprefix = !use_full && word_start < n
+            let needs_addprefix = !use_full
+                && word_start < n
                 && chars[word_start] == '$'
                 && word_start + 1 < n
                 && (chars[word_start + 1] == '(' || chars[word_start + 1] == '{');
@@ -6486,7 +7411,7 @@ fn vpath_pattern_matches(pattern: &str, target: &str) -> bool {
     // VPATH patterns use % as wildcard
     if let Some(percent_pos) = pattern.find('%') {
         let prefix = &pattern[..percent_pos];
-        let suffix = &pattern[percent_pos+1..];
+        let suffix = &pattern[percent_pos + 1..];
         target.starts_with(prefix) && target.ends_with(suffix)
     } else {
         pattern == target
@@ -6622,7 +7547,9 @@ fn extract_cmd_name(cmd: &str) -> &str {
     if trimmed.is_empty() {
         return "";
     }
-    let end = trimmed.find(|c: char| c.is_ascii_whitespace()).unwrap_or(trimmed.len());
+    let end = trimmed
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(trimmed.len());
     &trimmed[..end]
 }
 
@@ -6680,16 +7607,15 @@ fn run_cmd_with_error_handling(
             || shell_prefix.ends_with("dash")
             || shell_prefix.ends_with("zsh")
             || shell_prefix == "/bin/sh";
-        let is_shell_exec_error = looks_like_shell && (
-            line.ends_with(": inaccessible or not found")
-            || line.ends_with(": not found")
-            || line.ends_with(": command not found")
-            || line.contains(": can't execute: ")
-            || line.ends_with(": No such file or directory")
-            || line.ends_with(": Permission denied")
-            || line.ends_with(": is a directory")
-            || line.ends_with(": Is a directory")
-        );
+        let is_shell_exec_error = looks_like_shell
+            && (line.ends_with(": inaccessible or not found")
+                || line.ends_with(": not found")
+                || line.ends_with(": command not found")
+                || line.contains(": can't execute: ")
+                || line.ends_with(": No such file or directory")
+                || line.ends_with(": Permission denied")
+                || line.ends_with(": is a directory")
+                || line.ends_with(": Is a directory"));
         if !is_shell_exec_error {
             eprintln!("{}", line);
         }
@@ -6777,7 +7703,7 @@ fn preprocess_recipe_bsnl(line: &str) -> String {
     let bytes = line.as_bytes();
     let mut result = String::with_capacity(line.len());
     let mut i = 0;
-    let mut depth: i32 = 0;  // nesting depth inside $(…) / ${…}
+    let mut depth: i32 = 0; // nesting depth inside $(…) / ${…}
 
     while i < bytes.len() {
         let ch = bytes[i];
@@ -6877,7 +7803,7 @@ fn dir_of(path: &str) -> String {
 
 fn file_of(path: &str) -> String {
     match path.rfind('/') {
-        Some(pos) => path[pos+1..].to_string(),
+        Some(pos) => path[pos + 1..].to_string(),
         None => path.to_string(),
     }
 }

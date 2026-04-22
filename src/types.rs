@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// How a variable was defined
 #[derive(Debug, Clone, PartialEq)]
@@ -216,7 +216,7 @@ pub enum ParsedLine {
         flavor: VarFlavor,
         is_override: bool,
         is_export: bool,
-        has_extraneous: bool,  // true if there was extra text after the operator
+        has_extraneous: bool, // true if there was extra text after the operator
     },
     Endef,
     UnExport {
@@ -254,6 +254,7 @@ pub struct PatternSpecificVar {
 #[derive(Debug)]
 pub struct MakeDatabase {
     pub rules: IndexMap<String, Vec<Rule>>,
+    pub rule_name_aliases: HashMap<String, String>,
     pub pattern_rules: Vec<Rule>,
     pub suffix_rules: Vec<Rule>,
     pub variables: IndexMap<String, Variable>,
@@ -305,6 +306,7 @@ impl MakeDatabase {
     pub fn new() -> Self {
         MakeDatabase {
             rules: IndexMap::new(),
+            rule_name_aliases: HashMap::new(),
             pattern_rules: Vec::new(),
             suffix_rules: Vec::new(),
             variables: IndexMap::new(),
@@ -313,15 +315,40 @@ impl MakeDatabase {
             vpath: Vec::new(),
             vpath_general: Vec::new(),
             suffixes: vec![
-                ".out".into(), ".a".into(), ".ln".into(), ".o".into(),
-                ".c".into(), ".cc".into(), ".C".into(), ".cpp".into(),
-                ".p".into(), ".f".into(), ".F".into(), ".m".into(),
-                ".r".into(), ".y".into(), ".l".into(), ".ym".into(),
-                ".lm".into(), ".s".into(), ".S".into(), ".mod".into(),
-                ".sym".into(), ".def".into(), ".h".into(), ".info".into(),
-                ".dvi".into(), ".tex".into(), ".texinfo".into(),
-                ".texi".into(), ".txinfo".into(), ".w".into(),
-                ".ch".into(), ".web".into(), ".sh".into(), ".elc".into(),
+                ".out".into(),
+                ".a".into(),
+                ".ln".into(),
+                ".o".into(),
+                ".c".into(),
+                ".cc".into(),
+                ".C".into(),
+                ".cpp".into(),
+                ".p".into(),
+                ".f".into(),
+                ".F".into(),
+                ".m".into(),
+                ".r".into(),
+                ".y".into(),
+                ".l".into(),
+                ".ym".into(),
+                ".lm".into(),
+                ".s".into(),
+                ".S".into(),
+                ".mod".into(),
+                ".sym".into(),
+                ".def".into(),
+                ".h".into(),
+                ".info".into(),
+                ".dvi".into(),
+                ".tex".into(),
+                ".texinfo".into(),
+                ".texi".into(),
+                ".txinfo".into(),
+                ".w".into(),
+                ".ch".into(),
+                ".web".into(),
+                ".sh".into(),
+                ".elc".into(),
                 ".el".into(),
             ],
             second_expansion: false,
@@ -341,11 +368,71 @@ impl MakeDatabase {
         }
     }
 
+    fn normalized_rule_name(name: &str) -> String {
+        let path = Path::new(name);
+        let joined = if path.is_absolute() {
+            PathBuf::from(path)
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        };
+
+        let mut normalized = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                Component::RootDir => normalized.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        normalized.push("..");
+                    }
+                }
+                Component::Normal(part) => normalized.push(part),
+            }
+        }
+
+        normalized.to_string_lossy().to_string()
+    }
+
+    fn should_track_rule_name_alias(name: &str) -> bool {
+        Path::new(name).is_absolute() || name.contains('/')
+    }
+
+    pub fn remember_rule_name(&mut self, name: &str) -> String {
+        if !Self::should_track_rule_name_alias(name) {
+            return name.to_string();
+        }
+        let normalized = Self::normalized_rule_name(name);
+        if let Some(existing) = self.rule_name_aliases.get(&normalized) {
+            return existing.clone();
+        }
+        self.rule_name_aliases.insert(normalized, name.to_string());
+        name.to_string()
+    }
+
+    pub fn resolve_rule_name<'a>(&'a self, name: &'a str) -> Option<&'a str> {
+        if self.rules.contains_key(name) {
+            return Some(name);
+        }
+        let normalized = Self::normalized_rule_name(name);
+        self.rule_name_aliases.get(&normalized).map(|s| s.as_str())
+    }
+
+    pub fn get_rules(&self, name: &str) -> Option<&Vec<Rule>> {
+        self.resolve_rule_name(name)
+            .and_then(|resolved| self.rules.get(resolved))
+    }
+
+    pub fn has_rule(&self, name: &str) -> bool {
+        self.resolve_rule_name(name).is_some()
+    }
+
     /// Check if a name is explicitly mentioned in the makefile (either as a target
     /// or as a prerequisite of a non-pattern rule, or as a literal prereq in a pattern rule).
     pub fn is_explicitly_mentioned(&self, name: &str) -> bool {
-        self.explicitly_mentioned.contains(name)
-            || self.rules.contains_key(name)
+        self.explicitly_mentioned.contains(name) || self.has_rule(name)
     }
 
     pub fn is_phony(&self, target: &str) -> bool {
@@ -371,9 +458,11 @@ impl MakeDatabase {
         for pat in set {
             if let Some(pct) = pat.find('%') {
                 let prefix = &pat[..pct];
-                let suffix = &pat[pct+1..];
-                if target.starts_with(prefix) && target.ends_with(suffix)
-                    && target.len() >= prefix.len() + suffix.len() {
+                let suffix = &pat[pct + 1..];
+                if target.starts_with(prefix)
+                    && target.ends_with(suffix)
+                    && target.len() >= prefix.len() + suffix.len()
+                {
                     return true;
                 }
             }
@@ -383,7 +472,8 @@ impl MakeDatabase {
 
     pub fn is_intermediate(&self, target: &str) -> bool {
         // Explicitly listed as .INTERMEDIATE: <name>
-        if self.special_targets
+        if self
+            .special_targets
             .get(&SpecialTarget::Intermediate)
             .map_or(false, |set| set.contains(target))
         {
@@ -429,9 +519,11 @@ impl MakeDatabase {
                 if pat.contains('%') {
                     if let Some(pct) = pat.find('%') {
                         let prefix = &pat[..pct];
-                        let suffix = &pat[pct+1..];
-                        if target.starts_with(prefix) && target.ends_with(suffix)
-                            && target.len() >= prefix.len() + suffix.len() {
+                        let suffix = &pat[pct + 1..];
+                        if target.starts_with(prefix)
+                            && target.ends_with(suffix)
+                            && target.len() >= prefix.len() + suffix.len()
+                        {
                             matched = true;
                             break;
                         }
@@ -449,8 +541,11 @@ impl MakeDatabase {
         }
 
         // Explicit .INTERMEDIATE on this target beats any .NOTINTERMEDIATE.
-        if self.special_targets.get(&SpecialTarget::Intermediate)
-            .map_or(false, |s| s.contains(target)) {
+        if self
+            .special_targets
+            .get(&SpecialTarget::Intermediate)
+            .map_or(false, |s| s.contains(target))
+        {
             return false;
         }
 
@@ -464,8 +559,11 @@ impl MakeDatabase {
         if !ni_explicit {
             // .NOTINTERMEDIATE matched via pattern or global.
             // Check if target is explicitly in .SECONDARY (non-empty set containing target name).
-            if self.special_targets.get(&SpecialTarget::Secondary)
-                .map_or(false, |s| !s.is_empty() && s.contains(target)) {
+            if self
+                .special_targets
+                .get(&SpecialTarget::Secondary)
+                .map_or(false, |s| !s.is_empty() && s.contains(target))
+            {
                 return false;
             }
         }
@@ -477,5 +575,44 @@ impl MakeDatabase {
         self.special_targets
             .get(&SpecialTarget::Silent)
             .map_or(false, |set| set.is_empty() || set.contains(target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MakeDatabase;
+
+    #[test]
+    fn resolves_dot_prefixed_rule_name_aliases() {
+        let mut db = MakeDatabase::new();
+        let original = "./modules.stamp";
+        db.remember_rule_name(original);
+        assert_eq!(db.resolve_rule_name("modules.stamp"), Some(original));
+    }
+
+    #[test]
+    fn resolves_parent_dir_rule_name_aliases() {
+        let mut db = MakeDatabase::new();
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_name = cwd.file_name().unwrap().to_string_lossy();
+        let original = format!("../{}/modules.stamp", cwd_name);
+        db.remember_rule_name(&original);
+        assert_eq!(
+            db.resolve_rule_name("modules.stamp"),
+            Some(original.as_str())
+        );
+    }
+
+    #[test]
+    fn bare_rule_names_do_not_alias_to_cwd_paths() {
+        let mut db = MakeDatabase::new();
+        db.rules.insert("all".to_string(), Vec::new());
+        db.remember_rule_name("all");
+
+        let abs = std::env::current_dir().unwrap().join("all");
+        let abs = abs.to_string_lossy().to_string();
+
+        assert_eq!(db.resolve_rule_name("all"), Some("all"));
+        assert_eq!(db.resolve_rule_name(&abs), None);
     }
 }
