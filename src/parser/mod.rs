@@ -650,7 +650,14 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
 
             // Check if this is a target-specific variable
             // But NOT if the name contains `;` (which indicates an inline recipe)
-            if let Some(colon_pos) = name.find(':') {
+            //
+            // Use a paren-aware colon search: musl-style targets like
+            //   $(NOSSP_OBJS) $(NOSSP_OBJS:%.o=%.lo): CFLAGS_ALL += $(CFLAGS_NOSSP)
+            // have a literal `:` inside $(VAR:pat=sub) substitution refs that
+            // `name.find(':')` would mistakenly hit. find_rule_colon honours $()
+            // and ${} nesting depth; reuse it so the TSV split lines up with the
+            // actual rule-colon GNU make sees.
+            if let Some(colon_pos) = find_rule_colon(&name) {
                 let potential_target = name[..colon_pos].trim();
                 let raw_var_part = name[colon_pos+1..].trim();
                 // Strip override/export/unexport/private prefixes from the variable part
