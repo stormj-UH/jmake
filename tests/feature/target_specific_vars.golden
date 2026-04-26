@@ -1,0 +1,2 @@
+foo CFLAGS=-O2
+bar CFLAGS=-g
