@@ -4539,12 +4539,28 @@ impl<'a> Executor<'a> {
         // Include $@ = target so recursive variables using $@ (like `export HI = $(shell $($@.CMD))`)
         // are expanded with the correct target name.
         expansion_context.insert("@".to_string(), target.to_string());
+        // Also expand recursive staging entries into the context (in staging order) so that
+        // a recursive target-specific var that references another recursive target-specific var
+        // sees the target-specific value rather than the global default.  For example:
+        //   CFLAGS =
+        //   CFLAGS_ALL = ... $(CFLAGS)
+        //   target: CFLAGS += -O3
+        //   target: CFLAGS_ALL += -fPIC
+        // Without this, expanding CFLAGS_ALL's raw value '... $(CFLAGS) -fPIC' would fall
+        // back to the global empty CFLAGS instead of the target-specific '-O3'.
+        for (name, raw, is_expanded, _, _) in &staging {
+            if !*is_expanded && !expansion_context.contains_key(name.as_str()) {
+                let val = self.state.expand_with_auto_vars(raw, &expansion_context);
+                expansion_context.insert(name.clone(), val);
+            }
+        }
         let mut result: HashMap<String, (String, bool, bool)> = HashMap::new();
         for (name, raw, is_expanded, is_override, _flavor) in &staging {
             let val = if *is_expanded {
                 raw.clone()
             } else {
-                // Recursive: expand using global state + already-expanded target vars as context
+                // Recursive: expand using global state + target-specific context (includes
+                // both simple and recursively-expanded target-specific vars).
                 self.state.expand_with_auto_vars(raw, &expansion_context)
             };
             let is_priv = private_flags.contains(name.as_str());
