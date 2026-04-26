@@ -1,0 +1,2 @@
+# Cached tarballs are downloaded at test time, not committed to the repo
+cache/
