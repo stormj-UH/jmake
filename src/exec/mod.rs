@@ -1411,17 +1411,32 @@ impl<'a> Executor<'a> {
                         if self.what_if.iter().any(|w| normalize_path(w) == normalize_path(vp)) { return true; }
                     }
                     if self.db.is_phony(p) { return true; }
-                    // Use effective_mtime to handle deleted intermediates
+                    // If the prereq doesn't physically exist (and isn't intermediate or
+                    // secondary), it must be built regardless of effective_mtime: a missing
+                    // non-intermediate file is always "infinitely new".  This mirrors the
+                    // logic in needs_rebuild and prevents effective_mtime's synthetic
+                    // source-max-mtime from falsely concluding the target is up-to-date
+                    // when the prerequisite has simply never been created yet.
+                    let p_exists = self.file_mtime(p).is_some()
+                        || self.find_in_vpath(p).as_ref().and_then(|vp| self.file_mtime(vp)).is_some();
+                    if !p_exists {
+                        if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
+                            skipped_intermediates.push(p.clone());
+                            return false; // secondary missing file: skip
+                        }
+                        if self.db.is_intermediate(p) && !self.db.is_notintermediate(p) {
+                            skipped_intermediates.push(p.clone());
+                            return false; // deleted intermediate: skip
+                        }
+                        // Non-existent, non-intermediate file: treat as infinitely new.
+                        return true;
+                    }
+                    // Use effective_mtime to handle deleted intermediates and what-if checks
                     match self.effective_mtime(p, 0) {
                         Some(pt) => pt > target_time,
                         None => {
-                            // File doesn't exist and has no known sources to determine mtime.
-                            // For secondary/intermediate files whose sources are all up to date
-                            // (effective_mtime could not be determined), we can skip.
-                            // But for explicitly-mentioned files and .NOTINTERMEDIATE files
-                            // that are absent, we MUST build (they are "infinitely new").
-                            // Also treat any non-existent file with a rule as needing rebuild:
-                            // the rule will be run, and the target may then be out of date.
+                            // effective_mtime returned None: file has no known sources.
+                            // For secondary/intermediate files, skip; otherwise must build.
                             if self.db.is_secondary(p) && !self.db.is_notintermediate(p) {
                                 skipped_intermediates.push(p.clone());
                                 return false; // secondary missing file: skip
