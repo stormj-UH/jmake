@@ -77,6 +77,9 @@ run_pkg() {
     jmake_out="$WORK/${name}-jmake.out"
     (cd "$srcdir" && "$GNU_MAKE" -n "$target" >"$gnu_out" 2>&1) || true
     (cd "$srcdir" && JMAKE_TEST_MODE=1 "$JMAKE" -n "$target" >"$jmake_out" 2>&1) || true
+    # Normalize $(MAKE) path: GNU make sets it from argv[0] (/usr/bin/make);
+    # jmake test mode emits bare "make". Rewrite the GNU output before diffing.
+    sed -i "s|/usr/bin/make|make|g" "$gnu_out"
 
     gnu_lines=$(wc -l < "$gnu_out")
     jmake_lines=$(wc -l < "$jmake_out")
