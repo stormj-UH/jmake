@@ -1115,21 +1115,21 @@ impl<'a> Executor<'a> {
                 let after = parts[1];
                 if !before.is_empty() && before != ".WAIT" {
                     if is_order_only {
-                        order_only.push(before.to_string());
+                        order_only.push(normalize_path(before).to_string());
                     } else {
-                        normal.push(before.to_string());
+                        normal.push(normalize_path(before).to_string());
                     }
                 }
                 is_order_only = true;
                 if !after.is_empty() && after != ".WAIT" {
-                    order_only.push(after.to_string());
+                    order_only.push(normalize_path(after).to_string());
                 }
                 continue;
             }
             if is_order_only {
-                order_only.push(token.to_string());
+                order_only.push(normalize_path(token).to_string());
             } else {
-                normal.push(token.to_string());
+                normal.push(normalize_path(token).to_string());
             }
         }
         (normal, order_only)
@@ -4076,6 +4076,7 @@ impl<'a> Executor<'a> {
     }
 
     fn find_in_vpath(&self, target: &str) -> Option<String> {
+        let target = normalize_path(target);
         // Search VPATH and vpath for the target.
         // A vpath-resolved path is valid if either:
         //   (a) the file exists on disk, OR
@@ -4875,7 +4876,7 @@ impl<'a> Executor<'a> {
                 let mut matched: Vec<String> = Vec::new();
                 if let Ok(paths) = ::glob::glob(&token) {
                     for entry in paths.flatten() {
-                        matched.push(entry.to_string_lossy().to_string());
+                        matched.push(normalize_path(&entry.to_string_lossy()).to_string());
                     }
                 }
                 matched.sort();
@@ -4940,19 +4941,22 @@ impl<'a> Executor<'a> {
                 matched.sort();
                 if matched.is_empty() {
                     // No matches: treat as literal (like GNU Make does).
-                    if seen.insert(token.to_string()) {
-                        result.push(token.to_string());
+                    let lit = normalize_path(token).to_string();
+                    if seen.insert(lit.clone()) {
+                        result.push(lit);
                     }
                 } else {
                     for m in matched {
+                        let m = normalize_path(&m).to_string();
                         if seen.insert(m.clone()) {
                             result.push(m);
                         }
                     }
                 }
             } else {
-                if seen.insert(token.to_string()) {
-                    result.push(token.to_string());
+                let t = normalize_path(token).to_string();
+                if seen.insert(t.clone()) {
+                    result.push(t);
                 }
             }
         }
@@ -4963,7 +4967,7 @@ impl<'a> Executor<'a> {
         let mut vars = HashMap::new();
 
         // $@ - target
-        vars.insert("@".to_string(), target.to_string());
+        vars.insert("@".to_string(), normalize_path(target).to_string());
 
         // Helper: resolve a prerequisite to its actual path, checking:
         //   1. lib_search_results for -lname prerequisites
@@ -4973,20 +4977,20 @@ impl<'a> Executor<'a> {
         //   4. VPATH lookup
         let resolve_prereq = |p: &str| -> String {
             if let Some(resolved) = self.lib_search_results.get(p) {
-                return resolved.clone();
+                return normalize_path(resolved).to_string();
             }
             if Path::new(p).exists() {
-                return p.to_string();
+                return normalize_path(p).to_string();
             }
             // If the prereq's recipe actually ran this run (built == true), use its local
             // name even if the file doesn't exist (recipe ran but didn't create the file).
             if self.built.get(p) == Some(&true) {
-                return p.to_string();
+                return normalize_path(p).to_string();
             }
             if let Some(found) = self.find_in_vpath(p) {
-                found
+                normalize_path(&found).to_string()
             } else {
-                p.to_string()
+                normalize_path(p).to_string()
             }
         };
 
