@@ -6750,8 +6750,8 @@ fn extract_cmd_name(cmd: &str) -> &str {
     &trimmed[..end]
 }
 
-/// Run a command through the shell, capturing stderr to intercept and reformat
-/// "command not found" / "permission denied" errors to match GNU Make's output format.
+/// Run a command through the shell with inherited stdout and stderr.
+/// Reformats exit-code 127/126 errors to match GNU Make's output format.
 ///
 /// Returns `Ok(exit_code)` where exit_code is normalized:
 /// - 126/127 for exec errors become 127 (GNU Make normalizes both to 127)
@@ -6762,62 +6762,22 @@ fn run_cmd_with_error_handling(
     recipe_cmd: &str,
     progname: &str,
 ) -> std::io::Result<i32> {
-    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    // Pipe stderr so we can filter the shell's own "command not found" / "inaccessible or not
-    // found" messages (emitted by shells like mksh/dash before exiting with code 127/126).
-    // We emit all other stderr lines immediately, line-by-line, to preserve real-time ordering
-    // for programs that write to stderr while running (e.g. recursive make -w).
-    cmd.stderr(Stdio::piped());
+    // Inherit stderr so that subprocess output (stdout and stderr) shares the same
+    // file-descriptor ordering as the parent process.  Piping stderr and re-emitting
+    // it from the parent causes stdout/stderr interleaving drift: the subprocess's
+    // stdout flushes on exit (via inherited fd) BEFORE the parent drains the pipe
+    // and re-emits stderr, reversing the intended order in captured output.
+    //
+    // GNU make never pipes subprocess stderr; it inherits both stdout and stderr so
+    // the kernel serialises all writes to the same file position, preserving order.
+    //
+    // The previous pipe-based approach was used to suppress/reformat shell "command
+    // not found" messages (exit 127/126); that reformatting is still applied below
+    // based on exit code alone, which is sufficient for GNU-make conformance.
+    cmd.stderr(Stdio::inherit());
     let mut child = cmd.spawn()?;
-
-    // Drain stderr in the current thread (stdout is still inherited = real-time).
-    let stderr_pipe = child.stderr.take().unwrap();
-    let reader = BufReader::new(stderr_pipe);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        // Suppress lines that are the shell's own exec error messages.
-        // The shell emits these when exit code is 127 (not found) or 126 (permission/exec).
-        // GNU Make prints its own formatted version of these errors, so we suppress the
-        // shell's version to avoid duplication.
-        // Forms include:
-        //   "/bin/sh: cmd: inaccessible or not found"   (mksh, 127)
-        //   "mksh: cmd: not found"                      (mksh, 127)
-        //   "sh: cmd: command not found"                (dash, 127)
-        //   "/bin/sh: cmd: can't execute: Permission denied"  (mksh, 126)
-        //   "/bin/sh: cmd: can't execute: Is a directory"     (mksh, 126)
-        //   "sh: cmd: Permission denied"                (dash, 126)
-        // Only suppress lines that look like shell exec errors.
-        // The shell name appears as the first colon-delimited field.
-        // E.g. "/bin/sh: ./cmd: No such file or directory" or "sh: cmd: not found".
-        // Do NOT suppress errors from other programs (e.g. perl's
-        // "Can't open perl script: No such file or directory").
-        let shell_prefix = line.split(':').next().unwrap_or("");
-        let looks_like_shell = shell_prefix.ends_with("sh")
-            || shell_prefix.ends_with("/sh")
-            || shell_prefix.ends_with("mksh")
-            || shell_prefix.ends_with("bash")
-            || shell_prefix.ends_with("dash")
-            || shell_prefix.ends_with("zsh")
-            || shell_prefix == "/bin/sh";
-        let is_shell_exec_error = looks_like_shell && (
-            line.ends_with(": inaccessible or not found")
-            || line.ends_with(": not found")
-            || line.ends_with(": command not found")
-            || line.contains(": can't execute: ")
-            || line.ends_with(": No such file or directory")
-            || line.ends_with(": Permission denied")
-            || line.ends_with(": is a directory")
-            || line.ends_with(": Is a directory")
-        );
-        if !is_shell_exec_error {
-            eprintln!("{}", line);
-        }
-    }
 
     let status = child.wait()?;
     let code = status.code().unwrap_or(1);
