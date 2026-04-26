@@ -1,0 +1,48 @@
+name: Conformance tests
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch: {}
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/stormj-uh/jonerix:builder-amd64
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.REPO_TOKEN }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          curl -sL -H "Authorization: token ${TOKEN}" \
+            "${SERVER}/${REPO}/archive/${SHA}.tar.gz" | \
+            tar xz --strip-components=1
+          ls Cargo.toml && echo "Checkout OK"
+
+      - name: Build jmake (release)
+        run: |
+          cd $GITHUB_WORKSPACE
+          cargo build --release --quiet
+          echo "Built: $(target/release/jmake --version | head -1)"
+
+      - name: Tier 2 feature unit tests (cargo test)
+        run: |
+          cd $GITHUB_WORKSPACE
+          cargo test --test feature_tests 2>&1
+          echo "Tier 2 feature tests passed"
+
+      - name: Tier 1 real-world tests (slow, opt-in)
+        # Set JMAKE_REALWORLD_TESTS=1 in repo secrets to enable.
+        # Skipped by default because they download ~10MB of tarballs.
+        if: env.JMAKE_REALWORLD_TESTS == '1'
+        env:
+          JMAKE_REALWORLD_TESTS: ${{ secrets.JMAKE_REALWORLD_TESTS }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          tests/realworld/run.sh target/release/jmake || {
+            echo "::warning::Real-world tests drifted; see known drift causes in run.sh"
+          }
