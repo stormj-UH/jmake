@@ -426,6 +426,21 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
                     matches.push(format!("./{}", s));
                     continue;
                 }
+                // Case 3: pattern had `./` AND a glob in the directory
+                // component (e.g. `./f*/*.c` or `./src/*/x86_64/*.s`).
+                // Case 1 was skipped above because `dir_prefix_is_pattern`
+                // is true, but we still need GNU-make-compatible `./`
+                // preservation. Without this, $(patsubst $(srcdir)/%,%.o,
+                // $(basename $(SRCS))) with srcdir=. gets bare stems
+                // (no .o appended) because the `./` it tries to consume
+                // isn't there. Reproduced 2026-04-25 building musl —
+                // every AOBJS entry came out as `obj/src/aio/aio` (no
+                // .o), causing both the `%: %.o` link rule to misfire
+                // and `ar rc lib/libc.a` to be called with bare names.
+                if has_dot_slash && !s.starts_with("./") && !s.starts_with('/') {
+                    matches.push(format!("./{}", s));
+                    continue;
+                }
                 matches.push(s);
             }
         }
