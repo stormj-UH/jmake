@@ -18,8 +18,7 @@ fn should_impersonate_gnu_make(raw: Option<&str>) -> bool {
 }
 
 fn test_mode_enabled() -> bool {
-    let value = std::env::var("JMAKE_TEST_MODE").ok();
-    should_impersonate_gnu_make(value.as_deref())
+    eval::test_mode_enabled()
 }
 
 fn target_triple() -> &'static str {
@@ -35,8 +34,10 @@ fn version_lines(test_mode: bool) -> Vec<String> {
         vec![
             "GNU Make 4.4.1".to_string(),
             format!("Built for {}", target_triple()),
-            "Copyright (c) 2026 Jon-Erik G. Storm.".to_string(),
-            "This is jmake, a clean-room replacement for GNU Make.".to_string(),
+            "Copyright (C) 1988-2023 Free Software Foundation, Inc.".to_string(),
+            "License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>".to_string(),
+            "This is free software: you are free to change and redistribute it.".to_string(),
+            "There is NO WARRANTY, to the extent permitted by law.".to_string(),
         ]
     } else {
         vec![
@@ -69,12 +70,16 @@ fn main() {
 
         if is_write_error {
             // Print GNU Make-compatible error message to stderr, then exit(1).
-            let raw = std::env::args().next().unwrap_or_else(|| "make".to_string());
-            let progname = std::path::Path::new(&raw)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&raw)
-                .to_string();
+            let progname = if test_mode_enabled() {
+                "make".to_string()
+            } else {
+                let raw = std::env::args().next().unwrap_or_else(|| "make".to_string());
+                std::path::Path::new(&raw)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&raw)
+                    .to_string()
+            };
             eprintln!("{}: write error", progname);
             process::exit(1);
         }
@@ -119,13 +124,7 @@ fn main() {
         Ok(()) => process::exit(0),
         Err(e) => {
             if !e.is_empty() {
-                let raw = std::env::args().next().unwrap_or_else(|| "make".to_string());
-                let progname = std::path::Path::new(&raw)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&raw)
-                    .to_string();
-                eprintln!("{}: *** {}", progname, e);
+                eprintln!("{}: *** {}", eval::make_progname(), e);
             }
             process::exit(2);
         }
