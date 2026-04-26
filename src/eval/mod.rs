@@ -147,16 +147,26 @@ pub fn logical_cwd() -> std::path::PathBuf {
     env::current_dir().unwrap_or_default()
 }
 
-/// Build the progname string with optional MAKELEVEL suffix (e.g. "jmake[1]").
+/// Returns true when JMAKE_TEST_MODE=1, enabling byte-identical GNU Make output.
+pub fn test_mode_enabled() -> bool {
+    matches!(env::var("JMAKE_TEST_MODE").as_deref(), Ok("1"))
+}
+
+/// Build the progname string with optional MAKELEVEL suffix (e.g. "make[1]").
 /// The level is read from the MAKELEVEL environment variable (set by parent make).
+/// When JMAKE_TEST_MODE=1, always uses "make" as the base name so error/status
+/// messages are byte-identical to GNU Make 4.4.1.
 pub fn make_progname() -> String {
-    let raw = env::args().next().unwrap_or_else(|| "make".to_string());
-    // Use basename only (GNU Make behavior: program name is always the filename, not full path)
-    let base = std::path::Path::new(&raw)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&raw)
-        .to_string();
+    let base = if test_mode_enabled() {
+        "make".to_string()
+    } else {
+        let raw = env::args().next().unwrap_or_else(|| "make".to_string());
+        std::path::Path::new(&raw)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&raw)
+            .to_string()
+    };
     match env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()) {
         Some(level) if level > 0 => format!("{}[{}]", base, level),
         _ => base,
@@ -236,6 +246,10 @@ fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
         return false;
     }
     if args.print_directory {
+        return true;
+    }
+    // GNU Make automatically prints directory messages when -C is given
+    if args.directory.is_some() {
         return true;
     }
     // Recursive makes (MAKELEVEL > 0) automatically print directory messages
@@ -490,10 +504,15 @@ impl MakeState {
         // Set up built-in variables
         self.db.variables.insert("MAKE_VERSION".into(),
             Variable::new("4.4.1".into(), VarFlavor::Simple, VarOrigin::Default));
+        let make_binary = if test_mode_enabled() {
+            "make".to_string()
+        } else {
+            env::args().next().unwrap_or_else(|| "make".into())
+        };
         self.db.variables.insert("MAKE".into(),
-            Variable::new(env::args().next().unwrap_or_else(|| "make".into()), VarFlavor::Recursive, VarOrigin::Default));
+            Variable::new(make_binary.clone(), VarFlavor::Recursive, VarOrigin::Default));
         self.db.variables.insert("MAKE_COMMAND".into(),
-            Variable::new(env::args().next().unwrap_or_else(|| "make".into()), VarFlavor::Simple, VarOrigin::Default));
+            Variable::new(make_binary, VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert("CURDIR".into(),
             Variable::new(cwd.to_string_lossy().to_string(), VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".FEATURES".into(),
@@ -987,9 +1006,8 @@ impl MakeState {
         self.include_depth += 1;
         if self.include_depth > 200 {
             self.include_depth -= 1;
-            let progname = std::env::args().next().unwrap_or_else(|| "make".into());
             return Err(format!("{}: *** Recursive include of '{}'. Stop.",
-                progname, path.display()));
+                make_progname(), path.display()));
         }
         let result = self.read_makefile_display_inner(path, display_name);
         self.include_depth -= 1;
@@ -2783,10 +2801,7 @@ impl MakeState {
                 // Check for multiple words (GNU Make fatal error).
                 let words: Vec<&str> = expanded_goal.split_whitespace().collect();
                 if words.len() > 1 {
-                    let progname = std::env::args().next().unwrap_or_else(|| "make".to_string());
-                    let progname = std::path::Path::new(&progname)
-                        .file_name().and_then(|n| n.to_str()).unwrap_or("make").to_string();
-                    eprintln!("{}: *** .DEFAULT_GOAL contains more than one target.  Stop.", progname);
+                    eprintln!("{}: *** .DEFAULT_GOAL contains more than one target.  Stop.", make_progname());
                     std::process::exit(2);
                 }
                 // Set to specific goal; update default_target
