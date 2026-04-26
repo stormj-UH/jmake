@@ -831,18 +831,42 @@ impl MakeState {
             let mut seen_names: HashSet<String> = HashSet::new();
             let mut var_parts: Vec<String> = Vec::new();
 
+            // GNU Make escapes the value portion when writing MAKEFLAGS so that
+            // child processes can re-tokenise it without mangling spaces inside
+            // variable values.  Without this, `CFLAGS=-Wall -Wmissing-prototypes -O2`
+            // splits on whitespace at parse time and the trailing `-Wmissing-...`
+            // and `-O2` get re-interpreted as short flags by the child — silently
+            // setting -O2 (output-sync) and any single-letter flag character that
+            // appears in a `-W…` value (e.g. -Wmissing-prototypes turns on
+            // -i/-s/-n/-t/-r at the bundled-flag parser).
+            //
+            // Escape exactly what GNU Make escapes: backslash, space, tab, and
+            // dollar (which is doubled).
+            fn quote_makeflags_value(s: &str) -> String {
+                let mut out = String::with_capacity(s.len() + 4);
+                for ch in s.chars() {
+                    if ch == '$' {
+                        out.push('$');
+                    } else if ch == ' ' || ch == '\t' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out
+            }
+
             // Cmdline vars in reverse order (last-specified on CLI comes first).
             for (name, value) in cmdline_vars.iter().rev() {
                 let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
                 if seen_names.insert(key.to_string()) {
-                    var_parts.push(format!("{}={}", name, value));
+                    var_parts.push(format!("{}={}", name, quote_makeflags_value(value)));
                 }
             }
             // Env MAKEFLAGS vars in original order, skipping duplicates of cmdline vars.
             for (name, value) in env_vars.iter() {
                 let key = name.trim_end_matches(|c: char| c == ':' || c == '?' || c == '+');
                 if seen_names.insert(key.to_string()) {
-                    var_parts.push(format!("{}={}", name, value));
+                    var_parts.push(format!("{}={}", name, quote_makeflags_value(value)));
                 }
             }
 

@@ -633,6 +633,28 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     while i < tokens.len() {
         let token: &str = &tokens[i];
 
+        // After "--": every token is variable territory. GNU Make escapes
+        // spaces inside variable values so they tokenise as one piece, but
+        // be defensive: never let a post-`--` token sneak back into the
+        // flag parser even if it starts with `-` (e.g. an unescaped
+        // `CFLAGS=-Wall -O2` from a non-conforming peer would leak `-O2`
+        // back as --output-sync without this guard). If the token is not
+        // itself a `name=value`, attach it as a continuation of the
+        // previous variable's value (GNU Make's behaviour for unescaped
+        // whitespace inside a value is to fold it back together).
+        if past_dashdash {
+            if let Some(eq_pos) = token.find('=') {
+                let name = token[..eq_pos].to_string();
+                let value = token[eq_pos+1..].to_string();
+                result.variables.push((name, value));
+            } else if let Some(last) = result.variables.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(token);
+            }
+            i += 1;
+            continue;
+        }
+
         if past_dashdash && !token.starts_with('-') {
             // Variable assignment: NAME=value or NAME:=value etc.
             if let Some(eq_pos) = token.find('=') {
