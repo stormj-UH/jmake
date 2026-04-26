@@ -20,6 +20,8 @@ pub fn register_default_variables(db: &mut MakeDatabase) {
         ("PC", "pc"),
         ("YACC", "yacc"),
         ("YFLAGS", ""),
+        // GNU Make 4.4.1: YACC.y is what the %.c: %.y rule actually invokes.
+        ("YACC.y", "$(YACC) $(YFLAGS)"),
         ("MAKEINFO", "makeinfo"),
         ("TEX", "tex"),
         ("TEXI2DVI", "texi2dvi"),
@@ -61,6 +63,8 @@ pub fn register_default_variables(db: &mut MakeDatabase) {
         ("LOADLIBES", ""),
         ("ASFLAGS", ""),
         ("LFLAGS", ""),
+        // GNU Make 4.4.1: LEX.l is what the %.c: %.l rule actually invokes.
+        ("LEX.l", "$(LEX) $(LFLAGS) -t"),
         ("RFLAGS", ""),
         ("TARGET_ARCH", ""),
         ("TARGET_MACH", ""),
