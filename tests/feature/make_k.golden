@@ -1,0 +1,4 @@
+foo ok
+make: *** [make_k.mk:8: bar] Error 1
+baz ok
+make: Target 'all' not remade because of errors.

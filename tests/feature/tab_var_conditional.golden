@@ -1,0 +1,2 @@
+BAR=set-in-ifndef
+BAZ=set-in-baz-ifndef

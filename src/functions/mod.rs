@@ -396,7 +396,19 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
                 }
                 // Case 1: pattern had a real dir prefix like `foo/bar/`
                 // and glob returned a name without it — put it back.
-                if !dir_prefix.is_empty() && !s.starts_with(dir_prefix) {
+                // Skip the re-prepend if dir_prefix itself contains a glob
+                // metacharacter. For a pattern like `src/*/*.c`, glob correctly
+                // returns `src/aio/aio.c`; dir_prefix would be `src/*/` (with a
+                // literal `*`), `s.starts_with("src/*/")` is false, and the old
+                // code prepended `src/*/` -> `src/*/src/aio/aio.c`. musl's
+                // Makefile uses $(addsuffix /*.c, $(SRC_DIRS)) where SRC_DIRS
+                // itself holds glob patterns; the bogus path then survives all
+                // the way to the AR step. Reproduced 2026-04-25 from a clean
+                // bootstrap of musl 1.2.6.
+                let dir_prefix_is_pattern = dir_prefix.contains('*')
+                    || dir_prefix.contains('?')
+                    || dir_prefix.contains('[');
+                if !dir_prefix.is_empty() && !dir_prefix_is_pattern && !s.starts_with(dir_prefix) {
                     // If glob stripped only the `./` leader (common when
                     // dir_prefix is `./dir/`), prepend `./` not the full
                     // prefix. The rest of the prefix (`dir/`) is already
@@ -411,6 +423,21 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
                 // Case 2: pattern was `./*.foo` (no real dir prefix) and
                 // glob stripped the leading `./` — put it back.
                 if has_dot_slash && dir_prefix.is_empty() && !s.starts_with("./") {
+                    matches.push(format!("./{}", s));
+                    continue;
+                }
+                // Case 3: pattern had `./` AND a glob in the directory
+                // component (e.g. `./f*/*.c` or `./src/*/x86_64/*.s`).
+                // Case 1 was skipped above because `dir_prefix_is_pattern`
+                // is true, but we still need GNU-make-compatible `./`
+                // preservation. Without this, $(patsubst $(srcdir)/%,%.o,
+                // $(basename $(SRCS))) with srcdir=. gets bare stems
+                // (no .o appended) because the `./` it tries to consume
+                // isn't there. Reproduced 2026-04-25 building musl —
+                // every AOBJS entry came out as `obj/src/aio/aio` (no
+                // .o), causing both the `%: %.o` link rule to misfire
+                // and `ar rc lib/libc.a` to be called with bare names.
+                if has_dot_slash && !s.starts_with("./") && !s.starts_with('/') {
                     matches.push(format!("./{}", s));
                     continue;
                 }
