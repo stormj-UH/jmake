@@ -25,6 +25,11 @@ thread_local! {
     static IN_SHELL_EXEC_WITH_ENV: RefCell<bool> = RefCell::new(false);
 }
 
+#[inline]
+fn strip_dot_slash(s: &str) -> &str {
+    s.strip_prefix("./").unwrap_or(s)
+}
+
 /// A pending include that couldn't be resolved during initial makefile reading.
 #[derive(Clone)]
 pub struct PendingInclude {
@@ -1811,6 +1816,7 @@ impl MakeState {
                                 } else if is_unexport {
                                     var.export = Some(false);
                                 }
+                                let t = strip_dot_slash(&t).to_owned();
                                 let rules = self.db.rules.entry(t.clone()).or_insert_with(Vec::new);
                                 // Add to all rules for this target
                                 for r in rules.iter_mut() {
@@ -2123,6 +2129,19 @@ impl MakeState {
     }
 
     fn register_rule(&mut self, rule: Rule) {
+        // Canonicalize: strip leading "./" from target names, prerequisites, and
+        // grouped sibling names so they match GNU make file-table behavior.
+        // Recipe lines are intentionally NOT touched (./configure etc. are valid shell).
+        let mut rule = rule;
+        rule.targets = rule.targets.into_iter()
+            .map(|t| strip_dot_slash(&t).to_owned()).collect();
+        rule.prerequisites = rule.prerequisites.into_iter()
+            .map(|p| strip_dot_slash(&p).to_owned()).collect();
+        rule.order_only_prerequisites = rule.order_only_prerequisites.into_iter()
+            .map(|p| strip_dot_slash(&p).to_owned()).collect();
+        rule.grouped_siblings = rule.grouped_siblings.into_iter()
+            .map(|s| strip_dot_slash(&s).to_owned()).collect();
+
         // Grouped target rules (&:) must have a recipe.
         // A rule is grouped (has multiple targets in the group) when grouped_siblings is
         // non-empty (the parser sets this only when there are 2+ targets).
@@ -2144,7 +2163,7 @@ impl MakeState {
         // Handle special targets
         for target in &rule.targets {
             if let Some(special) = SpecialTarget::from_str(target) {
-                let prereqs: HashSet<String> = rule.prerequisites.iter().cloned().collect();
+                let prereqs: HashSet<String> = rule.prerequisites.iter().map(|p| strip_dot_slash(p).to_owned()).collect();
 
                 match special {
                     SpecialTarget::Phony | SpecialTarget::Precious |
@@ -2278,7 +2297,7 @@ impl MakeState {
                             self.db.not_parallel = true;
                         } else {
                             for prereq in &rule.prerequisites {
-                                self.db.not_parallel_targets.insert(prereq.clone());
+                                self.db.not_parallel_targets.insert(strip_dot_slash(prereq).to_owned());
                             }
                         }
                     }
@@ -2318,12 +2337,12 @@ impl MakeState {
             // E.g., in `%.tsk: %.z test.z`, `test.z` is explicitly mentioned.
             for prereq in &rule.prerequisites {
                 if !prereq.contains('%') {
-                    self.db.explicitly_mentioned.insert(prereq.clone());
+                    self.db.explicitly_mentioned.insert(strip_dot_slash(prereq).to_owned());
                 }
             }
             for prereq in &rule.order_only_prerequisites {
                 if !prereq.contains('%') {
-                    self.db.explicitly_mentioned.insert(prereq.clone());
+                    self.db.explicitly_mentioned.insert(strip_dot_slash(prereq).to_owned());
                 }
             }
 
@@ -2414,12 +2433,14 @@ impl MakeState {
         // Mark all explicit-rule prerequisites as explicitly mentioned.
         // This prevents targets that appear as prereqs from being considered intermediate.
         for prereq in &rule.prerequisites {
+            let prereq = strip_dot_slash(prereq).to_owned();
             self.db.explicitly_mentioned.insert(prereq.clone());
-            self.db.explicit_dep_names.insert(prereq.clone());
+            self.db.explicit_dep_names.insert(prereq);
         }
         for prereq in &rule.order_only_prerequisites {
+            let prereq = strip_dot_slash(prereq).to_owned();
             self.db.explicitly_mentioned.insert(prereq.clone());
-            self.db.explicit_dep_names.insert(prereq.clone());
+            self.db.explicit_dep_names.insert(prereq);
         }
 
         // Register explicit rules.
