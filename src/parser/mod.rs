@@ -116,6 +116,47 @@
 //! whitespace before a `\<newline>` is *not* stripped (POSIX 2024 §2.13.1).
 //! All other behaviour remains unchanged.
 
+// INVARIANTS: src/parser/mod.rs — makefile lexer and parser
+//
+// P1. Complete AST nodes:
+//     parse_line only returns ParsedLine variants that are fully populated.
+//     A Rule variant always has targets.len() >= 1 (the target is the left side
+//     of the `:` separator).  A VariableAssignment variant always has a non-empty
+//     name (the evaluator may later expand it to empty, but the parser token is
+//     non-empty).
+//
+// P2. Line continuation joined before any processing:
+//     next_logical_line consumes all physical lines belonging to a logical line
+//     (backslash-newline joins) before returning the joined string.  parse_line
+//     is never called on a line that still ends with `\` unless that `\` is
+//     inside a recipe (where it is preserved for the shell).
+//
+// P3. Conditional stack balance at end-of-file:
+//     The evaluator (process_parsed_lines) checks for an unbalanced conditional
+//     stack at EOF.  Inside a single file, the parser does not enforce this —
+//     it is the evaluator's responsibility.  The parser tracks `conditional_stack`
+//     entries as they are pushed (by Conditional variants) and popped (by Endif
+//     variants) but does not error on imbalance itself.
+//
+// P4. define_depth consistency:
+//     When `in_define == true`, `define_depth >= 1`.
+//     When `in_define == false`, `define_depth == 0`.
+//     Each nested `define` increments define_depth; each `endef` decrements it.
+//     The outer define ends only when define_depth reaches 0.
+//
+// P5. in_recipe semantics:
+//     `in_recipe` is set to true when a Rule line is parsed, and cleared when
+//     any non-recipe, non-empty line is processed by the evaluator.
+//     A recipe line is ONLY classified as such when `in_recipe == true` AND the
+//     line begins with the current recipe prefix character (tab by default).
+//     Tab-indented variable assignments inside inactive `ifeq`/`ifdef` blocks
+//     are NOT classified as recipes because in_recipe is false in that context.
+//
+// P6. pos monotonicity:
+//     `pos` only increases (next_logical_line increments it by at least 1 per call).
+//     It is reset to 0 only by load_file or load_string.  Consequently,
+//     next_logical_line is O(remaining lines) amortized and eventually returns None.
+
 mod lexer;
 mod directives;
 
@@ -182,6 +223,13 @@ impl Parser {
         }
     }
 
+    // PRE:  self.filename is set to a valid path; the file must be readable UTF-8 text.
+    // POST: On Ok: self.lines contains all physical lines of the file (BOM stripped).
+    //       self.pos == 0, self.lineno == 0.  All parser state (in_recipe, in_define,
+    //       conditional_stack) is NOT reset — callers must construct a fresh Parser
+    //       or reset state separately for each new file.
+    //       On Err: self.lines is unmodified.
+    // NOTE: Panic/drop safety: io::Result returned; no invariant broken on error return.
     pub fn load_file(&mut self) -> io::Result<()> {
         let content = fs::read_to_string(&self.filename)?;
         // Strip UTF-8 BOM if present
@@ -192,6 +240,11 @@ impl Parser {
         Ok(())
     }
 
+    // PRE:  `content` is valid UTF-8 (guaranteed by Rust's &str type).
+    // POST: self.lines contains all physical lines of `content` (BOM stripped).
+    //       self.pos == 0, self.lineno == 0.  Parser state NOT reset (see load_file note).
+    // NOTE: Panic/drop safety: Vec::collect can panic on OOM; no invariant broken
+    //       because self.lines would be either the new value or unchanged by panic.
     pub fn load_string(&mut self, content: &str) {
         // Strip UTF-8 BOM if present
         let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
@@ -200,10 +253,24 @@ impl Parser {
         self.lineno = 0;
     }
 
+    // PRE:  None.
+    // POST: Returns true iff every frame in conditional_stack has active == true.
+    //       self unchanged.
+    // NOTE: Panic/drop safety: iterator over a Vec; cannot panic.
     pub fn is_conditionally_active(&self) -> bool {
         self.conditional_stack.iter().all(|c| c.active)
     }
 
+    // PRE:  load_file or load_string has been called at least once.
+    // POST: On Some((line, lineno)):
+    //       - `line` is the fully-joined logical line (backslash-newline processing applied — P2).
+    //       - `lineno` is the 1-based number of the first physical line of this logical line.
+    //       - self.pos has advanced past all physical lines consumed to form this logical line (P6).
+    //       On None: self.pos >= self.lines.len(); all input has been consumed.
+    //       in_recipe and conditional_stack are NOT modified by this function — the evaluator
+    //       updates them.
+    // NOTE: Panic/drop safety: only string operations; cannot panic under normal conditions.
+    //       OOM during push_str would panic; no invariant broken (pos not updated on panic path).
     pub fn next_logical_line(&mut self) -> Option<(String, usize)> {
         if self.pos >= self.lines.len() {
             return None;

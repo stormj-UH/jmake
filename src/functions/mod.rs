@@ -110,6 +110,40 @@
 //! to numeric comparison but without parsing into a machine integer.  Supports
 //! leading `+`/`-` signs, leading zeros, and treats `+0`/`-0`/`0` as equal.
 
+// INVARIANTS: src/functions/mod.rs — built-in function dispatch table
+//
+// F1. Idempotent dispatch table (OnceLock):
+//     get_builtin_functions() returns the SAME HashMap instance on every call after
+//     the first.  The table is built once in the OnceLock initializer and then
+//     immutable for the lifetime of the process.  Callers may freely share &static
+//     references to the table.
+//
+// F2. Unknown function → empty string (not panic):
+//     expand_function (in expand.rs) only calls into this module AFTER checking that
+//     the function name is in the table.  If a name is not found (which cannot happen
+//     through the normal dispatch path), the caller returns empty string.  Individual
+//     function handlers also return empty string for any out-of-range or inapplicable
+//     input rather than panicking.
+//
+// F3. Argument splitting respects nested $()/{}:
+//     The argument splitter in expand_function (expand.rs) uses find_matching_close to
+//     locate commas that are NOT inside nested references before passing the split
+//     arguments to handlers.  Handlers receive already-split args and must not re-split
+//     on commas themselves.
+//
+// F4. FnHandler arity contract:
+//     Each table entry has (handler, min_args, max_args).  max_args == 0 means unlimited.
+//     The caller (expand_function in expand.rs) enforces arity before calling the handler.
+//     Handlers may assume args.len() >= min_args and (max_args == 0 || args.len() <= max_args).
+//
+// F5. Handlers are pure or locally side-effecting only:
+//     Text manipulation functions (subst, patsubst, filter, …) are pure.
+//     Shell-calling functions (shell, !=) launch a subprocess.
+//     $(error) and process::exit(2) are terminal — they never return.
+//     $(warning), $(info) write to stderr/stdout but do not modify shared Make state.
+//     $(eval) is the only handler that modifies the MakeState variable database;
+//     its actual implementation lives in expand_function (not in this module's fn_eval stub).
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -138,6 +172,15 @@ static BUILTIN_FUNCTIONS: OnceLock<HashMap<String, (FnHandler, usize, usize)>> =
 ///
 /// The table is built at most once per process; all subsequent calls return
 /// the cached reference in O(1) with no heap allocation.
+//
+// PRE:  None — safe to call from any context including concurrent threads
+//       (OnceLock provides thread-safe initialization).
+// POST: Returns &'static reference to the same HashMap on every call (F1).
+//       The returned map contains exactly 36 entries (one per built-in function).
+//       map[name] == (handler, min_args, max_args) satisfying F4.
+// NOTE: Panic/drop safety: the OnceLock initializer runs once; HashMap::with_capacity
+//       and insert may panic on OOM (unrecoverable; process aborts).  On successful
+//       initialization the table is immutable thereafter — no further allocation occurs.
 pub fn get_builtin_functions() -> &'static HashMap<String, (FnHandler, usize, usize)> {
     BUILTIN_FUNCTIONS.get_or_init(|| {
         // (handler, min_args, max_args) - max_args 0 means unlimited
