@@ -1,13 +1,132 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Parallel execution engine for jmake (-j N support).
-//
-// Architecture:
-//   - Main thread: graph resolution (sequential), scheduler loop
-//   - Worker threads: recipe execution (shell-spawning only)
-//   - Communication: mpsc channels (Job → workers, JobResult ← workers)
-//
-// Only activated when jobs > 1 AND .NOTPARALLEL is not set.
-// When jobs == 1, the existing sequential Executor code path is used unchanged.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Parallel job scheduler for jmake (`-j N` support).
+//!
+//! # Activation
+//!
+//! This module is only exercised when `jobs > 1` **and** `.NOTPARALLEL` is not
+//! set in the Makefile.  When either condition is true the sequential path in
+//! [`crate::exec`] is used unchanged.
+//!
+//! # Architecture
+//!
+//! ```text
+//!  ┌──────────────────────────────────────────────┐
+//!  │  Main thread                                  │
+//!  │  ┌─────────────────┐   ┌──────────────────┐  │
+//!  │  │ Phase 1:        │   │ Phase 3:         │  │
+//!  │  │ collect_plans   │──▶│ scheduler loop   │  │
+//!  │  │ (sequential DFS)│   │ (dispatch/recv)  │  │
+//!  │  └─────────────────┘   └────────┬─────────┘  │
+//!  └───────────────────────────────  │ Job  ───────┘
+//!           ▲ JobResult              │
+//!  ┌────────┴───────────────────┐    │
+//!  │  Worker threads (0..N-1)   │◀───┘
+//!  │  execute_job() per Job     │
+//!  └────────────────────────────┘
+//! ```
+//!
+//! * **Main thread**: performs the sequential graph-resolution phase
+//!   (`collect_plans`) and then runs the scheduler loop.  It never blocks on I/O
+//!   apart from waiting on the `result_rx` channel.
+//! * **Worker threads**: purely execute shell commands.  They receive a [`Job`]
+//!   (all owned data, no references into `Executor` or `MakeState`), run it via
+//!   [`execute_job`], and send a [`JobResult`] back.
+//! * **Communication**: two `std::sync::mpsc` channels.  `job_tx` → workers (many
+//!   readers share the receiver via `Arc<Mutex<Receiver>>`); `result_tx` → main
+//!   thread (one receiver).
+//!
+//! # Job scheduling algorithm
+//!
+//! [`ParallelScheduler`] maintains a dependency graph built from the
+//! [`TargetPlan`] map produced by Phase 1.  The key data structures are:
+//!
+//! * `prereqs_of`: for each target, the subset of its prerequisites that are
+//!   themselves scheduled targets (external files that already exist are excluded).
+//! * `dependents_of`: reverse map — for each target, the targets that list it as a
+//!   prerequisite.
+//! * `states`: current [`TargetState`] of each target.
+//! * `ready_queue`: `VecDeque` of targets whose prerequisites are all `Done` and
+//!   that are waiting for a worker slot.
+//!
+//! **Initialisation** (`new` + `find_initial_ready`):
+//! 1. Build `prereqs_of` and `dependents_of` from plans.
+//! 2. Process `.WAIT` markers: inject virtual *barrier nodes* that enforce
+//!    prerequisite sub-group ordering within a parent target.  A barrier
+//!    `target##wait##N` completes once its group is done, and the next group's
+//!    targets list the barrier as a prerequisite.
+//! 3. Walk BFS from the goal targets; any target with all prerequisites already
+//!    `Done` (or with no prerequisites at all) is enqueued in `ready_queue`.
+//!
+//! **Dispatch loop** (in `exec/mod.rs`):
+//! ```text
+//! loop {
+//!     while scheduler.should_launch() {
+//!         target = scheduler.pop_ready();
+//!         job = build_job_from_plan(target);
+//!         scheduler.send_job(job);
+//!         scheduler.states[target] = Running;
+//!         scheduler.running_count += 1;
+//!     }
+//!     if !scheduler.has_work() { break; }
+//!     result = scheduler.recv_result();
+//!     scheduler.handle_completion(result);   // may enqueue new ready targets
+//! }
+//! ```
+//!
+//! `handle_completion` → `propagate_completion`: when a target transitions to
+//! `Done`, every dependent is checked; if all its prerequisites are now `Done` it
+//! is enqueued (or immediately marked `Done` itself when `needs_rebuild` is
+//! false).  This propagation recurses, so long chains of up-to-date targets are
+//! resolved in a single `handle_completion` call without waiting for the next
+//! scheduler loop iteration.
+//!
+//! # Token / slot counting (`-j N`)
+//!
+//! `max_jobs` is the raw value of `-j N`.  `running_count` is the number of jobs
+//! currently executing in worker threads.  `should_launch` returns false when
+//! `running_count >= max_jobs`, ensuring at most `N` recipes run concurrently.
+//!
+//! The `-l` flag (load-average limit) is enforced in `should_launch`: if at least
+//! one job is already running and the 1-minute load average from `/proc/loadavg`
+//! is at or above `max_load`, no new jobs start.  This matches GNU Make's
+//! load-throttling semantics.
+//!
+//! # `.WAIT` barrier nodes
+//!
+//! A `.WAIT` marker inside a prerequisite list (`all: a b .WAIT c d`) splits the
+//! prerequisites into *groups*.  Within a parallel build the scheduler must ensure
+//! group 0 (`a b`) finishes before group 1 (`c d`) starts.
+//!
+//! The implementation injects virtual `target##wait##N` barrier nodes:
+//! * Barrier `target##wait##0` depends on all of group 0.
+//! * Barrier `target##wait##1` depends on all of group 1 plus barrier 0.
+//! * Each target in group 1 gains barrier 0 as an extra prerequisite.
+//!
+//! A safety check prevents injecting barriers that would cause deadlocks: if a
+//! target appears as an "unguarded" prerequisite in *another* plan (i.e., without
+//! a `.WAIT` guard), the barrier is not injected for that target.
+//!
+//! # Error handling
+//!
+//! * Default (no `-k`): the first failure sets `draining = true`.  No new jobs are
+//!   launched.  In-flight jobs are drained via `drain_running` before the scheduler
+//!   exits.  `has_work` returns false once `running_count == 0` even if
+//!   `ready_queue` is non-empty, preventing the main thread from blocking on a
+//!   `recv_result` that will never arrive.
+//! * With `-k`: errors are accumulated in `errors`; dependents of failed targets
+//!   are immediately marked `Failed` so they are never dispatched.  The build
+//!   continues for all non-dependent targets.
+//!
+//! # `JMAKE_DEBUG_DEADLOCK`
+//!
+//! If the environment variable `JMAKE_DEBUG_DEADLOCK=N` is set, `recv_result` uses
+//! a `recv_timeout` of N seconds.  On timeout it dumps the scheduler state (state
+//! counts, running targets, targets stuck with no state, and their unmet
+//! prerequisites) to stderr and exits with code 99.  This is a development aid
+//! only and has no effect when the variable is unset.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
