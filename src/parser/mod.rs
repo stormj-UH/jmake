@@ -1,4 +1,6 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
 // Makefile parser - lexing and parsing of Makefile syntax
 
 mod lexer;

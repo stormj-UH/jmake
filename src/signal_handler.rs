@@ -1,5 +1,49 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Signal handling for jmake: cleanup on SIGTERM.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! SIGTERM handler and async-signal-safe cleanup for jmake.
+//!
+//! When jmake receives `SIGTERM` while a recipe is running it must:
+//!
+//! 1. Print a `"*** [file:line: target] Terminated"` message to stderr.
+//! 2. Delete any temporary file that was created to hold stdin content (the
+//!    `--temp-stdin` mechanism used when jmake re-execs itself to pass makefile
+//!    content from stdin to the child).
+//! 3. Reset `SIGTERM` to `SIG_DFL` and re-raise the signal so the process
+//!    exits with the correct signal-killed status (not exit code 0 or 1).
+//!
+//! # Design: async-signal-safe globals
+//!
+//! Signal handlers may interrupt any point in the program; they must only
+//! call functions listed as async-signal-safe in POSIX.1-2017 §2.4.3.
+//! That rules out Rust's allocator, `eprintln!`, `std::fs::remove_file`, and
+//! any lock-taking function.
+//!
+//! To work around this, the paths and messages that the handler needs are
+//! stored in fixed-size static buffers (`SyncBuffer<N>`) before the handler
+//! is invoked.  The handler reads those buffers with raw pointer accesses and
+//! calls only `write(2)`, `unlink(2)`, `signal(2)`, and `raise(2)`.
+//!
+//! # Soundness
+//!
+//! See the four invariants (I1–I4) documented on the `SyncBuffer` statics
+//! below.  The key points are:
+//!
+//! - jmake is **single-threaded** at the point where these globals are written
+//!   (invariant I1), so there is no concurrent-write hazard.
+//! - A `Release` atomic store to the length field always follows the buffer
+//!   write; the handler loads it with `Acquire`, ensuring it never sees a
+//!   partially-written buffer (invariant I2).
+//! - No Rust reference (`&` or `&mut`) to the buffer interior is ever
+//!   materialised while a raw-pointer write is in progress (invariant I4).
+//!
+//! # Thread safety
+//!
+//! `set_temp_stdin_path`, `clear_temp_stdin_path`, `set_term_message`, and
+//! `clear_term_message` must only be called from the main thread.  The
+//! signal handler itself runs asynchronously on whatever thread receives the
+//! signal, but invariant I1 ensures that does not create a data race.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

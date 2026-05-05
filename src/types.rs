@@ -1,53 +1,118 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Shared type definitions for jmake.
+//!
+//! This module is the single source of truth for the core data model.  It
+//! intentionally has no dependencies on other jmake modules so that the
+//! parser, evaluator, and executor can all import from here without creating
+//! cycles.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`Variable`] | A single named variable with value, flavor, and origin. |
+//! | [`Rule`] | One explicit, pattern, or suffix rule. |
+//! | [`MakeDatabase`] | Runtime aggregate of all rules, variables, and make state. |
+//! | [`ParsedLine`] | The discriminated-union output of the makefile parser. |
+//! | [`SpecialTarget`] | Enum of the special `.PHONY`, `.SUFFIXES`, … targets. |
+//!
+//! # Thread safety
+//!
+//! None of the types in this module implement `Sync` or `Send` on their own.
+//! [`MakeDatabase`] is used exclusively on the main thread by the evaluator;
+//! worker threads in `exec::parallel` receive already-resolved data and do
+//! not access the database directly.
 
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// How a variable was defined
+/// How a variable was defined.
+///
+/// Mirrors the origins reported by the GNU Make `$(origin)` function.  The
+/// evaluator uses this to implement precedence: `CommandLine` and `Override`
+/// variables cannot be superseded by `File` assignments.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarOrigin {
+    /// A built-in default value (e.g. `CC = cc`).
     Default,
+    /// Imported from the process environment at startup.
     Environment,
+    /// Defined in a makefile.
     File,
+    /// Supplied on the command line as `VAR=value`.
     CommandLine,
+    /// Defined with the `override` keyword in a makefile.
     Override,
-    /// Automatic variables ($@, $<, etc.) — variant matched in $(origin) expansion
-    /// but never directly constructed (auto vars are set via auto_vars HashMap).
+    /// Automatic variables (`$@`, `$<`, etc.) — the variant is matched in
+    /// `$(origin)` expansion but automatic variables are never stored in the
+    /// main variable table; they are passed as a temporary `HashMap` during
+    /// recipe expansion.
     #[allow(dead_code)]
     Automatic,
 }
 
-/// Variable flavor: recursive (=) or simple (:= / ::=)
+/// Variable assignment flavor, corresponding to the operator used.
+///
+/// The flavor determines when and how the variable's value is expanded:
+/// recursive flavors defer expansion until the variable is referenced, while
+/// simple flavors expand immediately at assignment time.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarFlavor {
+    /// `=`  — value is expanded lazily every time the variable is referenced.
     Recursive,
+    /// `:=` or `::=`  — value is expanded once at assignment time.
     Simple,
-    /// POSIX immediate assignment (:::=).
-    /// Like Simple, the value is immediately expanded at assignment time.
-    /// Unlike Simple, when `+=` is applied, the appended text is NOT immediately
-    /// expanded -- it is stored as raw text and evaluated lazily (recursively).
+    /// `:::=`  — POSIX immediate assignment.  Like `Simple`, the value is
+    /// expanded at assignment time, but when `+=` is subsequently applied the
+    /// appended text is stored raw (not immediately expanded).
     PosixSimple,
+    /// `+=`  — appends to the existing value.  Expansion semantics depend on
+    /// the current flavor of the variable being appended to.
     Append,
-    Conditional, // ?=
+    /// `?=`  — conditional assignment; sets the variable only if it is not
+    /// already defined.
+    Conditional,
+    /// `!=`  — shell assignment; the value is run through `/bin/sh` and the
+    /// output (trailing newlines stripped) becomes the variable's value.
     Shell,       // !=
 }
 
+/// A single makefile variable binding.
+///
+/// Variables are stored in [`MakeDatabase::variables`] and in the
+/// per-target variable tables inside each [`Rule`].  A `Variable` is
+/// always associated with a name by its containing collection; the struct
+/// itself holds only the value and metadata.
 #[derive(Debug, Clone)]
 pub struct Variable {
+    /// The raw (possibly unexpanded) value string.
     pub value: String,
+    /// How the value should be expanded when referenced.
     pub flavor: VarFlavor,
+    /// Where the variable came from (affects override precedence).
     pub origin: VarOrigin,
-    pub export: Option<bool>, // None = inherit, Some(true) = export, Some(false) = unexport
-    /// When true, this target-specific variable is private and NOT inherited by prerequisites.
+    /// Export status for child processes.
+    /// `None` means inherit the global default; `Some(true)` forces export;
+    /// `Some(false)` forces suppression even if the global default is to export.
+    pub export: Option<bool>,
+    /// When `true`, this target-specific variable is *private*: it is set for
+    /// the target but is **not** inherited by its prerequisites.
     pub is_private: bool,
-    /// The makefile file path where this variable was defined (empty if unknown/built-in).
+    /// Path of the makefile that defined this variable (empty for built-ins).
     pub source_file: String,
-    /// The line number in the makefile where this variable was defined (0 if unknown).
+    /// Line number in `source_file` where this variable was defined (`0` if unknown).
     pub source_line: usize,
 }
 
 impl Variable {
+    /// Create a new [`Variable`] with the given value, flavor, and origin.
+    ///
+    /// Export status defaults to `None` (inherit global default), `is_private`
+    /// to `false`, and source location to unknown (`""` / `0`).
     pub fn new(value: String, flavor: VarFlavor, origin: VarOrigin) -> Self {
         Variable {
             value,
@@ -61,7 +126,20 @@ impl Variable {
     }
 }
 
-/// A single rule (explicit or pattern)
+/// A single makefile rule — explicit, pattern, or suffix.
+///
+/// One `Rule` object represents one `target: prerequisites` stanza in the
+/// parsed makefile.  The evaluator's `register_rule` function inserts rules
+/// into [`MakeDatabase::rules`] (for explicit targets) or
+/// [`MakeDatabase::pattern_rules`] (for `%`-pattern rules).
+///
+/// # Second expansion
+///
+/// When `.SECONDEXPANSION` is active and the prerequisite list contains `$`,
+/// the raw prerequisite text is preserved in `second_expansion_prereqs` and
+/// re-expanded at build time with automatic variables in scope.  The
+/// `prerequisites` field still holds the first-expansion result and is used
+/// for initial dependency analysis.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub targets: Vec<String>,
@@ -107,6 +185,10 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Create a new, empty [`Rule`] with all fields zeroed / empty.
+    ///
+    /// Callers are expected to fill in at minimum `targets` before registering
+    /// the rule with the database.
     pub fn new() -> Self {
         Rule {
             targets: Vec::new(),
@@ -129,7 +211,13 @@ impl Rule {
     }
 }
 
-/// Special targets that modify make's behavior
+/// Special targets that modify jmake's behavior.
+///
+/// When the evaluator encounters a rule whose target name begins with `.`,
+/// it checks this enum.  Special targets with no prerequisites act as
+/// global mode switches (e.g., `.PHONY:` with explicit targets, `.POSIX:`).
+///
+/// The set of recognized names matches GNU Make 4.4.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpecialTarget {
     Phony,
@@ -152,6 +240,19 @@ pub enum SpecialTarget {
 }
 
 impl SpecialTarget {
+    /// Parse a target name string into a [`SpecialTarget`] variant.
+    ///
+    /// Returns `None` for any name that is not a recognised special target,
+    /// including names that start with `.` but are not in the list (e.g.
+    /// `.hidden` is a plain file target, not a special target).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use jmake::types::SpecialTarget;
+    /// assert_eq!(SpecialTarget::from_str(".PHONY"), Some(SpecialTarget::Phony));
+    /// assert_eq!(SpecialTarget::from_str(".hidden"), None);
+    /// ```
     pub fn from_str(s: &str) -> Option<SpecialTarget> {
         match s {
             ".PHONY" => Some(SpecialTarget::Phony),
@@ -176,7 +277,11 @@ impl SpecialTarget {
     }
 }
 
-/// Conditional directive type
+/// The kind of a conditional directive.
+///
+/// Used by [`ParsedLine::Conditional`] and [`ParsedLine::Else`] to carry the
+/// condition that was parsed so the evaluator can evaluate it against the
+/// current variable database.
 #[derive(Debug, Clone)]
 pub enum ConditionalKind {
     Ifdef(String),
@@ -185,7 +290,15 @@ pub enum ConditionalKind {
     Ifneq(String, String),
 }
 
-/// Parsed line from a Makefile
+/// The result of parsing a single logical line from a makefile.
+///
+/// The parser produces one `ParsedLine` per logical line (after backslash
+/// continuation has been collapsed).  The evaluator ([`eval::MakeState`])
+/// then consumes these values to build the [`MakeDatabase`].
+///
+/// Most variants carry all the data the evaluator needs inline.  The
+/// [`ParsedLine::Rule`] variant carries a [`Rule`] that may still need its
+/// recipe lines collected from subsequent [`ParsedLine::Recipe`] lines.
 #[derive(Debug, Clone)]
 pub enum ParsedLine {
     Rule(Rule),
@@ -246,8 +359,19 @@ pub enum ParsedLine {
     FatalError(String),
 }
 
-/// A pattern-specific variable assignment entry.
-/// E.g. `%.o: CFLAGS += -Wall` produces PatternSpecificVar { pattern: "%.o", var_name: "CFLAGS", ... }
+/// A pattern-specific variable assignment.
+///
+/// Entries like `%.o: CFLAGS += -Wall` are stored here and applied to any
+/// target whose name matches `pattern` before its recipe is executed.  The
+/// evaluator checks [`MakeDatabase::pattern_specific_vars`] during target
+/// setup in the executor.
+///
+/// # Example
+///
+/// `%.o: CFLAGS += -Wall` produces:
+/// ```text
+/// PatternSpecificVar { pattern: "%.o", var_name: "CFLAGS", … }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PatternSpecificVar {
     pub pattern: String,
@@ -256,7 +380,24 @@ pub struct PatternSpecificVar {
     pub is_override: bool,
 }
 
-/// Database of all rules, variables, etc.
+/// The runtime database of all rules, variables, and global make state.
+///
+/// [`MakeDatabase`] is populated by the evaluator as it reads each makefile
+/// and then consulted by the executor when building targets.  It is the
+/// central data structure that connects parsing, evaluation, and execution.
+///
+/// Rules are stored in two separate tables:
+///
+/// - `rules` — explicit rules keyed by target name (using an [`IndexMap`] to
+///   preserve insertion order for correct `.DEFAULT_GOAL` detection).
+/// - `pattern_rules` — `%`-pattern rules in the order they were defined;
+///   the executor searches them last-to-first (most-recently-defined wins).
+///
+/// # Thread safety
+///
+/// [`MakeDatabase`] is accessed only from the main thread.  Worker threads in
+/// `exec::parallel` receive resolved [`TargetPlan`]s and do not hold a
+/// reference to the database.
 #[derive(Debug)]
 pub struct MakeDatabase {
     pub rules: IndexMap<String, Vec<Rule>>,
@@ -308,6 +449,8 @@ pub struct MakeDatabase {
 }
 
 impl MakeDatabase {
+    /// Create a new, empty [`MakeDatabase`] pre-populated with the standard
+    /// `.SUFFIXES` list from POSIX Make.
     pub fn new() -> Self {
         MakeDatabase {
             rules: IndexMap::new(),
@@ -347,19 +490,34 @@ impl MakeDatabase {
         }
     }
 
-    /// Check if a name is explicitly mentioned in the makefile (either as a target
-    /// or as a prerequisite of a non-pattern rule, or as a literal prereq in a pattern rule).
+    /// Returns `true` if `name` was explicitly mentioned in the makefile.
+    ///
+    /// "Explicitly mentioned" means the name appears as:
+    /// - A target of an explicit (non-pattern) rule, OR
+    /// - A prerequisite of an explicit rule, OR
+    /// - A literal (non-`%`) prerequisite of a pattern rule.
+    ///
+    /// Targets that exist only because an implicit rule matched them are NOT
+    /// considered explicitly mentioned, and remain eligible for intermediate
+    /// file cleanup.
     pub fn is_explicitly_mentioned(&self, name: &str) -> bool {
         self.explicitly_mentioned.contains(name)
             || self.rules.contains_key(name)
     }
 
+    /// Returns `true` if `target` is listed under `.PHONY`.
     pub fn is_phony(&self, target: &str) -> bool {
         self.special_targets
             .get(&SpecialTarget::Phony)
             .map_or(false, |set| set.contains(target))
     }
 
+    /// Returns `true` if `target` is precious (should not be deleted on error).
+    ///
+    /// A target is precious when:
+    /// - `.PRECIOUS:` with no prerequisites was seen (all targets are precious), OR
+    /// - The target name is listed explicitly under `.PRECIOUS:`, OR
+    /// - The target name matches a `%`-pattern listed under `.PRECIOUS:`.
     pub fn is_precious(&self, target: &str) -> bool {
         let set = match self.special_targets.get(&SpecialTarget::Precious) {
             Some(s) => s,
@@ -387,6 +545,7 @@ impl MakeDatabase {
         false
     }
 
+    /// Returns `true` if `target` was explicitly listed under `.INTERMEDIATE:`.
     pub fn is_intermediate(&self, target: &str) -> bool {
         // Explicitly listed as .INTERMEDIATE: <name>
         if self.special_targets
@@ -398,6 +557,10 @@ impl MakeDatabase {
         false
     }
 
+    /// Returns `true` if `target` is secondary (keeps the file but does not
+    /// consider it a real prerequisite for re-make purposes).
+    ///
+    /// `.SECONDARY:` with no prerequisites marks **all** targets as secondary.
     pub fn is_secondary(&self, target: &str) -> bool {
         let set = match self.special_targets.get(&SpecialTarget::Secondary) {
             Some(s) => s,
@@ -410,6 +573,15 @@ impl MakeDatabase {
         set.contains(target)
     }
 
+    /// Returns `true` if `target` should be treated as not-intermediate.
+    ///
+    /// Evaluates the full priority matrix between `.NOTINTERMEDIATE`,
+    /// `.INTERMEDIATE`, and `.SECONDARY` as specified by GNU Make 4.4:
+    ///
+    /// 1. An explicit name in `.INTERMEDIATE:` always wins (returns `false`).
+    /// 2. An explicit name in `.SECONDARY:` (non-empty set) beats a global or
+    ///    pattern `.NOTINTERMEDIATE:` but NOT an explicit-name `.NOTINTERMEDIATE:`.
+    /// 3. `.NOTINTERMEDIATE:` (global or pattern) otherwise wins.
     pub fn is_notintermediate(&self, target: &str) -> bool {
         // Check if explicitly marked as .NOTINTERMEDIATE
         // .NOTINTERMEDIATE with no prereqs means ALL targets are not intermediate.
@@ -479,6 +651,10 @@ impl MakeDatabase {
         true
     }
 
+    /// Returns `true` if `target` has silent recipe execution.
+    ///
+    /// A target is silent when `.SILENT:` has no prerequisites (all targets
+    /// are silent) or when `target` appears in the `.SILENT:` prerequisite list.
     pub fn is_silent_target(&self, target: &str) -> bool {
         self.special_targets
             .get(&SpecialTarget::Silent)
