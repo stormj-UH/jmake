@@ -192,3 +192,1154 @@ fn test_wildcard_no_prefix() {
         stdout
     );
 }
+
+// ── Helper for inline TempDir-based tests ─────────────────────────────────
+
+/// Run jmake on a Makefile written to `dir`, optionally requesting `target`.
+/// Returns (stdout, stderr, success).
+fn run_inline(dir: &std::path::Path, target: Option<&str>) -> (String, String, bool) {
+    let jmake = jmake_bin();
+    let mut cmd = Command::new(&jmake);
+    cmd.current_dir(dir);
+    cmd.env("JMAKE_TEST_MODE", "1");
+    if let Some(t) = target {
+        cmd.arg(t);
+    }
+    let out = cmd.output().expect("failed to run jmake");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
+/// Write `content` as `Makefile` in `dir` and run jmake on `target`.
+fn mk_run(dir: &std::path::Path, content: &str, target: &str) -> (String, String, bool) {
+    std::fs::write(dir.join("Makefile"), content).unwrap();
+    run_inline(dir, Some(target))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Variable flavors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Recursive variable (`=`) re-expands at reference time: a later redefinition
+/// of X is visible when the recursive variable is used.
+#[test]
+fn test_var_recursive_lazy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+X = hello
+REC = $(X) world
+X = goodbye
+all:
+	@echo "$(REC)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "goodbye world");
+}
+
+/// Simple variable (`:=`) expands at assignment time; later changes to X are
+/// invisible to Y.
+#[test]
+fn test_var_simple_immediate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+X = hello
+Y := $(X) world
+X = goodbye
+all:
+	@echo "$(Y)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "hello world");
+}
+
+/// `?=` (conditional assignment) only sets the variable if it is not already
+/// defined.
+#[test]
+fn test_var_conditional_assign() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+ALREADY := set
+ALREADY ?= overwrite
+FRESH ?= new_value
+all:
+	@echo "a=$(ALREADY)"
+	@echo "f=$(FRESH)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("a=set"), "got: {}", out);
+    assert!(out.contains("f=new_value"), "got: {}", out);
+}
+
+/// `+=` appends to the existing value, preserving flavor: a recursive base
+/// means the appended text is also lazily expanded.
+#[test]
+fn test_var_append() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+LATE = defined_late
+REC = hello
+REC += $(LATE)
+
+SIM := foo
+SIM += bar
+all:
+	@echo "rec=$(REC)"
+	@echo "sim=$(SIM)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("rec=hello defined_late"), "got: {}", out);
+    assert!(out.contains("sim=foo bar"), "got: {}", out);
+}
+
+/// `::=` (POSIX simple assignment) expands immediately, same as `:=`.
+#[test]
+fn test_var_posix_simple_assign() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+X = world
+Y ::= hello $(X)
+X = changed
+all:
+	@echo "$(Y)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "hello world");
+}
+
+/// `:::=` (GNU immediate) also expands at assignment time.
+#[test]
+fn test_var_gnu_immediate_assign() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+X = first
+Z :::= $(X) end
+X = second
+all:
+	@echo "$(Z)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "first end");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Automatic variables
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `$@` is the target name, `$<` is the first prerequisite, `$^` is all
+/// prerequisites deduplicated, `$+` keeps duplicates.
+#[test]
+fn test_auto_vars_basic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: a.txt b.txt a.txt
+	@echo "at=$@"
+	@echo "lt=$<"
+	@echo "ct=$^"
+	@echo "pt=$+"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("at=all"), "got: {}", out);
+    assert!(out.contains("lt=a.txt"), "got: {}", out);
+    assert!(out.contains("ct=a.txt b.txt"), "got: {}", out);
+    assert!(out.contains("pt=a.txt b.txt a.txt"), "got: {}", out);
+}
+
+/// `$*` is the pattern stem in a pattern rule.
+#[test]
+fn test_auto_var_stem() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("foo.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: foo.o
+
+%.o: %.c
+	@echo "stem=$*"
+	@echo "target=$@"
+	@echo "src=$<"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("stem=foo"), "got: {}", out);
+    assert!(out.contains("target=foo.o"), "got: {}", out);
+    assert!(out.contains("src=foo.c"), "got: {}", out);
+}
+
+/// `$(@D)` / `$(@F)` give the directory and file parts of `$@`.
+#[test]
+fn test_auto_var_at_df() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("obj").join("sub")).unwrap();
+    std::fs::write(dir.path().join("foo.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: obj/sub/foo.o
+
+obj/sub/foo.o: foo.c
+	@echo "atD=$(@D)"
+	@echo "atF=$(@F)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("atD=obj/sub"), "got: {}", out);
+    assert!(out.contains("atF=foo.o"), "got: {}", out);
+}
+
+/// `$(<D)` / `$(<F)` give the directory and file parts of `$<`.
+#[test]
+fn test_auto_var_lt_df() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("foo.c"), "").unwrap();
+    std::fs::write(dir.path().join("extra.h"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: foo.o
+
+foo.o: src/foo.c extra.h
+	@echo "ltD=$(<D)"
+	@echo "ltF=$(<F)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("ltD=src"), "got: {}", out);
+    assert!(out.contains("ltF=foo.c"), "got: {}", out);
+}
+
+/// `$(*D)` / `$(*F)` give the directory and file parts of the stem `$*` when
+/// the stem itself contains a slash.
+#[test]
+fn test_auto_var_star_df() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("src").join("sub")).unwrap();
+    std::fs::write(dir.path().join("src").join("sub").join("bar.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: src/sub/bar.o
+
+%.o: %.c
+	@echo "stD=$(*D)"
+	@echo "stF=$(*F)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("stD=src/sub"), "got: {}", out);
+    assert!(out.contains("stF=bar"), "got: {}", out);
+}
+
+/// `$?` expands to the list of prerequisites newer than the target.
+#[test]
+fn test_auto_var_question_mark() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Create a.txt, b.txt, c.txt — then create "all" as a file older than b.txt.
+    std::fs::write(dir.path().join("a.txt"), "").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "").unwrap();
+    std::fs::write(dir.path().join("c.txt"), "").unwrap();
+    // Make "all" older than everything by setting its mtime in the past.
+    std::fs::write(dir.path().join("all"), "").unwrap();
+    let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+    filetime::set_file_mtime(dir.path().join("all"), filetime::FileTime::from_system_time(old_time)).unwrap();
+    // Only touch b.txt to be newer.
+    filetime::set_file_mtime(dir.path().join("a.txt"), filetime::FileTime::from_system_time(old_time)).unwrap();
+    filetime::set_file_mtime(dir.path().join("c.txt"), filetime::FileTime::from_system_time(old_time)).unwrap();
+
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: a.txt b.txt c.txt
+	@echo "newer=$?"
+	@touch all
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("newer=b.txt"), "expected only b.txt in $?, got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Pattern rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A simple `%.o: %.c` pattern rule with stem substitution.
+#[test]
+fn test_pattern_rule_basic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("alpha.c"), "").unwrap();
+    std::fs::write(dir.path().join("beta.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all: alpha.o beta.o
+
+%.o: %.c
+	@echo "built $@ from $< (stem=$*)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("built alpha.o from alpha.c (stem=alpha)"), "got: {}", out);
+    assert!(out.contains("built beta.o from beta.c (stem=beta)"), "got: {}", out);
+}
+
+/// Static pattern rules: `$(OBJECTS): %.o: %.c` restricts which targets the
+/// pattern applies to.
+#[test]
+fn test_static_pattern_rule() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("foo.c"), "").unwrap();
+    std::fs::write(dir.path().join("bar.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+OBJECTS := foo.o bar.o
+all: $(OBJECTS)
+
+$(OBJECTS): %.o: %.c
+	@echo "static: $@ from $<"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("static: foo.o from foo.c"), "got: {}", out);
+    assert!(out.contains("static: bar.o from bar.c"), "got: {}", out);
+}
+
+/// Pattern-specific variables: `%.debug.o: CFLAGS += -g`.
+#[test]
+fn test_pattern_specific_variables() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("foo.c"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+CFLAGS := -Wall
+%.debug.o: CFLAGS += -g
+%.release.o: CFLAGS := -O2
+all: foo.debug.o foo.release.o
+
+foo.debug.o: foo.c
+	@echo "debug CFLAGS=$(CFLAGS)"
+
+foo.release.o: foo.c
+	@echo "release CFLAGS=$(CFLAGS)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("debug CFLAGS=-Wall -g"), "got: {}", out);
+    assert!(out.contains("release CFLAGS=-O2"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. String functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_fn_subst() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(subst e,3,hello world)"
+	@echo "$(subst oo,0,foobar)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("h3llo world"), "got: {}", out);
+    assert!(out.contains("f0bar"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_patsubst() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(patsubst %.c,%.o,foo.c bar.h baz.c)"
+	@echo "$(patsubst %,prefix_%,a b c)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("foo.o bar.h baz.o"), "got: {}", out);
+    assert!(out.contains("prefix_a prefix_b prefix_c"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_strip() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(strip   foo   bar   baz   )"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "foo bar baz");
+}
+
+#[test]
+fn test_fn_findstring() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "found=$(findstring bar,foo bar baz)"
+	@echo "miss=$(findstring xyz,foo bar baz)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("found=bar"), "got: {}", out);
+    assert!(out.contains("miss="), "got: {}", out);
+}
+
+#[test]
+fn test_fn_filter_and_filter_out() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+FILES := a.c b.h c.o d.c e.h f.s
+all:
+	@echo "in=$(filter %.c %.h,$(FILES))"
+	@echo "out=$(filter-out %.o %.s,$(FILES))"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("in=a.c b.h d.c e.h"), "got: {}", out);
+    assert!(out.contains("out=a.c b.h d.c e.h"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_sort() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(sort foo bar baz foo bar)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "bar baz foo");
+}
+
+#[test]
+fn test_fn_word_wordlist_words() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+LIST := alpha beta gamma delta
+all:
+	@echo "w1=$(word 1,$(LIST))"
+	@echo "w3=$(word 3,$(LIST))"
+	@echo "w99=$(word 99,$(LIST))"
+	@echo "wl=$(wordlist 2,3,$(LIST))"
+	@echo "ws=$(words $(LIST))"
+	@echo "fw=$(firstword $(LIST))"
+	@echo "lw=$(lastword $(LIST))"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("w1=alpha"), "got: {}", out);
+    assert!(out.contains("w3=gamma"), "got: {}", out);
+    assert!(out.contains("w99="), "got: {}", out);
+    assert!(out.contains("wl=beta gamma"), "got: {}", out);
+    assert!(out.contains("ws=4"), "got: {}", out);
+    assert!(out.contains("fw=alpha"), "got: {}", out);
+    assert!(out.contains("lw=delta"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. File name functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_fn_dir_notdir() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "dir=$(dir src/foo.c bar.c)"
+	@echo "notdir=$(notdir src/foo.c bar.c)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("dir=src/ ./"), "got: {}", out);
+    assert!(out.contains("notdir=foo.c bar.c"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_suffix_basename() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "suf=$(suffix foo.c bar.h baz)"
+	@echo "suf2=$(suffix foo.tar.gz)"
+	@echo "base=$(basename src/foo.c bar.h)"
+	@echo "base2=$(basename nosuffix)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("suf=.c .h"), "got: {}", out);
+    assert!(out.contains("suf2=.gz"), "got: {}", out);
+    assert!(out.contains("base=src/foo bar"), "got: {}", out);
+    assert!(out.contains("base2=nosuffix"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_addsuffix_addprefix() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "suf=$(addsuffix .o,foo bar baz)"
+	@echo "pre=$(addprefix src/,foo.c bar.c)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("suf=foo.o bar.o baz.o"), "got: {}", out);
+    assert!(out.contains("pre=src/foo.c src/bar.c"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_join() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(join a b c,1 2 3)"
+	@echo "$(join a b c,1 2)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("a1 b2 c3"), "got: {}", out);
+    assert!(out.contains("a1 b2 c"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_abspath() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(abspath /foo/../bar/./baz)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "/bar/baz");
+}
+
+/// `$(subst)` substitution reference shorthand: `$(var:.o=.c)`.
+#[test]
+fn test_substitution_reference() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+OBJS := foo.o bar.o baz.o
+SRCS := $(OBJS:.o=.c)
+DEPS := $(OBJS:%.o=%.d)
+all:
+	@echo "srcs=$(SRCS)"
+	@echo "deps=$(DEPS)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("srcs=foo.c bar.c baz.c"), "got: {}", out);
+    assert!(out.contains("deps=foo.d bar.d baz.d"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Conditional functions: $(if), $(or), $(and)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_fn_if_or_and() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+TRUTHY := yes
+EMPTY :=
+all:
+	@echo "ift=$(if $(TRUTHY),then,else)"
+	@echo "iff=$(if $(EMPTY),then,else)"
+	@echo "or=$(or $(EMPTY),$(TRUTHY),other)"
+	@echo "and1=$(and $(TRUTHY),done)"
+	@echo "and0=$(and $(EMPTY),done)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("ift=then"), "got: {}", out);
+    assert!(out.contains("iff=else"), "got: {}", out);
+    assert!(out.contains("or=yes"), "got: {}", out);
+    assert!(out.contains("and1=done"), "got: {}", out);
+    assert!(out.contains("and0="), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Control functions: $(foreach), $(call)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_fn_foreach() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(foreach x,a b c,[$(x)])"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "[a] [b] [c]");
+}
+
+#[test]
+fn test_fn_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+double = $1 $1
+wrap   = [$1]
+all:
+	@echo "$(call double,hello)"
+	@echo "$(call wrap,world)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("hello hello"), "got: {}", out);
+    assert!(out.contains("[world]"), "got: {}", out);
+}
+
+#[test]
+fn test_fn_eval() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+$(eval DYNAMIC := eval_works)
+all:
+	@echo "$(DYNAMIC)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "eval_works");
+}
+
+/// `$(flavor)` reports how a variable was defined.
+#[test]
+fn test_fn_flavor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+REC = recursive_value
+SIM := simple_value
+all:
+	@echo "rec=$(flavor REC)"
+	@echo "sim=$(flavor SIM)"
+	@echo "und=$(flavor TOTALLY_UNDEFINED_ZZZ)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("rec=recursive"), "got: {}", out);
+    assert!(out.contains("sim=simple"), "got: {}", out);
+    assert!(out.contains("und=undefined"), "got: {}", out);
+}
+
+/// `$(origin)` reports where a variable was defined.
+#[test]
+fn test_fn_origin() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+FILE_VAR := defined_here
+all:
+	@echo "file=$(origin FILE_VAR)"
+	@echo "env=$(origin PATH)"
+	@echo "undef=$(origin TOTALLY_UNDEFINED_ZZZ)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("file=file"), "got: {}", out);
+    assert!(out.contains("env=environment"), "got: {}", out);
+    assert!(out.contains("undef=undefined"), "got: {}", out);
+}
+
+/// `$(shell)` runs a command and returns its output with newlines replaced by
+/// spaces and the trailing newline stripped.
+#[test]
+fn test_fn_shell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+ECHOED := $(shell printf 'hello_from_shell')
+MULTI  := $(shell printf 'line1\nline2\nline3')
+all:
+	@echo "e=$(ECHOED)"
+	@echo "m=$(MULTI)"
+	@echo "i=$(shell printf 'inline')"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("e=hello_from_shell"), "got: {}", out);
+    assert!(out.contains("m=line1 line2 line3"), "got: {}", out);
+    assert!(out.contains("i=inline"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Conditionals: ifeq / ifneq / ifdef / ifndef
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_conditional_ifeq_ifneq() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+A := hello
+B := world
+ifeq ($(A),hello)
+R1 := a_is_hello
+else
+R1 := a_not_hello
+endif
+
+ifneq ($(A),$(B))
+R2 := a_ne_b
+else
+R2 := a_eq_b
+endif
+all:
+	@echo "$(R1)"
+	@echo "$(R2)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("a_is_hello"), "got: {}", out);
+    assert!(out.contains("a_ne_b"), "got: {}", out);
+}
+
+#[test]
+fn test_conditional_ifdef_ifndef() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+DEFINED := yes
+EMPTY :=
+ifdef DEFINED
+R1 := defined
+else
+R1 := not_defined
+endif
+
+ifndef EMPTY
+R2 := empty_undefined
+else
+R2 := empty_defined
+endif
+all:
+	@echo "$(R1)"
+	@echo "$(R2)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("defined"), "got: {}", out);
+    // NOTE: ifdef checks for non-empty value, not just existence.
+    // EMPTY is defined but empty, so ifndef EMPTY is true.
+    assert!(out.contains("empty_undefined"), "got: {}", out);
+}
+
+#[test]
+fn test_conditional_quoting_styles() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+X := hello world
+
+ifeq ($(X),hello world)
+R1 := paren_match
+else
+R1 := paren_miss
+endif
+
+ifeq "$(X)" "hello world"
+R2 := dquote_match
+else
+R2 := dquote_miss
+endif
+
+ifeq '$(X)' 'hello world'
+R3 := squote_match
+else
+R3 := squote_miss
+endif
+all:
+	@echo "$(R1) $(R2) $(R3)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "paren_match dquote_match squote_match");
+}
+
+#[test]
+fn test_conditional_nested() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+A := yes
+B := no
+ifeq ($(A),yes)
+  ifeq ($(B),yes)
+    RESULT := both
+  else
+    RESULT := only_a
+  endif
+else
+  RESULT := neither
+endif
+all:
+	@echo "$(RESULT)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "only_a");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Include directives
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_include_basic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("vars.mk"), "INCLUDED := from_vars_mk\n").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+include vars.mk
+all:
+	@echo "$(INCLUDED)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "from_vars_mk");
+}
+
+/// `-include` (and `sinclude`) must silently ignore missing files.
+#[test]
+fn test_include_missing_ignored() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+-include does_not_exist.mk
+sinclude also_missing.mk
+all:
+	@echo "ok"
+"#, "all");
+    assert!(ok, "jmake failed (stderr: {})", err);
+    assert_eq!(out.trim(), "ok");
+}
+
+/// `include` with a variable-expanded path.
+#[test]
+fn test_include_variable_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.mk"), "CFG := cfg_value\n").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+INC := config.mk
+include $(INC)
+all:
+	@echo "$(CFG)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "cfg_value");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. Special targets
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `.PHONY` forces a target to always run even when a file with the same name
+/// exists.
+#[test]
+fn test_special_phony() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Create a file named "clean" so it would normally be considered up-to-date.
+    std::fs::write(dir.path().join("clean"), "old").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+.PHONY: clean
+clean:
+	@echo "cleaning"
+"#, "clean");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "cleaning");
+}
+
+/// `.DELETE_ON_ERROR` removes the target file when its recipe fails.
+#[test]
+fn test_special_delete_on_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (_, _, ok) = mk_run(dir.path(), r#"
+.DELETE_ON_ERROR:
+broken.txt:
+	@printf 'partial\n' > $@
+	@exit 1
+all: broken.txt
+"#, "all");
+    // Build must fail.
+    assert!(!ok, "expected failure but succeeded");
+    // The file must have been removed.
+    assert!(!dir.path().join("broken.txt").exists(),
+        ".DELETE_ON_ERROR: broken.txt should have been removed");
+}
+
+/// `.PRECIOUS` prevents the target from being deleted when the recipe fails.
+#[test]
+fn test_special_precious() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (_, _, ok) = mk_run(dir.path(), r#"
+.PRECIOUS: precious.txt
+precious.txt:
+	@printf 'partial\n' > $@
+	@exit 1
+all: precious.txt
+"#, "all");
+    // Build must fail.
+    assert!(!ok, "expected failure but succeeded");
+    // But the file must still exist (not deleted).
+    assert!(dir.path().join("precious.txt").exists(),
+        ".PRECIOUS: precious.txt should have been kept");
+}
+
+/// `.SECONDARY` keeps an intermediate file that would otherwise be removed
+/// after it is no longer needed.
+#[test]
+fn test_special_secondary() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+.SECONDARY: middle.txt
+all: final.txt
+final.txt: middle.txt
+	@cp $< $@
+middle.txt:
+	@printf 'data\n' > $@
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    let _ = out;
+    let _ = err;
+    // Both files must exist after a successful build.
+    assert!(dir.path().join("final.txt").exists(), "final.txt missing");
+    assert!(dir.path().join("middle.txt").exists(),
+        ".SECONDARY: middle.txt should not have been deleted");
+}
+
+/// `.ONESHELL` makes all recipe lines for a target run in a single shell
+/// invocation, so shell variables set in one line are visible in subsequent
+/// lines.
+#[test]
+fn test_special_oneshell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+.ONESHELL:
+all:
+	@x=hello
+	@echo "$$x"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "hello");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. VPATH / vpath
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `VPATH` variable directs make to search additional directories for
+/// prerequisites.
+#[test]
+fn test_vpath_variable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("bar.txt"), "bar content\n").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+VPATH = src
+all: bar.txt
+	@echo "found: $<"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("found: src/bar.txt"), "got: {}", out);
+}
+
+/// The `vpath` directive restricts directory search to files matching a
+/// pattern.
+#[test]
+fn test_vpath_directive() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let hdrs = dir.path().join("headers");
+    std::fs::create_dir_all(&hdrs).unwrap();
+    std::fs::write(hdrs.join("foo.h"), "/* header */\n").unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+vpath %.h headers
+all: foo.h
+	@echo "header: $<"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("header: headers/foo.h"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Order-only prerequisites
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Prerequisites listed after `|` are order-only: make ensures they are built
+/// before the target but does not treat them as inputs that trigger a rebuild.
+#[test]
+fn test_order_only_prereqs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+.PHONY: all ensure_dir
+all: result.txt | ensure_dir
+	@echo "built"
+
+result.txt:
+	@printf 'done\n' > $@
+
+ensure_dir:
+	@echo "order_only_ran"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    // The order-only prerequisite `ensure_dir` must have run.
+    assert!(out.contains("order_only_ran"), "got: {}", out);
+    assert!(out.contains("built"), "got: {}", out);
+    // Order-only prereqs must NOT appear in $^.
+    let (out2, err2, ok2) = mk_run(dir.path(), r#"
+.PHONY: all oo
+all: a.txt | oo
+	@echo "caret=$^"
+a.txt:
+	@touch $@
+oo:
+	@echo "oo_ran"
+"#, "all");
+    assert!(ok2, "jmake failed: {}", err2);
+    // $^ should list a.txt but NOT oo; find the caret= line and verify it
+    assert!(out2.contains("caret=a.txt"), "got: {}", out2);
+    let caret_line = out2.lines().find(|l| l.starts_with("caret=")).unwrap_or("");
+    assert!(!caret_line.contains("oo"),
+        "order-only prereq oo appeared in $^, caret line: {:?}", caret_line);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. Multi-line variables (define / endef)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `define`/`endef` defines a multi-line variable; `$(strip ...)` collapses
+/// the embedded newlines into a single space-separated string.
+#[test]
+fn test_define_endef_strip() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+define MULTI
+alpha
+beta
+gamma
+endef
+SINGLE := $(strip $(MULTI))
+all:
+	@echo "$(SINGLE)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "alpha beta gamma");
+}
+
+/// A `define`d variable used as a recipe expands each line as a separate
+/// recipe command.
+#[test]
+fn test_define_as_recipe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+define GREET
+@echo "Hello"
+@echo "World"
+endef
+all:
+	$(GREET)
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("Hello"), "got: {}", out);
+    assert!(out.contains("World"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Export / unexport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `export VAR` makes the variable available in the recipe shell environment.
+#[test]
+fn test_export_to_shell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+export MY_EXPORTED = hello_exported
+MY_UNEXPORTED = not_exported
+all:
+	@echo "exp=$${MY_EXPORTED}"
+	@echo "unexp=$${MY_UNEXPORTED:-absent}"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("exp=hello_exported"), "got: {}", out);
+    assert!(out.contains("unexp=absent"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. Escaped characters
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `$$` in a recipe expands to a single literal `$` for the shell.
+#[test]
+fn test_escaped_dollar() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "dollar=$$"
+	@echo "two=$$$$"
+"#, "all");
+    // $$  -> shell sees $  (PID variable, but we only test the outer $)
+    // $$$$ -> shell sees $$, which is the shell PID
+    // We just verify the recipe ran without error and produced output.
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("dollar="), "got: {}", out);
+    assert!(out.contains("two="), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. $(eval) with $(foreach) — regression for dynamic rule generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Uses $(foreach) + $(eval) + $(call) to dynamically define per-library
+/// variables, which is a common real-world pattern.
+#[test]
+fn test_eval_foreach_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+LIBS := foo bar baz
+define make_lib_var
+$(1)_LIB := lib$(1).a
+endef
+$(foreach lib,$(LIBS),$(eval $(call make_lib_var,$(lib))))
+all:
+	@echo "foo=$(foo_LIB)"
+	@echo "bar=$(bar_LIB)"
+	@echo "baz=$(baz_LIB)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("foo=libfoo.a"), "got: {}", out);
+    assert!(out.contains("bar=libbar.a"), "got: {}", out);
+    assert!(out.contains("baz=libbaz.a"), "got: {}", out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. Multiple patterns and edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `$(patsubst)` with a pattern that has no `%` acts as a literal word
+/// replacement.
+#[test]
+fn test_patsubst_no_percent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+all:
+	@echo "$(patsubst foo,bar,foo baz foo)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "bar baz bar");
+}
+
+/// `$(sort)` deduplicates and sorts a list, useful for combining lists.
+#[test]
+fn test_sort_dedup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+A := c b a
+B := a d b
+all:
+	@echo "$(sort $(A) $(B))"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "a b c d");
+}
+
+/// Computed variable names: `$($(VAR))` looks up a variable whose name is
+/// given by the value of VAR.
+#[test]
+fn test_computed_variable_name() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+WHICH := COLOR
+COLOR := blue
+all:
+	@echo "$($(WHICH))"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "blue");
+}
+
+/// Recursive `$(call)` with multiple arguments.
+#[test]
+fn test_call_multi_arg() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), r#"
+join3 = $1-$2-$3
+all:
+	@echo "$(call join3,alpha,beta,gamma)"
+"#, "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "alpha-beta-gamma");
+}
+
+/// `$(info ...)` prints to stdout; `$(warning ...)` prints to stderr.
+#[test]
+fn test_fn_info_warning() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"), r#"
+$(info info_message)
+$(warning warn_message)
+all:
+	@echo "recipe"
+"#).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .arg("all")
+        .output()
+        .expect("run jmake");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "jmake failed: {}", stderr);
+    assert!(stdout.contains("info_message"), "stdout: {}", stdout);
+    assert!(stderr.contains("warn_message"), "stderr: {}", stderr);
+    assert!(stdout.contains("recipe"), "stdout: {}", stdout);
+}
