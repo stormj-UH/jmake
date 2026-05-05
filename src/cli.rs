@@ -38,6 +38,8 @@
 use std::env;
 use std::path::PathBuf;
 
+use crate::types::JobCount;
+
 /// Parsed command-line arguments for jmake.
 ///
 /// Every flag from the command line and from `MAKEFLAGS` / `GNUMAKEFLAGS` ends
@@ -55,8 +57,8 @@ pub struct MakeArgs {
     pub targets: Vec<String>,
     /// Variable assignments from `MAKEFLAGS` and the command line as `(name, value)` pairs.
     pub variables: Vec<(String, String)>,
-    /// Maximum simultaneous jobs (`-j N`).  Defaults to 1.
-    pub jobs: usize,
+    /// Maximum simultaneous jobs (`-j N`).  Defaults to 1 (sequential).
+    pub jobs: JobCount,
     /// Keep going after errors (`-k`).
     pub keep_going: bool,
     /// Suppress recipe echoing (`-s` / `--silent`).
@@ -150,7 +152,7 @@ impl Default for MakeArgs {
             makefiles: Vec::new(),
             targets: Vec::new(),
             variables: Vec::new(),
-            jobs: 1,
+            jobs: JobCount::sequential(),
             keep_going: false,
             silent: false,
             ignore_errors: false,
@@ -323,7 +325,8 @@ pub fn parse_args() -> MakeArgs {
                 "--jobs" => {
                     i += 1;
                     if i < args.len() {
-                        result.jobs = args[i].parse().unwrap_or(1);
+                        let n: usize = args[i].parse().unwrap_or(1);
+                        result.jobs = JobCount::new(n).unwrap_or_else(JobCount::sequential);
                         result.jobs_explicit = true;
                     }
                 }
@@ -375,7 +378,10 @@ pub fn parse_args() -> MakeArgs {
                 s if s.starts_with("--jobs=") => {
                     let val = &s[7..];
                     match val.parse::<usize>() {
-                        Ok(n) => { result.jobs = n; result.jobs_explicit = true; }
+                        Ok(n) => {
+                            result.jobs = JobCount::new(n).unwrap_or_else(JobCount::sequential);
+                            result.jobs_explicit = true;
+                        }
                         Err(_) => {
                             let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
                             eprintln!("{}: invalid option -- '--jobs={}'", progname, val);
@@ -544,7 +550,9 @@ pub fn parse_args() -> MakeArgs {
                         if !rest.is_empty() {
                             // -j<value>: if value is not a valid number, it's an error.
                             match rest.parse::<usize>() {
-                                Ok(n) => { result.jobs = n; }
+                                Ok(n) => {
+                                    result.jobs = JobCount::new(n).unwrap_or_else(JobCount::sequential);
+                                }
                                 Err(_) => {
                                     let progname = args.get(0).map(|s| s.as_str()).unwrap_or("make");
                                     eprintln!("{}: invalid option -- 'j{}'", progname, rest);
@@ -560,14 +568,14 @@ pub fn parse_args() -> MakeArgs {
                             if i + 1 < args.len() {
                                 if let Ok(n) = args[i + 1].parse::<usize>() {
                                     i += 1;
-                                    result.jobs = n;
+                                    result.jobs = JobCount::new(n).unwrap_or_else(JobCount::sequential);
                                     consumed = true;
                                 }
                             }
                             if !consumed {
                                 // bare -j with no number = unlimited parallel jobs.
                                 // Cap at 256 to avoid spawning absurd numbers of threads.
-                                result.jobs = 256;
+                                result.jobs = JobCount::new(256).unwrap(); // 256 is non-zero
                             }
                         }
                     }
@@ -859,11 +867,14 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     // set arbitrary flags — but a silent fallback to 1 could mask
                     // misconfiguration).  Unknown/huge values are silently dropped.
                     // Values that overflow usize on this platform are also dropped.
+                    // A value of 0 is also silently dropped (nonsensical job count).
                     if let Ok(n) = token[7..].parse::<usize>() {
-                        result.jobs = n;
-                        result.jobs_explicit = true;
+                        if let Some(jc) = JobCount::new(n) {
+                            result.jobs = jc;
+                            result.jobs_explicit = true;
+                        }
                     }
-                    // else: malformed --jobs= in MAKEFLAGS → leave jobs unchanged.
+                    // else: malformed or zero --jobs= in MAKEFLAGS → leave jobs unchanged.
                 }
                 _ if token.starts_with("--output-sync=") => {
                     result.output_sync = Some(token[14..].to_string());
@@ -931,13 +942,17 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         let arg: String = chars[j+1..].iter().collect();
                         if !arg.is_empty() {
                             if let Ok(n) = arg.parse::<usize>() {
-                                result.jobs = n;
+                                if let Some(jc) = JobCount::new(n) {
+                                    result.jobs = jc;
+                                }
                             }
-                            // If not a number, ignore the malformed -jXYZ
+                            // If not a number or zero, ignore the malformed -jXYZ
                         } else if i + 1 < tokens.len() {
                             if let Ok(n) = tokens[i + 1].parse::<usize>() {
                                 i += 1;
-                                result.jobs = n;
+                                if let Some(jc) = JobCount::new(n) {
+                                    result.jobs = jc;
+                                }
                             }
                             // else: bare -j means capped unlimited (256)
                         }

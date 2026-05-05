@@ -248,8 +248,10 @@ pub struct MakeState {
     pub in_recipe_execution: RefCell<bool>,
     /// Pending includes that couldn't be found during initial read
     pub pending_includes: Vec<PendingInclude>,
-    /// Current include depth (for detecting infinite recursion)
-    pub include_depth: usize,
+    /// Current include depth (for detecting infinite include recursion).
+    /// Bounded by `RecursionDepth` to prevent stack exhaustion from deeply-nested
+    /// include chains (limit: 200, matching GNU Make's effective cap).
+    pub include_depth: RecursionDepth,
     /// Set of include file names for which a rebuild recipe has already been
     /// attempted (ran or was considered ran via grouped pattern rules).
     /// Used to avoid running the same recipe twice for grouped pattern rules.
@@ -447,7 +449,7 @@ impl MakeState {
             in_second_expansion: RefCell::new(false),
             in_recipe_execution: RefCell::new(false),
             pending_includes: Vec::new(),
-            include_depth: 0,
+            include_depth: RecursionDepth::new(200),
             include_recipe_ran: HashSet::new(),
             include_already_ran: HashSet::new(),
             entering_directory_printed: false,
@@ -665,7 +667,7 @@ impl MakeState {
         let mut executor = exec::Executor::new(
             &self.db,
             self,
-            self.args.jobs,
+            self.args.jobs.get(),
             self.args.load_average,
             self.args.keep_going,
             self.args.dry_run,
@@ -970,8 +972,8 @@ impl MakeState {
         }
 
         // Job count: -j N (only when > 1; -j1 is the default and not passed on)
-        if self.args.jobs > 1 {
-            long_parts.push(format!("-j{}", self.args.jobs));
+        if self.args.jobs.get() > 1 {
+            long_parts.push(format!("-j{}", self.args.jobs.get()));
         }
 
         // No-arg long options (come after options-with-args)
@@ -1221,22 +1223,24 @@ impl MakeState {
     /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
     pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
         // Guard against infinite include recursion (e.g., a makefile including itself)
-        // SECURITY: verified — depth capped at 200, preventing stack exhaustion from
-        // a chain of files each including the next.  200 matches GNU Make's effective
-        // limit in practice (GNU Make doesn't document an explicit cap but errors out
-        // around the same depth due to OS open-file limits).
-        self.include_depth += 1;
-        if self.include_depth > 200 {
-            self.include_depth -= 1;
-            return Err(format!("{}: *** Recursive include of '{}'. Stop.",
-                make_progname(), path.display()));
-        }
+        // SECURITY: verified — depth capped at 200 (encoded in RecursionDepth::new(200)
+        // above), preventing stack exhaustion from a chain of files each including the
+        // next.  200 matches GNU Make's effective limit in practice (GNU Make doesn't
+        // document an explicit cap but errors out around the same depth due to OS
+        // open-file limits).
+        self.include_depth = match self.include_depth.increment() {
+            Ok(d) => d,
+            Err(_) => {
+                return Err(format!("{}: *** Recursive include of '{}'. Stop.",
+                    make_progname(), path.display()));
+            }
+        };
         // SECURITY: path traversal in include directives — trust boundary.
         // `include ../../etc/passwd` is permitted: Makefiles are trusted authored
         // content.  The file is opened read-only; no data is written.  The same
         // trust model applies as for $(wildcard), $(realpath), and shell scripts.
         let result = self.read_makefile_display_inner(path, display_name);
-        self.include_depth -= 1;
+        self.include_depth = self.include_depth.decrement();
         result
     }
 
@@ -4109,7 +4113,7 @@ impl MakeState {
         }
 
         let pending = std::mem::take(&mut self.pending_includes);
-        let parallel_jobs = self.args.jobs;
+        let parallel_jobs = self.args.jobs.get();
 
         // ── Phase A ─────────────────────────────────────────────────────────────
         let mut work_items: Vec<PendingWork> = Vec::new();

@@ -28,7 +28,111 @@
 
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// Domain newtypes — make illegal states unrepresentable
+// ---------------------------------------------------------------------------
+
+/// Number of parallel jobs allowed (`-j N`).
+///
+/// Zero jobs is nonsensical: even a sequential build executes at least one
+/// job at a time.  Wrapping the raw count in this newtype enforces that
+/// invariant at the type level and documents the trust boundary: any code
+/// that holds a `JobCount` is guaranteed to be working with a non-zero value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JobCount(NonZeroUsize);
+
+impl JobCount {
+    /// Construct a `JobCount` from a raw `usize`.
+    ///
+    /// Returns `None` when `n == 0`; 0 jobs is never valid.
+    pub fn new(n: usize) -> Option<Self> {
+        NonZeroUsize::new(n).map(JobCount)
+    }
+
+    /// A sequential (single-job) count — the safe default when no `-j` flag
+    /// was supplied.
+    pub fn sequential() -> Self {
+        // SAFETY: 1 is non-zero.
+        JobCount(NonZeroUsize::new(1).unwrap())
+    }
+
+    /// Return the underlying raw `usize`.
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for JobCount {
+    fn default() -> Self {
+        Self::sequential()
+    }
+}
+
+/// Error type returned when include/expansion recursion exceeds its limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TooDeep {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for TooDeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "recursion depth exceeded limit of {}", self.limit)
+    }
+}
+
+/// Bounded recursion depth counter for include and variable-expansion loops.
+///
+/// Carries both the current depth and the maximum allowed depth so that the
+/// limit is always visible alongside the counter — it can never be mismatched
+/// with a separate constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecursionDepth {
+    current: usize,
+    max: usize,
+}
+
+impl RecursionDepth {
+    /// Create a new depth counter starting at 0 with the given `max`.
+    pub fn new(max: usize) -> Self {
+        RecursionDepth { current: 0, max }
+    }
+
+    /// Try to increment the depth.
+    ///
+    /// Returns `Err(TooDeep)` if incrementing would exceed `max`.
+    pub fn increment(self) -> Result<Self, TooDeep> {
+        let next = self.current + 1;
+        if next > self.max {
+            Err(TooDeep { limit: self.max })
+        } else {
+            Ok(RecursionDepth { current: next, ..self })
+        }
+    }
+
+    /// Decrement the depth.  Saturates at 0 — decrementing a zero counter is
+    /// a logic error but should not panic in production.
+    pub fn decrement(self) -> Self {
+        RecursionDepth {
+            current: self.current.saturating_sub(1),
+            ..self
+        }
+    }
+
+    /// Return the current depth value.
+    #[allow(dead_code)]
+    pub fn current(self) -> usize {
+        self.current
+    }
+
+    /// Return true if the depth is at or above the configured maximum.
+    #[allow(dead_code)]
+    pub fn is_at_limit(self) -> bool {
+        self.current >= self.max
+    }
+}
 
 /// How a variable was defined.
 ///
