@@ -4,14 +4,13 @@
 mod lexer;
 mod directives;
 
-pub use lexer::*;
 pub use directives::*;
 
 use crate::types::*;
 use crate::eval::MakeState;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self};
 
 pub struct Parser {
     pub lines: Vec<String>,
@@ -558,13 +557,12 @@ pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
     let mut is_export = false;
     let mut is_unexport = false;
     let mut is_private = false;
-    let mut target: Option<String> = None;
     let mut work = line.to_string();
 
     // Check for override/export/unexport/private prefixes
     // Note: these are only keywords when followed by another keyword or a valid
     // variable name+operator (not when the word IS the variable name, e.g. "private = g").
-    let is_keyword_prefix = |keyword: &str, rest: &str| -> bool {
+    let is_keyword_prefix = |_keyword: &str, rest: &str| -> bool {
         // After the keyword (with leading whitespace stripped), the remaining text
         // must NOT start with an assignment operator. If it does, the keyword is
         // the variable name itself (e.g., `private = g` sets var "private").
@@ -1032,42 +1030,6 @@ fn find_bare_colon(s: &str) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// Unescape `\%` → `%` in a target name (file path) string.
-/// In GNU Make, `\%` in a target name or static pattern rule target list
-/// represents a literal `%` character.  This function converts stored
-/// `\%` sequences back to plain `%` so the target can be looked up in the
-/// Unescape backslash sequences in target/prerequisite names.
-/// `\:` → `:` (escaped colon becomes literal colon)
-/// `\\` → `\` (escaped backslash becomes literal backslash)
-/// `\#` → `#` (escaped hash becomes literal hash)
-/// `\ ` → ` ` (escaped space becomes literal space)
-pub fn unescape_target_name(s: &str) -> String {
-    if !s.contains('\\') {
-        return s.to_string();
-    }
-    let bytes = s.as_bytes();
-    let mut result = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b':' | b'#' | b'\\' | b' ' => {
-                    result.push(bytes[i + 1] as char);
-                    i += 2;
-                }
-                _ => {
-                    result.push('\\');
-                    i += 1;
-                }
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
 }
 
 /// rule database by its canonical (unescaped) name.
@@ -1616,17 +1578,13 @@ pub fn split_prerequisites(s: &str) -> (Vec<String>, Vec<String>, Option<String>
     };
 
     // Split on | for order-only prerequisites inside the prereq part.
-    let mut prereqs = Vec::new();
-    let mut order_only = Vec::new();
-
-    if let Some(pipe_pos) = find_pipe(prereq_part) {
+    let (prereqs, order_only) = if let Some(pipe_pos) = find_pipe(prereq_part) {
         let normal = &prereq_part[..pipe_pos];
         let oo = &prereq_part[pipe_pos + 1..];
-        prereqs = split_filenames(normal.trim());
-        order_only = split_filenames(oo.trim());
+        (split_filenames(normal.trim()), split_filenames(oo.trim()))
     } else {
-        prereqs = split_filenames(prereq_part.trim());
-    }
+        (split_filenames(prereq_part.trim()), Vec::new())
+    };
 
     (prereqs, order_only, inline_recipe)
 }

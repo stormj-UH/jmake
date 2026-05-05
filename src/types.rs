@@ -12,6 +12,9 @@ pub enum VarOrigin {
     File,
     CommandLine,
     Override,
+    /// Automatic variables ($@, $<, etc.) — variant matched in $(origin) expansion
+    /// but never directly constructed (auto vars are set via auto_vars HashMap).
+    #[allow(dead_code)]
     Automatic,
 }
 
@@ -235,6 +238,9 @@ pub enum ParsedLine {
     MissingSeparator(String), // the hint message (e.g., "did you mean TAB instead of 8 spaces?")
     /// Invalid syntax in a conditional directive (e.g. `ifeq` with no args or bad args)
     InvalidConditional,
+    /// Placeholder for GNU Make `.load` directive (dynamic plugin loading).
+    /// Not yet implemented; variant retained for future .load support.
+    #[allow(dead_code)]
     LoadDirective(String),
     /// Fatal parse error that must terminate make immediately (e.g. "target pattern has no %").
     FatalError(String),

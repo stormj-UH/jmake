@@ -3,8 +3,6 @@
 
 mod expand;
 
-pub use expand::*;
-
 use crate::cli::MakeArgs;
 use crate::database::MakeDatabase;
 use crate::exec;
@@ -13,7 +11,6 @@ use crate::implicit_rules;
 use crate::parser::{self, Parser};
 use crate::types::*;
 
-use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -531,10 +528,8 @@ impl MakeState {
             let explicit_dirs: Vec<String> = if has_reset {
                 // Only include dirs that appear AFTER the last -I-
                 let mut after_reset = Vec::new();
-                let mut found_reset = false;
                 for d in self.args.include_dirs.iter().rev() {
                     if d.to_string_lossy() == "-" {
-                        found_reset = true;
                         break;
                     }
                     after_reset.push(d.to_string_lossy().to_string());
@@ -1280,7 +1275,7 @@ impl MakeState {
                 if is_conditional {
                     let parsed = parser.parse_line(&line, self);
                     match &parsed {
-                        ParsedLine::Conditional(kind) => {
+                        ParsedLine::Conditional(_kind) => {
                             // Don't evaluate - just push inactive state
                             parser.conditional_stack.push(parser::ConditionalState {
                                 active: false,
@@ -1726,7 +1721,7 @@ impl MakeState {
                     parser.in_recipe = true;
                     current_rule = Some(rule);
                 }
-                ParsedLine::StaticPatternExpansion(mut expanded_rules) => {
+                ParsedLine::StaticPatternExpansion(expanded_rules) => {
                     // Flush the previous current_rule (and any siblings from a
                     // prior static pattern rule in this same block).
                     if let Some(prev) = current_rule.take() {
@@ -2334,7 +2329,6 @@ impl MakeState {
                         // Record that .LOW_RESOLUTION_TIME was seen.
                         self.db.special_targets.entry(special.clone()).or_insert_with(HashSet::new);
                     }
-                    _ => {}
                 }
                 continue;
             }
@@ -4446,25 +4440,4 @@ fn try_expand_define_name(trimmed: &str, state: &MakeState) -> Option<String> {
     Some(format!("{}define {}{}", prefix, expanded_name, after_name))
 }
 
-/// Extract the `override`/`export`/`private` prefix(es) from a raw variable
-/// assignment line so they can be re-prepended after expanding the name.
-/// Returns the prefix string including any trailing spaces (e.g. "override ").
-fn extract_var_prefixes(line: &str) -> String {
-    let mut result = String::new();
-    let mut work = line;
-    loop {
-        if work.starts_with("override ") {
-            result.push_str("override ");
-            work = work["override ".len()..].trim_start();
-        } else if work.starts_with("export ") {
-            result.push_str("export ");
-            work = work["export ".len()..].trim_start();
-        } else if work.starts_with("private ") {
-            result.push_str("private ");
-            work = work["private ".len()..].trim_start();
-        } else {
-            break;
-        }
-    }
-    result
-}
+

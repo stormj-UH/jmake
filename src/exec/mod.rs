@@ -6,14 +6,12 @@ pub mod parallel;
 use crate::cli::ShuffleMode;
 use crate::database::MakeDatabase;
 use crate::eval::MakeState;
-use crate::functions;
 use crate::types::*;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::SystemTime;
@@ -50,8 +48,6 @@ pub struct Executor<'a> {
     /// Intermediate targets that were actually built this run (candidates for deletion).
     /// Stored as Vec to maintain insertion order (for consistent rm output).
     intermediate_built: Vec<String>,
-    /// Maps intermediate target → its parent target (for deletion order).
-    intermediate_parent: HashMap<String, String>,
     /// Top-level targets (not subject to intermediate deletion even if .INTERMEDIATE).
     top_level_targets: HashSet<String>,
     /// Targets/files marked as "infinitely new" via -W/--what-if.
@@ -196,7 +192,6 @@ impl<'a> Executor<'a> {
             any_recipe_ran: false,
             grouped_covered: HashSet::new(),
             intermediate_built: Vec::new(),
-            intermediate_parent: HashMap::new(),
             top_level_targets: HashSet::new(),
             what_if,
             inherited_vars_stack: Vec::new(),
@@ -1087,7 +1082,7 @@ impl<'a> Executor<'a> {
         &self,
         raw_text: &str,
         base_auto_vars: &HashMap<String, String>,
-        target: &str,
+        _target: &str,
     ) -> (Vec<String>, Vec<String>) {
         // Expand the raw text using auto vars (second expansion).
         // Set the in_second_expansion flag so that eval() in this context
@@ -2171,7 +2166,7 @@ impl<'a> Executor<'a> {
         &mut self,
         target: &str,
         rules: &[Rule],
-        is_phony: bool,
+        _is_phony: bool,
     ) -> Result<(bool, Vec<String>, Vec<String>, Vec<(usize, String)>, String, String), String> {
         // Double-colon rules are not used for grouped targets, but handle gracefully
         // by delegating — in practice grouped targets use single-colon rules.
@@ -4293,7 +4288,7 @@ impl<'a> Executor<'a> {
         }
 
         // Helper: get raw value and is_expanded flag for var_name from staging.
-        let get_staging_entry = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
+        let _get_staging_entry = |staging: &Vec<(String, String, bool, bool, VarFlavor)>,
                                   staging_idx: &HashMap<String, usize>,
                                   var_name: &str| -> Option<(String, bool)> {
             staging_idx.get(var_name).map(|&i| {
@@ -5068,7 +5063,6 @@ impl<'a> Executor<'a> {
                         // (had a rule but didn't create a file — counts as always newer)
                         self.built.contains_key(p.as_str())
                     }
-                    _ => false,
                 }
             })
             .map(|p| resolve_prereq(p))
@@ -5387,9 +5381,8 @@ impl<'a> Executor<'a> {
             *self.state.current_file.borrow_mut() = source_file.to_string();
             *self.state.current_line.borrow_mut() = lineno;
             // The expanded value is already in sub_lines (pre-expanded above).
-            // We still need the expanded string for prefix-flag extraction.
-            // Reconstruct it from sub_lines.
-            let expanded = sub_lines.join("\n");
+            // (expanded string no longer needed — prefix flags are extracted from
+            // the original recipe line below, not from the post-expansion join.)
 
             // Extract prefix flags (@, -, +) from the ORIGINAL recipe line (before expansion).
             // These flags propagate to ALL sub-lines from the expansion.
@@ -6214,83 +6207,6 @@ fn se_text_has_non_pattern_word(text: &str) -> bool {
     false
 }
 
-/// Collects all top-level words from the SE text that do NOT contain `%`.
-/// These are words that are NOT stem-derived, i.e. they will expand to
-/// explicitly-mentioned files regardless of what the stem is.
-///
-/// Used to mark the right subset of SE-expanded prerequisites as
-/// "explicitly mentioned" (i.e. non-intermediate) in the database.
-fn se_non_pattern_words(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let n = bytes.len();
-    let mut result = Vec::new();
-    let mut i = 0;
-    let mut word_start = 0;
-    let mut in_word = false;
-    let mut word_has_percent = false;
-
-    let mut flush_word = |start: usize, end: usize, has_pct: bool, result: &mut Vec<String>| {
-        if !has_pct && end > start {
-            result.push(text[start..end].to_string());
-        }
-    };
-
-    while i < n {
-        match bytes[i] {
-            b' ' | b'\t' | b'\n' => {
-                if in_word {
-                    flush_word(word_start, i, word_has_percent, &mut result);
-                }
-                in_word = false;
-                word_has_percent = false;
-                i += 1;
-            }
-            b'$' => {
-                if !in_word {
-                    word_start = i;
-                    in_word = true;
-                }
-                if i + 1 < n {
-                    match bytes[i + 1] {
-                        b'(' | b'{' => {
-                            let open = bytes[i + 1];
-                            let close = if open == b'(' { b')' } else { b'}' };
-                            let mut depth = 1;
-                            i += 2;
-                            while i < n && depth > 0 {
-                                if bytes[i] == open { depth += 1; }
-                                else if bytes[i] == close { depth -= 1; }
-                                i += 1;
-                            }
-                        }
-                        _ => { i += 2; }
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            b'%' => {
-                if !in_word {
-                    word_start = i;
-                    in_word = true;
-                }
-                word_has_percent = true;
-                i += 1;
-            }
-            _ => {
-                if !in_word {
-                    word_start = i;
-                    in_word = true;
-                }
-                i += 1;
-            }
-        }
-    }
-    if in_word {
-        flush_word(word_start, n, word_has_percent, &mut result);
-    }
-    result
-}
 
 /// Collects all top-level words from the SE text that contain `%`.
 /// These are words that ARE stem-derived.  Complement of `se_non_pattern_words`.
@@ -6352,13 +6268,6 @@ fn se_pattern_words(text: &str) -> Vec<String> {
     result
 }
 
-/// Apply `%` → stem substitution to a prerequisite string, word by word.
-/// Only the first `%` in each whitespace-delimited word is replaced.
-/// For non-SE prerequisites (stored as already-split individual words),
-/// this simply calls `replace_first_percent`.
-fn subst_stem_in_prereq(prereq: &str, stem: &str) -> String {
-    replace_first_percent(prereq, stem)
-}
 
 /// Apply `%` → stem substitution to a raw SE prerequisite text.
 /// GNU Make rule: in SE prerequisite text, replace the first `%` in each

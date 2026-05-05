@@ -52,6 +52,9 @@ pub struct TargetPlan {
     /// Automatic variables pre-computed for this target ($@, $<, $^, etc.).
     pub auto_vars: HashMap<String, String>,
     /// Whether this target is .PHONY.
+    /// Used by should_rebuild_now; allowed dead-code because that method is
+    /// planned API not yet wired into the main dispatch loop.
+    #[allow(dead_code)]
     pub is_phony: bool,
     /// Whether this target needs rebuilding (determined conservatively during resolution).
     pub needs_rebuild: bool,
@@ -301,7 +304,7 @@ fn execute_job_normal(job: Job) -> JobResult {
     let is_silent_target = job.is_silent_target;
     let mut any_cmd_ran = false;
 
-    'outer: for (lineno, orig_line, sub_lines) in &job.pre_expanded {
+    for (lineno, orig_line, sub_lines) in &job.pre_expanded {
         let lineno = *lineno;
         let (_outer_display, outer_silent, outer_ignore, outer_force) =
             parse_recipe_prefix_standalone(orig_line);
@@ -786,6 +789,8 @@ impl ParallelScheduler {
 
     /// Check if the recipe for `target` actually needs to run, given what we
     /// now know about which prerequisites were rebuilt.
+    /// Planned API — not yet wired into the main dispatch loop (Worker B / orchestrator).
+    #[allow(dead_code)]
     fn should_rebuild_now(&self, target: &str) -> bool {
         let plan = match self.plans.get(target) {
             Some(p) => p,
@@ -815,6 +820,8 @@ impl ParallelScheduler {
         })
     }
 
+    /// Planned API — not yet wired into the main dispatch loop (Worker B / orchestrator).
+    #[allow(dead_code)]
     fn launch_job(&mut self, target: &str) {
         let plan = match self.plans.get(target) {
             Some(p) => p,
@@ -1003,6 +1010,8 @@ impl ParallelScheduler {
         }
     }
 
+    /// Planned API — not yet wired into the main dispatch loop (Worker B / orchestrator).
+    #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         self.running_count == 0 && self.ready_queue.is_empty()
     }
@@ -1147,7 +1156,9 @@ impl ParallelScheduler {
         }
     }
 
-    /// Check if the given root target was successfully built (Done or already up-to-date).
+    /// Check if the given root target was successfully rebuilt (Done(true)) vs up-to-date (Done(false)).
+    /// Planned API — not yet wired into the main dispatch loop (Worker B / orchestrator).
+    #[allow(dead_code)]
     pub fn target_was_rebuilt(&self, target: &str) -> Option<bool> {
         match self.states.get(target) {
             Some(TargetState::Done(r)) => Some(*r),
@@ -1171,7 +1182,6 @@ fn touch_file_standalone(target: &str) {
     // Also update mtime by setting it to now.
     let now = std::time::SystemTime::now();
     if let Ok(modified) = now.duration_since(std::time::UNIX_EPOCH) {
-        use std::time::Duration;
         let _ = filetime_or_noop(target, modified);
     }
 }

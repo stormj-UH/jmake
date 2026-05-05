@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
 // jmake - Clean-room drop-in replacement for GNU Make
 
+#![deny(warnings)]
+#![deny(rust_2018_idioms)]
+
 mod parser;
 mod eval;
 mod exec;
@@ -13,6 +16,7 @@ mod signal_handler;
 
 use std::process;
 
+#[cfg(test)]
 fn should_impersonate_gnu_make(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }

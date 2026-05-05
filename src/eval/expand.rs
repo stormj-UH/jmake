@@ -926,7 +926,7 @@ impl MakeState {
             if f.is_empty() { String::new() } else { format!("{}:{}: ", f, l) }
         };
 
-        let fatal = |msg: &str| -> ! {
+        let _fatal = |msg: &str| -> ! {
             eprintln!("{}*** {}.  Stop.", file_loc, msg);
             std::process::exit(2);
         };

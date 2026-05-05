@@ -34,7 +34,6 @@ pub struct MakeArgs {
     pub trace: bool,
     pub check_symlink_times: bool,
     pub load_average: Option<f64>,
-    pub max_load: Option<f64>,
     pub output_sync: Option<String>,
     pub eval_strings: Vec<String>,
     pub what_if: Vec<String>,
@@ -115,7 +114,6 @@ impl Default for MakeArgs {
             trace: false,
             check_symlink_times: false,
             load_average: None,
-            max_load: None,
             output_sync: None,
             eval_strings: Vec::new(),
             what_if: Vec::new(),
@@ -628,7 +626,6 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     let tokens: Vec<String> = split_makeflags_tokens(trimmed);
     let mut i = 0;
     let mut past_dashdash = false;
-    let mut first_token = true;
 
     while i < tokens.len() {
         let token: &str = &tokens[i];
@@ -694,7 +691,6 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
         }
 
         if token.starts_with("--") {
-            first_token = false;
             match token {
                 "--always-make" => result.always_make = true,
                 "--environment-overrides" => result.environment_overrides = true,
@@ -764,7 +760,6 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
         }
 
         if token.starts_with('-') {
-            first_token = false;
             // Short options with '-' prefix (like -Idir, -l2.5, -Onone)
             let rest = &token[1..];
             if rest.is_empty() {
@@ -868,7 +863,6 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
         // OR a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
         // Check if it contains '=' to distinguish variable from flags.
         // NOTE: GNU Make allows multiple bundled-flag tokens, e.g. "i B" means flags i AND B.
-        first_token = false;
         if token.contains('=') {
             // This is a bare variable assignment (e.g. "hello=world" from MAKEFLAGS env).
             // Add to variables so it's included in MAKEFLAGS output.

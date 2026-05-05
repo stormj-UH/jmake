@@ -597,7 +597,7 @@ fn fn_value(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     args[0].clone()
 }
 
-fn fn_eval(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+fn fn_eval(_args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     // $(eval text) - parsed as makefile content; handled in expander
     // Always returns empty string
     String::new()
@@ -764,7 +764,7 @@ fn fn_info(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     String::new()
 }
 
-fn fn_guile(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+fn fn_guile(_args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     // Guile integration is not supported
     String::new()
 }

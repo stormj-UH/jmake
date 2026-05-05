@@ -1,6 +1,10 @@
 // Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
 // Signal handling for jmake: cleanup on SIGTERM.
 
+// TODO(Worker B): remove this allow once the signal_handler unsafe rewrite lands.
+// The static_mut_refs lints fire on the raw-pointer casts in sigterm_handler.
+#![allow(static_mut_refs)]
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Maximum path length for the temp file path stored for signal handler use.
@@ -55,6 +59,8 @@ pub fn clear_term_message() {
 }
 
 /// Returns true if a SIGTERM was received.
+/// Currently unused by the main loop but retained for future signal-poll support.
+#[allow(dead_code)]
 pub fn signal_received() -> bool {
     SIGNAL_RECEIVED.load(Ordering::Acquire)
 }
