@@ -7014,9 +7014,16 @@ fn collapse_backslash_newlines(s: &str) -> String {
             }
             // Replace with a single space (GNU Make semantics)
             result.push(' ');
-        } else {
+        } else if bytes[i].is_ascii() {
             result.push(bytes[i] as char);
             i += 1;
+        } else {
+            // Multi-byte UTF-8 sequence: copy the full character to avoid
+            // double-encoding (casting a high byte to char would reinterpret
+            // it as a Latin-1 codepoint and re-encode it as UTF-8).
+            let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+            result.push(ch);
+            i += ch.len_utf8();
         }
     }
     result
@@ -7082,13 +7089,24 @@ fn preprocess_recipe_bsnl(line: &str) -> String {
                 result.push(' ');
             } else {
                 // Even number of backslashes or no newline: just push the backslash
+                // (backslash is always ASCII, safe to cast)
                 result.push(ch as char);
                 i += 1;
             }
             continue;
         }
-        result.push(ch as char);
-        i += 1;
+        // Copy the current byte/character to result.  ASCII bytes are safe to
+        // cast; for multi-byte UTF-8 sequences we must copy the full codepoint
+        // to avoid double-encoding (casting a high byte to char reinterprets
+        // it as a Latin-1 codepoint and then push re-encodes it as UTF-8).
+        if ch.is_ascii() {
+            result.push(ch as char);
+            i += 1;
+        } else {
+            let c = line[i..].chars().next().unwrap_or('\u{FFFD}');
+            result.push(c);
+            i += c.len_utf8();
+        }
     }
     result
 }
@@ -7114,10 +7132,18 @@ fn split_recipe_sub_lines(s: &str) -> Vec<String> {
                 result.push(current.clone());
                 current.clear();
             }
-        } else {
+            i += 1;
+        } else if bytes[i].is_ascii() {
             current.push(bytes[i] as char);
+            i += 1;
+        } else {
+            // Multi-byte UTF-8 sequence: push the full codepoint to avoid
+            // double-encoding (casting a high byte to char reinterprets it as a
+            // Latin-1 codepoint, which push then re-encodes as UTF-8).
+            let c = s[i..].chars().next().unwrap_or('\u{FFFD}');
+            current.push(c);
+            i += c.len_utf8();
         }
-        i += 1;
     }
     result.push(current);
     result
