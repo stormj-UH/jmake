@@ -404,7 +404,7 @@ pub fn parse_args() -> MakeArgs {
                     result.old_file.push(val.to_string());
                 }
                 s if s.starts_with("--new-file=") || s.starts_with("--assume-new=") || s.starts_with("--what-if=") => {
-                    let eq = s.find('=').unwrap();
+                    let eq = s.find('=').unwrap(); // PANIC-SAFE: all three guards above require '=' to be present
                     let val = &s[eq+1..];
                     result.new_file.push(val.to_string());
                     result.what_if.push(val.to_string());

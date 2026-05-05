@@ -83,7 +83,7 @@ pub fn parse_conditional(line: &str) -> Option<ParsedLine> {
     // GNU Make requires whitespace after ifeq/ifneq. "ifeq(" falls through to
     // MissingSeparator("ifeq/ifneq must be followed by whitespace") in parse_line.
     if trimmed.starts_with("ifeq ") || trimmed.starts_with("ifeq\t") {
-        let rest = trimmed.strip_prefix("ifeq").unwrap().trim();
+        let rest = trimmed.strip_prefix("ifeq").unwrap().trim(); // PANIC-SAFE: starts_with("ifeq") is guaranteed by the outer if
         if let Some((a, b)) = parse_conditional_args(rest) {
             return Some(ParsedLine::Conditional(ConditionalKind::Ifeq(a, b)));
         }
@@ -92,7 +92,7 @@ pub fn parse_conditional(line: &str) -> Option<ParsedLine> {
     }
 
     if trimmed.starts_with("ifneq ") || trimmed.starts_with("ifneq\t") {
-        let rest = trimmed.strip_prefix("ifneq").unwrap().trim();
+        let rest = trimmed.strip_prefix("ifneq").unwrap().trim(); // PANIC-SAFE: starts_with("ifneq") is guaranteed by the outer if
         if let Some((a, b)) = parse_conditional_args(rest) {
             return Some(ParsedLine::Conditional(ConditionalKind::Ifneq(a, b)));
         }
@@ -106,12 +106,12 @@ pub fn parse_conditional(line: &str) -> Option<ParsedLine> {
     }
 
     if trimmed.starts_with("ifdef ") || trimmed.starts_with("ifdef\t") {
-        let var = trimmed.strip_prefix("ifdef").unwrap().trim().to_string();
+        let var = trimmed.strip_prefix("ifdef").unwrap().trim().to_string(); // PANIC-SAFE: starts_with("ifdef") is guaranteed by the outer if
         return Some(ParsedLine::Conditional(ConditionalKind::Ifdef(var)));
     }
 
     if trimmed.starts_with("ifndef ") || trimmed.starts_with("ifndef\t") {
-        let var = trimmed.strip_prefix("ifndef").unwrap().trim().to_string();
+        let var = trimmed.strip_prefix("ifndef").unwrap().trim().to_string(); // PANIC-SAFE: starts_with("ifndef") is guaranteed by the outer if
         return Some(ParsedLine::Conditional(ConditionalKind::Ifndef(var)));
     }
 
@@ -255,7 +255,7 @@ pub fn parse_include(line: &str) -> ParsedLine {
 }
 
 pub fn parse_vpath(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("vpath").unwrap().trim();
+    let rest = line.strip_prefix("vpath").unwrap().trim(); // PANIC-SAFE: callers only invoke this after confirming the line starts with "vpath"
 
     if rest.is_empty() {
         return ParsedLine::VpathDirective {
@@ -286,7 +286,7 @@ pub fn parse_vpath(line: &str) -> ParsedLine {
 
 pub fn parse_export(line: &str, is_export: bool) -> ParsedLine {
     let keyword = if is_export { "export" } else { "unexport" };
-    let rest = line.strip_prefix(keyword).unwrap().trim();
+    let rest = line.strip_prefix(keyword).unwrap().trim(); // PANIC-SAFE: callers only invoke this after confirming the line starts with the keyword
 
     if rest.is_empty() {
         if is_export {

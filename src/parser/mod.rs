@@ -372,7 +372,7 @@ impl Parser {
 
         // else
         if effective == "else" || effective.starts_with("else ") || effective.starts_with("else\t") {
-            let rest = effective.strip_prefix("else").unwrap().trim();
+            let rest = effective.strip_prefix("else").unwrap().trim(); // PANIC-SAFE: outer if guarantees effective starts with "else"
             if rest.is_empty() {
                 return ParsedLine::Else(None);
             }
@@ -393,11 +393,11 @@ impl Parser {
         if effective.starts_with("undefine ") || effective.starts_with("override undefine ") {
             let is_override = effective.starts_with("override ");
             let rest = if is_override {
-                effective.strip_prefix("override ").unwrap()
+                effective.strip_prefix("override ").unwrap() // PANIC-SAFE: is_override implies starts_with("override ")
             } else {
                 &effective
             };
-            let name = rest.strip_prefix("undefine").unwrap().trim().to_string();
+            let name = rest.strip_prefix("undefine").unwrap().trim().to_string(); // PANIC-SAFE: outer if guarantees starts_with("undefine ") or via override branch "override undefine "
             // If the name starts with `:` (including `::` for double-colon rules),
             // this is actually a rule like `undefine: ;recipe`, not a directive.
             // If the name starts with an assignment operator (`=`, `:=`, `+=`, etc.),
