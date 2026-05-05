@@ -53,6 +53,7 @@ mod types;
 mod database;
 mod implicit_rules;
 mod signal_handler;
+mod io_traits;
 
 use std::process;
 

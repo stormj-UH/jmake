@@ -219,6 +219,7 @@ pub mod parallel;
 use crate::cli::ShuffleMode;
 use crate::database::MakeDatabase;
 use crate::eval::MakeState;
+use crate::io_traits::{MakeFs, MakeShell};
 use crate::types::*;
 
 use std::collections::{HashMap, HashSet};
@@ -232,6 +233,17 @@ use std::time::SystemTime;
 pub struct Executor<'a> {
     db: &'a MakeDatabase,
     state: &'a MakeState,
+    /// Injected filesystem abstraction.  All stat/read/glob/remove calls go
+    /// through this so that the build core has no direct OS coupling.
+    /// TODO(pure-core): convert all remaining direct `std::fs` / `glob::glob`
+    ///      call sites inside this file to use `self.fs` instead.
+    fs: Box<dyn MakeFs + 'a>,
+    /// Injected shell abstraction.  All recipe execution and `$(shell …)` captures
+    /// go through this so that the build core has no direct process coupling.
+    /// TODO(pure-core): convert all remaining direct `Command::new` call sites
+    ///      inside this file to use `self.shell_runner` instead.
+    #[allow(dead_code)]
+    shell_runner: Box<dyn MakeShell + 'a>,
     jobs: usize,
     /// Maximum load average for -l; None if not specified.
     load_average: Option<f64>,
@@ -370,6 +382,8 @@ impl<'a> Executor<'a> {
     pub fn new(
         db: &'a MakeDatabase,
         state: &'a MakeState,
+        fs: Box<dyn MakeFs + 'a>,
+        shell_runner: Box<dyn MakeShell + 'a>,
         jobs: usize,
         load_average: Option<f64>,
         keep_going: bool,
@@ -402,6 +416,8 @@ impl<'a> Executor<'a> {
         Executor {
             db,
             state,
+            fs,
+            shell_runner,
             jobs,
             load_average,
             keep_going,
@@ -970,7 +986,7 @@ impl<'a> Executor<'a> {
         // local copy (VPATH+ rename behavior) and should not be deleted.
         let existing: Vec<String> = to_delete.iter()
             .filter(|t| {
-                if !Path::new(t.as_str()).exists() { return false; }
+                if !self.fs.file_exists(Path::new(t.as_str())) { return false; }
                 // Skip deletion if this target also exists under a VPATH directory:
                 // the local copy is the updated authoritative version.
                 if self.find_in_vpath(t).is_some() { return false; }
@@ -984,7 +1000,7 @@ impl<'a> Executor<'a> {
         }
         if !self.dry_run {
             for t in &existing {
-                let _ = fs::remove_file(t);
+                let _ = self.fs.remove_file(Path::new(t));
             }
         }
         // Remove deleted (or non-existent) entries from intermediate_built
@@ -1557,8 +1573,8 @@ impl<'a> Executor<'a> {
         // Glob-expand wildcard patterns in non-SE prerequisites.
         // GNU Make expands wildcards in targets/prerequisites at read time; we do it
         // here before building so that patterns like a.t* expand to real files.
-        all_prereqs = Self::glob_expand_prereqs(all_prereqs);
-        all_order_only = Self::glob_expand_prereqs(all_order_only);
+        all_prereqs = self.glob_expand_prereqs(all_prereqs);
+        all_order_only = self.glob_expand_prereqs(all_order_only);
 
         // Apply shuffle to prerequisite ordering (unless .NOTPARALLEL is set).
         // GNU Make shuffles regular and order-only prerequisites together as one combined
@@ -2074,11 +2090,11 @@ impl<'a> Executor<'a> {
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
                 // Glob-expand wildcard patterns in pattern rule prereqs (e.g. %.t* -> a.three a.two).
-                pat_prereqs = Self::glob_expand_prereqs(pat_prereqs);
+                pat_prereqs = self.glob_expand_prereqs(pat_prereqs);
                 let mut pat_order_only: Vec<String> = pattern_rule.order_only_prerequisites.iter()
                     .map(|p| subst_stem_in_prereq_dir(p, &stem, &matched_pt))
                     .collect();
-                pat_order_only = Self::glob_expand_prereqs(pat_order_only);
+                pat_order_only = self.glob_expand_prereqs(pat_order_only);
 
                 // Handle second expansion for the pattern rule.
                 // If Step 0.5 already performed the SE expansion (and cached the result),
@@ -2829,7 +2845,7 @@ impl<'a> Executor<'a> {
         // individual rule runs.  This ensures that if the target doesn't exist
         // initially, ALL rules run — even if an earlier rule in the family creates
         // the target and later rules would otherwise see it as "up to date".
-        let initial_target_mtime: Option<SystemTime> = get_mtime(target);
+        let initial_target_mtime: Option<SystemTime> = self.fs.file_mtime(Path::new(target)).ok();
         let target_initially_missing = initial_target_mtime.is_none();
 
         let mut any_rebuilt = false;
@@ -3215,7 +3231,7 @@ impl<'a> Executor<'a> {
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
         // Glob-expand wildcard patterns in the substituted prerequisites (e.g. a.t* → a.three a.two).
-        prereqs = Self::glob_expand_prereqs(prereqs);
+        prereqs = self.glob_expand_prereqs(prereqs);
 
         // Also expand any explicit prerequisites that came from `build_target_inner`
         // combining explicit rules with this pattern rule.
@@ -3226,7 +3242,7 @@ impl<'a> Executor<'a> {
             .filter(|p| p.as_str() != ".WAIT")
             .map(|p| subst_stem_in_prereq_dir(p, stem, matched_pattern_target))
             .collect();
-        order_only = Self::glob_expand_prereqs(order_only);
+        order_only = self.glob_expand_prereqs(order_only);
 
         // SE expansion is deferred until AFTER non-SE prereqs are built (see below).
         // This matches GNU Make behavior where $(info ...) in SE prereqs fires after
@@ -3585,8 +3601,8 @@ impl<'a> Executor<'a> {
             *self.state.current_line.borrow_mut() = saved_line;
 
             // Glob-expand wildcard patterns introduced by SE expansion.
-            se_added_prereqs = Self::glob_expand_prereqs(se_added_prereqs);
-            se_added_oo = Self::glob_expand_prereqs(se_added_oo);
+            se_added_prereqs = self.glob_expand_prereqs(se_added_prereqs);
+            se_added_oo = self.glob_expand_prereqs(se_added_oo);
             se_added_prereqs.retain(|p| p != ".WAIT");
             se_added_oo.retain(|p| p != ".WAIT");
 
@@ -3650,8 +3666,8 @@ impl<'a> Executor<'a> {
             // Extend prereqs and order_only with SE results for auto vars and rebuild check.
             prereqs.extend(se_added_prereqs);
             order_only.extend(se_added_oo);
-            prereqs = Self::glob_expand_prereqs(prereqs);
-            order_only = Self::glob_expand_prereqs(order_only);
+            prereqs = self.glob_expand_prereqs(prereqs);
+            order_only = self.glob_expand_prereqs(order_only);
 
             // Update original-order lists to include SE prereqs for correct auto vars.
             prereqs_original_order = prereqs.clone();
@@ -4085,11 +4101,9 @@ impl<'a> Executor<'a> {
                             let resolved = subst_stem_in_prereq_dir(p, &stem, &pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
                             let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
-                                ::glob::glob(&resolved)
-                                    .ok()
-                                    .map_or(false, |mut it| it.next().is_some())
+                                !self.fs.glob(&resolved).is_empty()
                             } else {
-                                Path::new(&resolved).exists()
+                                self.fs.file_exists(Path::new(&resolved))
                                 || self.db.is_phony(&resolved)
                                 || self.db.rules.contains_key(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
@@ -4151,11 +4165,9 @@ impl<'a> Executor<'a> {
                             let resolved = subst_stem_in_prereq_dir(p, &stem, &pattern_target);
                             // If the resolved prereq contains glob chars, check if any matching files exist.
                             let ok = if resolved.contains('*') || resolved.contains('?') || resolved.contains('[') {
-                                ::glob::glob(&resolved)
-                                    .ok()
-                                    .map_or(false, |mut it| it.next().is_some())
+                                !self.fs.glob(&resolved).is_empty()
                             } else {
-                                Path::new(&resolved).exists()
+                                self.fs.file_exists(Path::new(&resolved))
                                 || self.db.rules.contains_key(&resolved)
                                 || self.db.is_phony(&resolved)
                                 || explicit_prereqs.iter().any(|ep| ep == &resolved)
@@ -5080,11 +5092,12 @@ impl<'a> Executor<'a> {
         if let Some(cached) = self.mtime_cache.borrow().get(path) {
             return *cached;
         }
-        // Slow path: syscall + cache insertion.
+        // Slow path: call through the injected MakeFs boundary, then cache.
+        let p = Path::new(path);
         let result = if self.state.args.check_symlink_times {
-            get_mtime_symlink(path)
+            self.fs.file_mtime_symlink(p).ok()
         } else {
-            get_mtime(path)
+            self.fs.file_mtime(p).ok()
         };
         self.mtime_cache.borrow_mut().insert(path.to_owned(), result);
         result
@@ -5201,16 +5214,14 @@ impl<'a> Executor<'a> {
     /// Each token that contains `*`, `?`, or `[` is glob-expanded against the filesystem.
     /// If no files match, the literal token is kept (GNU Make behaviour).
     /// Tokens without wildcards are passed through unchanged.
-    fn glob_expand_prereqs(prereqs: Vec<String>) -> Vec<String> {
+    fn glob_expand_prereqs(&self, prereqs: Vec<String>) -> Vec<String> {
         let mut result = Vec::with_capacity(prereqs.len());
         for token in prereqs {
             if token.contains('*') || token.contains('?') || token.contains('[') {
-                let mut matched: Vec<String> = Vec::new();
-                if let Ok(paths) = ::glob::glob(&token) {
-                    for entry in paths.flatten() {
-                        matched.push(normalize_path(&entry.to_string_lossy()).to_string());
-                    }
-                }
+                let mut matched: Vec<String> = self.fs.glob(&token)
+                    .into_iter()
+                    .map(|s| normalize_path(&s).to_string())
+                    .collect();
                 matched.sort();
                 if matched.is_empty() {
                     // No matches: keep the literal token (GNU Make keeps unmatched globs).
@@ -5656,9 +5667,9 @@ impl<'a> Executor<'a> {
                             let delete_on_error = self.db.special_targets
                                 .contains_key(&SpecialTarget::DeleteOnError);
                             if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
-                                if Path::new(target).exists() {
+                                if self.fs.file_exists(Path::new(target)) {
                                     eprintln!("{}: *** Deleting file '{}'", self.progname, target);
-                                    let _ = fs::remove_file(target);
+                                    let _ = self.fs.remove_file(Path::new(target));
                                 }
                             }
                             return Err(String::new());
@@ -5869,9 +5880,9 @@ impl<'a> Executor<'a> {
                             let delete_on_error = self.db.special_targets
                                 .contains_key(&SpecialTarget::DeleteOnError);
                             if delete_on_error && !self.db.is_precious(target) && !self.db.is_phony(target) {
-                                if Path::new(target).exists() {
+                                if self.fs.file_exists(Path::new(target)) {
                                     eprintln!("{}: *** Deleting file '{}'", self.progname, target);
-                                    let _ = fs::remove_file(target);
+                                    let _ = self.fs.remove_file(Path::new(target));
                                 }
                             }
                             return Err(String::new());
@@ -6876,45 +6887,9 @@ fn vpath_pattern_matches(pattern: &str, target: &str) -> bool {
     }
 }
 
-fn get_mtime(path: &str) -> Option<SystemTime> {
-    fs::metadata(path).ok()?.modified().ok()
-}
-
-/// Get mtime for symlink checking: with -L, use the latest mtime between the
-/// symlink itself and its target (recursively), as GNU Make does.
-/// For dangling symlinks (target doesn't exist), returns the symlink's own mtime
-/// so the dependent target can still be built.
-fn get_mtime_symlink(path: &str) -> Option<SystemTime> {
-    // Get the symlink's own mtime via lstat.
-    let sym_meta = fs::symlink_metadata(path).ok()?;
-    let sym_mtime = sym_meta.modified().ok()?;
-
-    // If it's not a symlink, just return the file's mtime.
-    if !sym_meta.file_type().is_symlink() {
-        return Some(sym_mtime);
-    }
-
-    // It's a symlink: read where it points.
-    if let Ok(target) = fs::read_link(path) {
-        // Resolve the target path relative to the parent directory of 'path'.
-        let resolved = if target.is_absolute() {
-            target
-        } else if let Some(parent) = Path::new(path).parent() {
-            parent.join(&target)
-        } else {
-            target
-        };
-        // Recursively get the target's mtime (handles symlink chains).
-        // If the target doesn't exist (dangling), fall through and use sym_mtime.
-        if let Some(target_mtime) = get_mtime_symlink(resolved.to_str().unwrap_or("")) {
-            // Use the MAX of symlink mtime and target mtime.
-            return Some(sym_mtime.max(target_mtime));
-        }
-    }
-
-    // Dangling symlink or can't read link: return symlink's own mtime.
-    Some(sym_mtime)
-}
+// NOTE: get_mtime and get_mtime_symlink have been removed; their logic now lives in
+// io_traits::RealFs (file_mtime and file_mtime_symlink).  All callers inside Executor
+// use self.fs.file_mtime / self.fs.file_mtime_symlink through the MakeFs boundary.
 
 fn touch_file(path: &str) {
     if Path::new(path).exists() {

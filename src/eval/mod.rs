@@ -179,6 +179,7 @@ use crate::database::MakeDatabase;
 use crate::exec;
 use crate::functions;
 use crate::implicit_rules;
+use crate::io_traits::{RealFs, RealShell};
 use crate::parser::{self, Parser};
 use crate::types::*;
 
@@ -733,6 +734,8 @@ impl MakeState {
         let mut executor = exec::Executor::new(
             &self.db,
             self,
+            Box::new(RealFs),
+            Box::new(RealShell),
             self.args.jobs.get(),
             self.args.load_average,
             self.args.keep_going,
