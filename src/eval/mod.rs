@@ -2799,21 +2799,16 @@ impl MakeState {
                         .cloned()
                         .collect();
 
-                    // When a new rule has a recipe, its prerequisites are "primary"
-                    // and placed BEFORE the existing accumulated prerequisites.
-                    // GNU Make uses the recipe rule to determine the primary ordering.
+                    // GNU Make always appends new prerequisites to the END of the
+                    // existing list, preserving the order in which rules were written.
+                    // The recipe-bearing rule does NOT get priority in prereq ordering.
+                    // (The old code prepended when new_has_recipe, which produced
+                    // reversed order: `all: a\nall: b\n<recipe>` gave `b a` not `a b`.)
                     let new_has_recipe = !rule.recipe.is_empty();
-                    if new_has_recipe && !rule.prerequisites.is_empty() {
-                        // Prepend new rule's prereqs, then append existing ones (avoiding dups)
-                        let mut new_prereqs = rule.prerequisites.clone();
-                        for p in &existing.prerequisites {
-                            if !new_prereqs.contains(p) {
-                                new_prereqs.push(p.clone());
-                            }
+                    for p in &rule.prerequisites {
+                        if !existing.prerequisites.contains(p) {
+                            existing.prerequisites.push(p.clone());
                         }
-                        existing.prerequisites = new_prereqs;
-                    } else {
-                        existing.prerequisites.extend(rule.prerequisites.clone());
                     }
                     existing.order_only_prerequisites.extend(filtered_order_only);
                     // Merge second-expansion raw prerequisite text.
@@ -2821,19 +2816,11 @@ impl MakeState {
                     if let Some(ref new_text) = rule.second_expansion_prereqs {
                         match existing.second_expansion_prereqs {
                             Some(ref mut existing_text) => {
-                                if new_has_recipe {
-                                    let old = existing_text.clone();
-                                    *existing_text = if old.is_empty() {
-                                        new_text.clone()
-                                    } else {
-                                        format!("{} {}", new_text, old)
-                                    };
-                                } else {
-                                    if !existing_text.is_empty() {
-                                        existing_text.push(' ');
-                                    }
-                                    existing_text.push_str(new_text);
+                                // Always append (same order-preserving policy as normal prereqs).
+                                if !existing_text.is_empty() {
+                                    existing_text.push(' ');
                                 }
+                                existing_text.push_str(new_text);
                             }
                             None => {
                                 existing.second_expansion_prereqs = Some(new_text.clone());

@@ -1390,3 +1390,427 @@ all:
     assert!(stderr.contains("warn_message"), "stderr: {}", stderr);
     assert!(stdout.contains("recipe"), "stdout: {}", stdout);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edge-case battery (hardening/edge-cases branch)
+// Items 1-14 from the task spec.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── 1. Empty targets and prerequisites ───────────────────────────────────────
+
+/// `all:` with no prerequisites and no recipe: should succeed with
+/// "Nothing to be done for 'all'." — not an error.
+#[test]
+fn test_empty_target_no_prereqs_no_recipe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "all:\n", "all");
+    assert!(ok, "jmake failed: {}", err);
+    // Either the "Nothing to be done" message OR silent success is acceptable.
+    // The important thing is exit 0.
+    let _ = out;
+}
+
+/// `all: ;` — empty inline recipe (semicolon with nothing after it):
+/// should execute without error.  The target is considered to have a recipe
+/// (so no "nothing to be done" message) even though the recipe is a no-op.
+#[test]
+fn test_empty_inline_recipe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Note: `all: ;` sets up a target whose recipe is the empty string.
+    // GNU Make prints "'all' is up to date." if the target exists, or runs
+    // the empty recipe (silently) if it doesn't.
+    let (_, err, ok) = mk_run(dir.path(), "all: ;\n", "all");
+    assert!(ok, "jmake failed: {}", err);
+}
+
+// ── 2. Multiple rules for same target: prerequisite merging order ─────────────
+
+/// Two rules for the same target: prerequisites must be merged in
+/// textual order (first rule's prereqs first, then second rule's).
+/// Regression for the bug where the recipe-bearing rule's prereqs were
+/// prepended instead of appended.
+#[test]
+fn test_multi_rule_prereq_merge_order() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a"), "").unwrap();
+    std::fs::write(dir.path().join("b"), "").unwrap();
+    // Second rule provides the recipe; first rule provides prereq `a`.
+    // GNU Make order: a b (textual order, not recipe-first).
+    let (out, err, ok) = mk_run(dir.path(),
+        "all: a\nall: b\n\t@echo \"prereqs=$^\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "prereqs=a b",
+        "prerequisites out of order: got {:?}", out);
+}
+
+/// Three rules with prereqs split across all three; recipe on the last.
+#[test]
+fn test_multi_rule_three_way_merge() {
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in &["a", "b", "c"] {
+        std::fs::write(dir.path().join(f), "").unwrap();
+    }
+    let (out, err, ok) = mk_run(dir.path(),
+        "all: a\nall: b\nall: c\n\t@echo \"prereqs=$^\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "prereqs=a b c",
+        "prerequisites out of order: got {:?}", out);
+}
+
+// ── 3. Recursive make: MAKELEVEL and $(MAKE) ─────────────────────────────────
+
+/// MAKELEVEL must be 0 for the top-level make.
+#[test]
+fn test_makelevel_zero_at_top() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "all:\n\t@echo \"ML=$(MAKELEVEL)\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "ML=0");
+}
+
+/// $(MAKE) expands to the path of the running jmake binary.
+#[test]
+fn test_make_var_expands_to_binary() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "all:\n\t@test -n \"$(MAKE)\" && echo ok\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "ok", "$(MAKE) was empty: {}", err);
+}
+
+/// Recursive $(MAKE) invocation increments MAKELEVEL to 1.
+#[test]
+fn test_recursive_make_increments_makelevel() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        "all:\n\t$(MAKE) sub\nsub:\n\t@echo \"ML=$(MAKELEVEL)\"\n"
+    ).unwrap();
+    let (out, err, ok) = run_inline(dir.path(), Some("all"));
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("ML=1"),
+        "expected MAKELEVEL=1 in recursive make, got: {}", out);
+}
+
+// ── 4. Long variable values (>4096 bytes) ────────────────────────────────────
+
+/// A variable holding more than 4096 characters must be stored and echoed
+/// back intact; this exercises any buffer-size assumptions.
+#[test]
+fn test_long_variable_value() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let big: String = "x".repeat(5000);
+    let mk = format!("LONGVAR := {}\nall:\n\t@echo \"$(LONGVAR)\" | wc -c | tr -d ' '\n", big);
+    let (out, err, ok) = mk_run(dir.path(), &mk, "all");
+    assert!(ok, "jmake failed: {}", err);
+    // `echo "5000-char-string"` adds a newline, so wc -c reports 5001.
+    let count: usize = out.trim().parse().unwrap_or(0);
+    assert_eq!(count, 5001,
+        "expected 5001 chars (5000 + newline from echo), got {} — err: {}",
+        count, err);
+}
+
+// ── 5. UTF-8 in targets and variable values ───────────────────────────────────
+
+/// UTF-8 characters in a variable value must survive assignment and
+/// expansion without double-encoding.
+/// Regression for the bug in split_recipe_sub_lines / preprocess_recipe_bsnl
+/// / collapse_backslash_newlines where `bytes[i] as char` reinterpreted
+/// high bytes as Latin-1 codepoints and re-encoded them as UTF-8.
+#[test]
+fn test_utf8_variable_value_no_double_encoding() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // "héllo" contains U+00E9 (é) encoded as 0xC3 0xA9 in UTF-8.
+    let mk_bytes: &[u8] =
+        b"VAR := h\xc3\xa9llo\nall:\n\t@echo \"$(VAR)\"\n";
+    std::fs::write(dir.path().join("Makefile"), mk_bytes).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .arg("all")
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success(), "jmake failed");
+    // Output must be exactly h 0xC3 0xA9 llo 0x0A — two-byte é, not four bytes.
+    assert_eq!(
+        out.stdout,
+        b"h\xc3\xa9llo\n",
+        "UTF-8 double-encoding: expected h\\xc3\\xa9llo\\n, got {:?}",
+        out.stdout
+    );
+}
+
+/// UTF-8 in a recipe line (no variable) must also survive.
+#[test]
+fn test_utf8_literal_in_recipe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Literal "café" in recipe; é = 0xC3 0xA9.
+    let mk_bytes: &[u8] = b"all:\n\t@echo \"caf\xc3\xa9\"\n";
+    std::fs::write(dir.path().join("Makefile"), mk_bytes).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .arg("all")
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success(), "jmake failed");
+    assert_eq!(
+        out.stdout,
+        b"caf\xc3\xa9\n",
+        "UTF-8 double-encoding in literal recipe: got {:?}", out.stdout
+    );
+}
+
+// ── 6. Tab vs spaces in recipe ───────────────────────────────────────────────
+
+/// A recipe line indented with spaces (not tab) must be rejected with a
+/// "missing separator" error and a non-zero exit code.
+#[test]
+fn test_space_indented_recipe_is_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Four-space indent — not a recipe prefix tab.
+    std::fs::write(dir.path().join("Makefile"),
+        "all:\n    @echo should_not_run\n").unwrap();
+    let (_, err, ok) = run_inline(dir.path(), Some("all"));
+    assert!(!ok, "expected error for space-indented recipe");
+    assert!(err.contains("missing separator"),
+        "expected 'missing separator' in stderr, got: {}", err);
+}
+
+// ── 7. Backslash continuation ─────────────────────────────────────────────────
+
+/// Backslash at end of variable assignment line continues the value onto
+/// the next line; leading whitespace on the continuation is collapsed to
+/// a single space.
+#[test]
+fn test_backslash_continuation_variable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "LONGVAR := hello \\\n    world\nall:\n\t@echo \"$(LONGVAR)\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "hello world");
+}
+
+/// Backslash continuation inside a recipe line is passed to the shell,
+/// which joins the lines.
+#[test]
+fn test_backslash_continuation_recipe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "all:\n\t@echo \"multi \\\ndone\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    // Shell joins the two halves; the result is "multi done".
+    assert!(out.trim().contains("multi") && out.trim().contains("done"),
+        "expected continuation to work, got: {:?}", out);
+}
+
+// ── 8. Multiple targets on one rule ──────────────────────────────────────────
+
+/// `a b c: d` creates three separate rules each depending on `d`; the
+/// recipe runs once per target and `$@` is set correctly for each.
+#[test]
+fn test_multiple_targets_one_rule() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("d"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "a b c: d\n\t@echo \"built $@\"\nall: a b c\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("built a"), "got: {}", out);
+    assert!(out.contains("built b"), "got: {}", out);
+    assert!(out.contains("built c"), "got: {}", out);
+}
+
+// ── 9. $(MAKECMDGOALS) ────────────────────────────────────────────────────────
+
+/// $(MAKECMDGOALS) must contain the exact targets given on the command line.
+#[test]
+fn test_makecmdgoals_populated() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        "all:\n\t@echo \"goals=$(MAKECMDGOALS)\"\nfoo:\n\t@echo foo\n"
+    ).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .args(["all", "foo"])
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("goals=all foo"),
+        "expected MAKECMDGOALS to contain 'all foo', got: {}", stdout);
+}
+
+/// When a single target is requested, $(MAKECMDGOALS) contains just that target.
+#[test]
+fn test_makecmdgoals_single() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "all:\n\t@echo \"goals=$(MAKECMDGOALS)\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("goals=all"), "got: {}", out);
+}
+
+// ── 10. Default goal ──────────────────────────────────────────────────────────
+
+/// The first non-pattern, non-dot target in the Makefile is the default
+/// goal when no target is specified on the command line.
+#[test]
+fn test_default_goal_is_first_non_dot_target() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        ".SUFFIXES:\nfirst:\n\t@echo \"first\"\nsecond:\n\t@echo \"second\"\n"
+    ).unwrap();
+    let (out, err, ok) = run_inline(dir.path(), None);
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("first"), "expected 'first' to be default goal, got: {}", out);
+    assert!(!out.contains("second"), "got: {}", out);
+}
+
+/// A target whose name starts with `.` is not eligible as the default goal.
+#[test]
+fn test_dot_target_not_default_goal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        ".PHONY: .special\n.special:\n\t@echo \"special\"\nreal:\n\t@echo \"real\"\n"
+    ).unwrap();
+    let (out, err, ok) = run_inline(dir.path(), None);
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("real"), "expected 'real' to be default goal, got: {}", out);
+    assert!(!out.contains("special"), "got: {}", out);
+}
+
+// ── 11. .PHONY always runs ────────────────────────────────────────────────────
+
+/// A `.PHONY` target must always execute its recipe even when a file with
+/// the same name exists and is up to date.
+#[test]
+fn test_phony_target_runs_when_file_exists() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Create a file named "clean" to act as a potential false up-to-date target.
+    std::fs::write(dir.path().join("clean"), "I am a file").unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        ".PHONY: clean\nclean:\n\t@echo done\n",
+        "clean");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "done",
+        "phony target should run despite file existing, got: {}", out);
+}
+
+/// `.PHONY` prerequisites are always rebuilt even when no files are out of date.
+#[test]
+fn test_phony_prereq_always_runs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // 'all' depends on phony 'check'; check must run on every invocation.
+    let (out, err, ok) = mk_run(dir.path(),
+        ".PHONY: check\nall: check\n\t@echo all\ncheck:\n\t@echo checked\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("checked"), "phony prereq should always run, got: {}", out);
+    assert!(out.contains("all"), "got: {}", out);
+}
+
+// ── 12. Nested function calls ─────────────────────────────────────────────────
+
+/// `$(patsubst %.o,%.c,$(filter %.o,OBJS))` — the inner $(filter) is
+/// evaluated first, then its result is fed to $(patsubst).
+#[test]
+fn test_nested_patsubst_filter() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "OBJS := foo.o bar.c baz.o\nall:\n\t@echo \"$(patsubst %.o,%.c,$(filter %.o,$(OBJS)))\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "foo.c baz.c",
+        "nested patsubst/filter failed: {}", out);
+}
+
+/// Three levels of nesting: $(sort $(filter %.o,$(subst .a,.o,$(LIBS)))).
+#[test]
+fn test_triple_nested_functions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "LIBS := foo.a bar.a baz.a\nall:\n\t@echo \"$(sort $(filter %.o,$(subst .a,.o,$(LIBS))))\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "bar.o baz.o foo.o",
+        "triple nested functions failed: {}", out);
+}
+
+// ── 13. Target-specific variable assignment ───────────────────────────────────
+
+/// `target: VAR = val` sets a target-specific variable that overrides the
+/// global value during the target's recipe and is invisible outside it.
+#[test]
+fn test_target_specific_var_overrides_global() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "CFLAGS = -O2\nfoo: CFLAGS = -O0\nfoo:\n\t@echo \"foo=$(CFLAGS)\"\nall: foo\n\t@echo \"all=$(CFLAGS)\"\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    // foo's recipe sees -O0; all's recipe sees the global -O2.
+    assert!(out.contains("foo=-O0"),
+        "expected target-specific CFLAGS=-O0 in foo, got: {}", out);
+    assert!(out.contains("all=-O2"),
+        "expected global CFLAGS=-O2 in all, got: {}", out);
+}
+
+/// Target-specific `:=` (simple) assignment.
+#[test]
+fn test_target_specific_simple_assign() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        "VAR = global\ntgt: VAR := local\ntgt:\n\t@echo \"$(VAR)\"\nall: tgt\n",
+        "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert!(out.contains("local"),
+        "expected target-specific VAR=local, got: {}", out);
+}
+
+// ── 14. override directive ────────────────────────────────────────────────────
+
+/// `override VAR = val` prevents a command-line assignment from changing VAR.
+#[test]
+fn test_override_prevents_cmdline_change() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        "override VAR = from_makefile\nall:\n\t@echo \"VAR=$(VAR)\"\n"
+    ).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .args(["all", "VAR=from_cmdline"])
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success(), "jmake failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("VAR=from_makefile"),
+        "override should prevent cmdline change, got: {}", stdout);
+}
+
+/// Without `override`, a command-line assignment wins over a makefile assignment.
+#[test]
+fn test_no_override_cmdline_wins() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"),
+        "VAR = from_makefile\nall:\n\t@echo \"VAR=$(VAR)\"\n"
+    ).unwrap();
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .args(["all", "VAR=from_cmdline"])
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success(), "jmake failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("VAR=from_cmdline"),
+        "without override, cmdline should win, got: {}", stdout);
+}
