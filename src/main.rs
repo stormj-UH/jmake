@@ -1,5 +1,45 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// jmake - Clean-room drop-in replacement for GNU Make
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Entry point for jmake — a clean-room replacement for GNU Make.
+//!
+//! # Responsibilities
+//!
+//! This module:
+//!
+//! 1. Installs a custom panic hook that converts stdout write errors (broken
+//!    pipe, `/dev/full`) into a clean `exit(1)` with a diagnostic on stderr,
+//!    matching what a GNU Make-compatible tool is expected to do.
+//! 2. Installs the SIGTERM handler (see [`signal_handler`]) before touching
+//!    anything else so that any temp file created during startup is covered.
+//! 3. Parses command-line arguments via [`cli::parse_args`] and dispatches to
+//!    [`eval::MakeState`] for the actual build.
+//! 4. Cleans up temp files after a normal return (the SIGTERM handler owns
+//!    cleanup on abnormal termination).
+//!
+//! # Test-mode impersonation
+//!
+//! When the environment variable `JMAKE_TEST_MODE` is set to `"1"`, jmake
+//! reports itself as `GNU Make 4.4.1` in `--version` output and adjusts a
+//! small number of other outputs for compatibility with the GNU Make test
+//! suite.  This impersonation is never active outside that test mode.
+//!
+//! # Exit codes
+//!
+//! | Code | Meaning |
+//! |------|---------|
+//! | 0    | Success — all requested targets are up to date. |
+//! | 1    | I/O error writing to stdout (broken pipe, full disk). |
+//! | 2    | Build failure — at least one target could not be made. |
+//! | 101  | Unexpected internal panic (Rust default). |
+//!
+//! # Thread safety
+//!
+//! `main` is single-threaded up to the point where the parallel executor
+//! (`exec::parallel`) spawns worker threads.  The signal handler globals
+//! are designed for single-threaded access; see [`signal_handler`] for the
+//! full safety argument.
 
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
@@ -16,15 +56,26 @@ mod signal_handler;
 
 use std::process;
 
+/// Returns `true` when `raw` is exactly `"1"` (after trimming whitespace).
+///
+/// Used to determine whether `JMAKE_TEST_MODE` enables GNU Make impersonation.
+/// Any other value — including `"true"`, `"yes"`, or `"0"` — is treated as
+/// disabled, matching GNU Make's own convention for boolean environment flags.
 #[cfg(test)]
 fn should_impersonate_gnu_make(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Returns `true` when test mode is active (delegates to [`eval::test_mode_enabled`]).
 fn test_mode_enabled() -> bool {
     eval::test_mode_enabled()
 }
 
+/// Returns the canonical GNU Make target-triple string for the current
+/// host architecture.
+///
+/// Used only in test-mode `--version` output to impersonate the specific
+/// GNU Make build that the test suite expects.
 fn target_triple() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "aarch64-unknown-linux-gnu",
@@ -33,6 +84,16 @@ fn target_triple() -> &'static str {
     }
 }
 
+/// Returns the lines to print for `--version`.
+///
+/// When `test_mode` is `true`, the output mimics `GNU Make 4.4.1` so that the
+/// GNU Make test suite's version-check assertions pass.  In production mode the
+/// output identifies jmake by its own name and `CARGO_PKG_VERSION`.
+///
+/// # Arguments
+///
+/// * `test_mode` — if `true`, emit GNU Make 4.4.1 impersonation text; otherwise
+///   emit jmake-branded text.
 fn version_lines(test_mode: bool) -> Vec<String> {
     if test_mode {
         vec![

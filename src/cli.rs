@@ -1,27 +1,89 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Command-line argument parsing for jmake.
+//!
+//! This module owns everything between `argv[0]` and the [`MakeArgs`] struct
+//! that the rest of the program consumes.  It handles:
+//!
+//! - **GNUMAKEFLAGS** (parsed first, then cleared so recursive makes don't
+//!   see duplicates)
+//! - **MAKEFLAGS** (merged before command-line flags)
+//! - **Short flags** (`-k`, `-j4`, `-C dir`, combined forms like `-ksn`)
+//! - **Long flags** (`--jobs=4`, `--directory=dir`, `--debug=b`, …)
+//! - **Variable assignments** (`VAR=value` positional args and from MAKEFLAGS)
+//! - **Targets** (bare words that are not assignments or flags)
+//!
+//! Parsing is intentionally lenient in the same places GNU Make is lenient:
+//! bare `-j` means unlimited parallelism, unknown long flags print an error
+//! and exit with code 2, and `--` stops flag processing.
+//!
+//! # Design notes
+//!
+//! - [`MakeArgs`] is cheaply cloneable; [`eval::MakeState`] keeps both a live
+//!   copy and a `cmdline_args` snapshot so makefile-level `MAKEFLAGS` changes
+//!   cannot silently override flags the user passed on the command line.
+//! - The "explicit" tracking fields (`jobs_explicit`, `silent_explicit`, …)
+//!   let [`eval`] protect user-supplied values from being clobbered by a
+//!   makefile `MAKEFLAGS` assignment.
+//! - [`parse_makeflags`] is `pub` so [`eval`] can call it when a makefile
+//!   assigns to `MAKEFLAGS` directly.
+//!
+//! # Thread safety
+//!
+//! All functions in this module are called only from the main thread before
+//! any worker threads are spawned.
 
 use std::env;
 use std::path::PathBuf;
 
+/// Parsed command-line arguments for jmake.
+///
+/// Every flag from the command line and from `MAKEFLAGS` / `GNUMAKEFLAGS` ends
+/// up here.  Fields follow the naming convention of GNU Make's own internal
+/// variables where possible so that the mapping is self-documenting.
+///
+/// The `*_explicit` fields are `true` when the corresponding flag was supplied
+/// by the user (either from an env variable or from the command line) and
+/// therefore must not be overridden when a makefile assigns to `MAKEFLAGS`.
 #[derive(Debug, Clone)]
 pub struct MakeArgs {
+    /// Makefile paths given via `-f` / `--file`.  Empty means auto-discover.
     pub makefiles: Vec<PathBuf>,
+    /// Target names to build.  Empty means build the first target in the makefile.
     pub targets: Vec<String>,
+    /// Variable assignments from `MAKEFLAGS` and the command line as `(name, value)` pairs.
     pub variables: Vec<(String, String)>,
+    /// Maximum simultaneous jobs (`-j N`).  Defaults to 1.
     pub jobs: usize,
+    /// Keep going after errors (`-k`).
     pub keep_going: bool,
+    /// Suppress recipe echoing (`-s` / `--silent`).
     pub silent: bool,
+    /// Ignore recipe errors (`-i` / `--ignore-errors`).
     pub ignore_errors: bool,
+    /// Dry-run: print recipes but do not execute them (`-n`).
     pub dry_run: bool,
+    /// Touch targets instead of rebuilding (`-t`).
     pub touch: bool,
+    /// Question mode: exit 0 if up to date, 1 if not, without running recipes (`-q`).
     pub question: bool,
+    /// Print `Entering/Leaving directory` messages (`-w`).
     pub print_directory: bool,
+    /// Suppress directory messages even when `-w` would normally be implied (`--no-print-directory`).
     pub no_print_directory: bool,
+    /// Environment variables override makefile assignments (`-e`).
     pub environment_overrides: bool,
+    /// Disable built-in implicit rules (`-r`).
     pub no_builtin_rules: bool,
+    /// Disable built-in variable definitions (`-R`).
     pub no_builtin_variables: bool,
+    /// Print the internal rule/variable database (`-p`).
     pub print_data_base: bool,
+    /// Debug flag categories passed via `--debug=FLAGS`.
     pub debug: Vec<String>,
+    /// `true` if `-d` (short form) was given; recorded so `MAKEFLAGS` shows `d` not `--debug=b`.
     pub debug_short: bool, // true if -d was given (short flag), shows as 'd' in MAKEFLAGS
     pub directory: Option<PathBuf>,
     pub include_dirs: Vec<PathBuf>,
@@ -134,6 +196,16 @@ impl Default for MakeArgs {
     }
 }
 
+/// Retrieve the next positional argument for an option that requires one.
+///
+/// If `i` is out of range, prints the canonical GNU Make error message and
+/// exits with code 2.
+///
+/// # Arguments
+///
+/// * `args` — the full `argv` slice
+/// * `i`    — index of the expected argument (already advanced past the flag)
+/// * `opt`  — option name used in the error message (e.g. `"f"`, `"file"`)
 fn require_arg(args: &[String], i: usize, opt: &str) -> String {
     if i < args.len() {
         args[i].clone()
@@ -144,8 +216,16 @@ fn require_arg(args: &[String], i: usize, opt: &str) -> String {
     }
 }
 
-/// Accumulate a -C directory path.
-/// Multiple -C options are chained: each is relative to the previous result.
+/// Accumulate a `-C` directory path.
+///
+/// Multiple `-C` options are chained: each value is resolved relative to the
+/// result of all previous `-C` options.  An absolute `new_dir` resets the
+/// chain.  This mirrors GNU Make's own `-C` chaining semantics.
+///
+/// # Arguments
+///
+/// * `current` — the accumulated directory so far, or `None` on the first `-C`
+/// * `new_dir`  — the raw string from the command line
 fn accumulate_dir(current: Option<PathBuf>, new_dir: &str) -> Option<PathBuf> {
     let new_path = PathBuf::from(new_dir);
     let combined = if let Some(cur) = current {
@@ -160,6 +240,18 @@ fn accumulate_dir(current: Option<PathBuf>, new_dir: &str) -> Option<PathBuf> {
     Some(combined)
 }
 
+/// Parse `argv` into a [`MakeArgs`] struct.
+///
+/// Reads and merges `GNUMAKEFLAGS` (processed first, then cleared) and
+/// `MAKEFLAGS` before scanning the command-line arguments.  The result
+/// reflects the final merged flag state.
+///
+/// Unknown long options cause a GNU Make-compatible error message on stderr
+/// followed by `process::exit(2)`.
+///
+/// # Panics
+///
+/// Does not panic.  All error paths call `process::exit`.
 pub fn parse_args() -> MakeArgs {
     let args: Vec<String> = env::args().collect();
     let mut result = MakeArgs::default();
@@ -571,10 +663,15 @@ pub fn parse_args() -> MakeArgs {
     result
 }
 
-/// Split a MAKEFLAGS string into tokens, respecting backslash escaping.
-/// A backslash before any character escapes it: `\ ` means a literal space
-/// (not a word separator), `\\` means a literal backslash.
-/// The unescaped value of each token (with backslashes removed) is returned.
+/// Tokenise a `MAKEFLAGS`-style string, honouring backslash escaping.
+///
+/// A backslash immediately before any character prevents that character from
+/// acting as a word separator: `\ ` embeds a literal space in the current
+/// token, `\\` embeds a literal backslash.  The returned tokens have
+/// backslash-escape sequences resolved (the backslashes are removed).
+///
+/// This is needed because GNU Make uses backslash escaping to embed spaces
+/// and special characters in `MAKEFLAGS` values such as `--eval=…`.
 fn split_makeflags_tokens(flags: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -605,6 +702,25 @@ fn split_makeflags_tokens(flags: &str) -> Vec<String> {
     tokens
 }
 
+/// Parse a `MAKEFLAGS`-style string and merge its flags into `result`.
+///
+/// The format is:
+/// - An optional leading run of single-letter flags with no `-` prefix
+///   (e.g. `"erR"`).
+/// - Any number of long options in `--flag` / `--flag=value` form.
+/// - An optional `--` separator after which every token is a `NAME=value`
+///   variable assignment.
+///
+/// Backslash escaping of spaces (e.g. `--eval=foo\ bar`) is handled by
+/// [`split_makeflags_tokens`] before individual tokens are processed.
+///
+/// This function is called from [`parse_args`] for the environment
+/// variables and from [`eval`] when a makefile assigns to `MAKEFLAGS`.
+///
+/// # Arguments
+///
+/// * `flags`  — the raw `MAKEFLAGS` / `GNUMAKEFLAGS` string
+/// * `result` — the [`MakeArgs`] to update in-place
 pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
     // MAKEFLAGS format:
     //   - May start with single-letter flags bundled (no leading '-'), e.g. "erR"

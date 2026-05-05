@@ -1,5 +1,36 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Directive parsing (conditionals, include, vpath, export, define)
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Directive parsing for jmake.
+//!
+//! This module handles the structural directives that appear at the top level
+//! of a makefile.  The structural parser in `parser/mod.rs` delegates here
+//! once it recognises a directive keyword.
+//!
+//! # Covered directives
+//!
+//! | Directive | Parser function |
+//! |-----------|-----------------|
+//! | `ifeq` / `ifneq` / `ifdef` / `ifndef` | [`parse_conditional`] |
+//! | `include` / `-include` / `sinclude`    | [`parse_include`] |
+//! | `vpath`                                | [`parse_vpath`] |
+//! | `export` / `unexport`                  | [`parse_export`] |
+//! | `define` / `override define` / `export define` | [`parse_define_start`] |
+//!
+//! Each function returns a [`ParsedLine`] variant that the evaluator in
+//! `eval/mod.rs` acts on.
+//!
+//! # Conditional argument parsing
+//!
+//! Both `(arg1,arg2)` syntax and `'arg1' 'arg2'` / `"arg1" "arg2"` syntax are
+//! supported for `ifeq` / `ifneq`.  Variable references (`$(…)` / `${…}`) are
+//! tracked by depth to avoid treating a comma inside a reference as the
+//! argument separator.
+//!
+//! # Thread safety
+//!
+//! All functions in this module are stateless and safe to call from any context.
 
 use crate::types::*;
 
