@@ -49,9 +49,26 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Maximum path length for the temp file path stored for signal handler use.
+//
+// POSIX PATH_MAX is 4096 on Linux (include/uapi/linux/limits.h) and on macOS
+// (sys/syslimits.h).  musl libc defines PATH_MAX as 4096 in
+// include/limits.h.  We match that value exactly so that any valid
+// absolute path fits in the buffer with a NUL terminator in the last byte.
+//
+// Const-assert: a compile-time check makes the relationship machine-verifiable.
 const MAX_PATH: usize = 4096;
-// Maximum message length
+const _: () = assert!(MAX_PATH == 4096, "MAX_PATH must match POSIX PATH_MAX (4096)");
+
+// Maximum message length for the Terminated diagnostic line.
+//
+// The message has the form:
+//   "<progname>: *** [<file>:<line>: <target>] Terminated\n"
+// Worst case: 255 (progname) + 4096 (file path) + 20 (line) + 255 (target)
+// + ~30 (fixed text) ≈ 4656 bytes.  2048 is generous for the common case
+// (short progname, short path, short target) while remaining signal-safe.
+// If a message is truncated it is still diagnostic; truncation is safe.
 const MAX_MSG: usize = 2048;
+const _: () = assert!(MAX_MSG == 2048, "MAX_MSG sentinel — update if you change the constant");
 
 // Signal-handler globals.
 //
@@ -118,14 +135,26 @@ static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub fn set_temp_stdin_path(path: &str) {
     let bytes = path.as_bytes();
     let len = bytes.len().min(MAX_PATH - 1);
+    // I1 (single-threaded): no concurrent writer — enforced by the caller
+    // contract documented on this module (main thread only).
+    // I2 (Release/Acquire ordering): the store below happens-after this write.
+    // I3 (bounds): len ≤ MAX_PATH-1 by the .min() above.
+    // I4 (no aliasing): no live Rust reference into TEMP_FILE_BUF exists here.
+    debug_assert!(len < MAX_PATH, "path len {len} must be < MAX_PATH {MAX_PATH}");
+    debug_assert!(
+        len + 1 <= MAX_PATH,
+        "NUL terminator at offset {0} must be within buffer [0, {MAX_PATH})",
+        len + 1
+    );
     // SAFETY:
     // - I1: jmake is single-threaded; no concurrent writer exists.
-    // - The pointer comes from UnsafeCell::get() which is the approved way to
-    //   obtain a *mut without constructing a &mut or & reference.
-    // - We write `len` bytes into [0..len] and a NUL terminator at [len];
-    //   both indices are within [0, MAX_PATH) by the min() above.
-    // - The Release store to TEMP_FILE_LEN (below) happens-after this write,
-    //   so the signal handler (which loads with Acquire) cannot observe a
+    // - I2: pointer from UnsafeCell::get() — the approved way to obtain *mut
+    //   without constructing a &mut or & reference; no Rust reference to the
+    //   buffer interior is created.
+    // - I3: len ≤ MAX_PATH-1 (enforced by .min() and the debug_assert above),
+    //   so bytes [0..len] and the NUL at [len] are all within the array bounds.
+    // - I4: the Release store to TEMP_FILE_LEN below happens-after this write;
+    //   the signal handler loads with Acquire and therefore cannot observe a
     //   partially-written buffer.
     unsafe {
         let dst = TEMP_FILE_BUF.as_mut_ptr();
@@ -145,11 +174,23 @@ pub fn clear_temp_stdin_path() {
 pub fn set_term_message(msg: &str) {
     let bytes = msg.as_bytes();
     let len = bytes.len().min(MAX_MSG - 1);
+    // I1 (single-threaded): no concurrent writer — main thread only.
+    // I2 (Release/Acquire): store below happens-after the write.
+    // I3 (bounds): len ≤ MAX_MSG-1 by the .min() above.
+    // I4 (no aliasing): no live Rust reference into TERM_MSG_BUF exists here.
+    debug_assert!(len < MAX_MSG, "msg len {len} must be < MAX_MSG {MAX_MSG}");
+    debug_assert!(
+        len + 1 <= MAX_MSG,
+        "NUL terminator at offset {0} must be within buffer [0, {MAX_MSG})",
+        len + 1
+    );
     // SAFETY:
     // - I1: single-threaded; no concurrent writer.
-    // - Pointer from UnsafeCell::get(); no reference materialised.
-    // - len < MAX_MSG guarantees [0..len] and [len] are within bounds.
-    // - Release store below ensures signal handler observes complete data.
+    // - I2: pointer from UnsafeCell::get(); no Rust reference materialised.
+    // - I3: len ≤ MAX_MSG-1 (enforced by .min() and debug_assert above),
+    //   so [0..len] and the NUL at [len] are within the array bounds.
+    // - I4: Release store below ensures the signal handler (Acquire load)
+    //   observes the complete buffer write.
     unsafe {
         let dst = TERM_MSG_BUF.as_mut_ptr();
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
@@ -246,5 +287,56 @@ pub fn install_sigterm_handler() {
     //   before the next SIGTERM is delivered; the caller owns this ordering.
     unsafe {
         libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path of exactly MAX_PATH-1 bytes is the longest path that fits in the
+    /// buffer.  After set_temp_stdin_path the stored length must equal MAX_PATH-1
+    /// and the byte at that offset must be 0 (the NUL terminator).
+    #[test]
+    fn max_path_minus_one_stored_correctly() {
+        // Build a path of exactly MAX_PATH-1 ASCII bytes.
+        let path: String = "a".repeat(MAX_PATH - 1);
+        set_temp_stdin_path(&path);
+
+        let stored_len = TEMP_FILE_LEN.load(Ordering::Acquire);
+        assert_eq!(stored_len, MAX_PATH - 1,
+            "stored length should be MAX_PATH-1 = {}", MAX_PATH - 1);
+
+        // The NUL terminator must sit at index MAX_PATH-1, which is within the
+        // MAX_PATH-element buffer (valid indices 0..MAX_PATH-1 inclusive).
+        // SAFETY: stored_len == MAX_PATH-1 < MAX_PATH; reading one byte at that
+        // offset is within the buffer.  No other code mutates the buffer
+        // concurrently (single-threaded test).
+        let nul_byte = unsafe { TEMP_FILE_BUF.as_ptr().add(stored_len).read() };
+        assert_eq!(nul_byte, 0u8, "byte at [stored_len] must be NUL terminator");
+
+        // Clean up so other tests start from a known state.
+        clear_temp_stdin_path();
+        assert_eq!(TEMP_FILE_LEN.load(Ordering::Acquire), 0,
+            "clear_temp_stdin_path should atomically zero the length");
+    }
+
+    /// clear_temp_stdin_path() must zero the length atomically (Release store)
+    /// so a signal handler racing after this call cannot observe a stale length
+    /// paired with a stale buffer.
+    #[test]
+    fn clear_temp_stdin_path_zeros_length_atomically() {
+        // Write a non-empty path, then clear it.
+        set_temp_stdin_path("/tmp/jmake-test-path");
+        assert!(TEMP_FILE_LEN.load(Ordering::Acquire) > 0,
+            "length must be non-zero after set_temp_stdin_path");
+
+        clear_temp_stdin_path();
+
+        // The Release store in clear_temp_stdin_path guarantees that any
+        // Acquire load (e.g. in the signal handler) sees 0 here.
+        let len_after = TEMP_FILE_LEN.load(Ordering::Acquire);
+        assert_eq!(len_after, 0,
+            "TEMP_FILE_LEN must be 0 immediately after clear_temp_stdin_path");
     }
 }

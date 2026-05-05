@@ -750,45 +750,62 @@ impl MakeState {
                     // immediately via the same path as the normal case (below).
                     // Variable assignments (the common case here) are safe to execute immediately.
                     //
+                    // WHY the mutable cast is needed:
+                    //   `expand_function` holds `&self` because the entire expansion
+                    //   engine works through shared references (enabling $(call) and
+                    //   $(foreach) to re-enter freely).  `eval_string` requires
+                    //   `&mut self` because it calls `process_parsed_lines`, which
+                    //   inserts new entries into `self.db.variables` (an IndexMap
+                    //   that may reallocate).  There is no `RefCell` around `db`
+                    //   today, so the only available escape hatch is this cast.
+                    //
+                    // WHAT CANNOT be done inside the eval'd content:
+                    //   1. Redefine the variable currently being expanded.
+                    //      (vars_being_expanded catches this and returns "" to break
+                    //      the cycle, but the outer expansion still sees the pre-eval
+                    //      value for the current call frame.)
+                    //   2. Define new rule *prerequisites* (the in_recipe /
+                    //      in_second_expansion guard above already aborted if that
+                    //      was attempted here).
+                    //   3. Use any of the RefCell-guarded fields while they are
+                    //      already borrowed — the debug_asserts below catch this.
+                    //
                     // SAFETY:
-                    // - `expanded` is a fully-owned String; no reference into
-                    //   `self.db.variables` or any other `self` field is alive at
-                    //   this point in the current stack frame.
-                    // - All RefCell borrow guards (e.g. for `in_second_expansion`,
-                    //   `in_recipe_execution`, `expansion_caller_stack`) that were
-                    //   taken earlier in this function have been dropped before this
-                    //   block (they are let-bindings that fell out of scope).
-                    // - jmake is single-threaded: no concurrent mutation of `self`
-                    //   is possible from another thread.
-                    // - `eval_string` takes `&mut self` and may insert into
-                    //   `self.db.variables` (IndexMap), which could reallocate the
-                    //   map's internal storage.  All prior `.get()` borrows from
-                    //   the map have been dropped (callers to `expand_var_value`
-                    //   clone the Variable before calling, so no &Variable from
-                    //   the map is live on the stack).
-                    // - The `&self → *mut Self` cast relies on the invariant that
-                    //   the only aliased reference (`self: &MakeState`) does not
-                    //   overlap with anything that `eval_string` writes through the
-                    //   raw pointer.  The fields that `eval_string` writes
-                    //   (db.variables, current_file, current_line, eval_pending)
-                    //   are not referenced by any live borrow at this site.
-                    //   Fields accessed via `RefCell` (current_file, current_line,
-                    //   etc.) have runtime borrow-checking; the RefCell guards
-                    //   above have been released.
-                    // - KNOWN LIMITATION: this pattern is not provably sound under
-                    //   Stacked Borrows / MIRI because `self: &Self` aliases the
-                    //   mutation target.  A fully sound fix requires wrapping `db`
-                    //   in `RefCell<MakeDatabase>` (tracked for a future refactor).
-                    // - debug_assert: verifies that no RefCell in MakeState is
-                    //   currently borrowed exclusively (catching re-entrant bugs
-                    //   in debug builds that this cast cannot prevent).
+                    // - I1 (pointer validity): `self` is a valid, aligned reference
+                    //   to `MakeState`; casting `*const Self → *mut Self` gives a
+                    //   valid mutable raw pointer to the same allocation.
+                    // - I2 (no live map references): every `self.db.variables.get()`
+                    //   call in this file uses `.cloned()` before calling
+                    //   `expand_var_value`, so no `&Variable` reference into the
+                    //   IndexMap is live anywhere on the call stack above this point.
+                    //   `eval_string` may reallocate the map; that is safe only
+                    //   because of this cloning discipline.
+                    // - I3 (no live RefCell borrows): `in_second_expansion`,
+                    //   `in_recipe_execution`, and `eval_pending` borrows taken
+                    //   earlier in this function were let-bindings that are now out
+                    //   of scope.  The debug_asserts below verify this at runtime in
+                    //   debug builds; a panic here indicates a re-entrancy bug.
+                    // - I4 (single-threaded): jmake never spawns threads during
+                    //   expansion; no concurrent write to `self` is possible.
+                    // - KNOWN LIMITATION: the cast is not provably sound under
+                    //   Stacked Borrows / MIRI because `self: &Self` nominally
+                    //   aliases the mutation target.  The fully sound fix is
+                    //   wrapping `db` in `RefCell<MakeDatabase>` (deferred refactor).
                     debug_assert!(
                         self.eval_pending.try_borrow().is_ok(),
-                        "eval_pending is exclusively borrowed at $(eval) call site"
+                        "eval_pending is exclusively borrowed at $(eval) call site — re-entrancy bug"
                     );
                     debug_assert!(
                         self.in_second_expansion.try_borrow().is_ok(),
-                        "in_second_expansion is exclusively borrowed at $(eval) call site"
+                        "in_second_expansion is exclusively borrowed at $(eval) call site — re-entrancy bug"
+                    );
+                    debug_assert!(
+                        self.in_recipe_execution.try_borrow().is_ok(),
+                        "in_recipe_execution is exclusively borrowed at $(eval) call site — re-entrancy bug"
+                    );
+                    debug_assert!(
+                        self.expansion_caller_stack.try_borrow().is_ok(),
+                        "expansion_caller_stack is exclusively borrowed at $(eval) call site — re-entrancy bug"
                     );
                     let result = unsafe {
                         let self_ptr: *mut Self = self as *const Self as *mut Self;
@@ -853,36 +870,67 @@ impl MakeState {
                     // registered BEFORE the eval'd rules (preserving definition order for
                     // double-colon rules like `all:: ; @echo it` followed by `$(eval all:: ; @echo worked)`).
                     if !auto_vars.is_empty() {
-                        // Inside call/foreach/let: execute immediately.
+                        // Inside call/foreach/let: execute immediately so that
+                        // variable changes (e.g. `$(eval res:=...)`) are visible
+                        // to subsequent loop iterations.
+                        //
+                        // WHY the mutable cast is needed:
+                        //   Same reason as the recipe/second-expansion path above:
+                        //   `expand_function` only has `&self`, but `eval_string`
+                        //   requires `&mut self` to insert into `self.db.variables`.
+                        //   Immediate execution (rather than deferral via
+                        //   `eval_pending`) is required here so that assignments
+                        //   made by one $(foreach) iteration are visible to the
+                        //   next iteration in the same loop body.
+                        //
+                        // WHAT CANNOT be done inside the eval'd content:
+                        //   1. Redefine the loop/call variable currently being
+                        //      expanded — the vars_being_expanded guard returns ""
+                        //      to break the cycle, but the outer iteration still
+                        //      sees the value from before the eval.
+                        //   2. Access any RefCell field that is currently held
+                        //      as a `borrow_mut()` guard — the debug_asserts below
+                        //      catch this in debug builds.
+                        //   3. Any operation that would require a re-entrant mutable
+                        //      borrow of `self.db` (not possible today; `db` is not
+                        //      behind a RefCell, and this is the only mutation path).
                         //
                         // SAFETY:
-                        // - `final_content` is a fully-owned String; it does not borrow
-                        //   any field of `self`.
-                        // - All RefCell borrow guards for `in_second_expansion`,
-                        //   `in_recipe_execution`, `expansion_caller_stack`, and
-                        //   `eval_pending` that were taken earlier in this function
-                        //   have been dropped before this block.
-                        // - Every call to `expand_var_value` in the expand chain
-                        //   that is currently on the stack receives a *cloned*
-                        //   `Variable` value; no `&Variable` reference into
-                        //   `self.db.variables` is live anywhere on the call stack
-                        //   above this point (ensured by the `.cloned()` calls at
-                        //   every `self.db.variables.get(...)` site in this file).
-                        // - jmake is single-threaded: no concurrent mutation.
-                        // - `eval_string` may insert into `self.db.variables`
-                        //   (IndexMap), including insertions that reallocate the
-                        //   map's storage.  The preceding cloning invariant ensures
-                        //   no live pointer into the old storage exists.
-                        // - KNOWN LIMITATION: the `&self → *mut Self` cast is not
-                        //   provably sound under Stacked Borrows.  The fully sound
-                        //   fix is wrapping `db` in `RefCell<MakeDatabase>`.
+                        // - I1 (pointer validity): `self` is a valid, aligned
+                        //   reference; `*const Self as *mut Self` is a valid raw
+                        //   pointer to the same allocation.
+                        // - I2 (no live map references): `final_content` is a
+                        //   fully-owned `String`; it holds no reference into `self`.
+                        //   All `self.db.variables.get(...)` sites in this file use
+                        //   `.cloned()` before calling `expand_var_value`, so no
+                        //   `&Variable` reference into the IndexMap is live anywhere
+                        //   on the call stack above this point.  `eval_string` may
+                        //   reallocate the map; that is safe because of this
+                        //   cloning discipline.
+                        // - I3 (no live RefCell borrows): all RefCell borrow guards
+                        //   taken earlier in this function have gone out of scope
+                        //   before this block.  The debug_asserts below verify this
+                        //   at runtime in debug builds.
+                        // - I4 (single-threaded): jmake never spawns threads during
+                        //   expansion; no concurrent write to `self` is possible.
+                        // - KNOWN LIMITATION: not provably sound under Stacked
+                        //   Borrows / MIRI.  Fully sound fix: wrap `db` in
+                        //   `RefCell<MakeDatabase>` (deferred refactor).
                         debug_assert!(
                             self.eval_pending.try_borrow().is_ok(),
-                            "eval_pending is exclusively borrowed at $(eval) call site"
+                            "eval_pending is exclusively borrowed at $(eval) call site — re-entrancy bug"
                         );
                         debug_assert!(
                             self.in_second_expansion.try_borrow().is_ok(),
-                            "in_second_expansion is exclusively borrowed at $(eval) call site"
+                            "in_second_expansion is exclusively borrowed at $(eval) call site — re-entrancy bug"
+                        );
+                        debug_assert!(
+                            self.in_recipe_execution.try_borrow().is_ok(),
+                            "in_recipe_execution is exclusively borrowed at $(eval) call site — re-entrancy bug"
+                        );
+                        debug_assert!(
+                            self.expansion_caller_stack.try_borrow().is_ok(),
+                            "expansion_caller_stack is exclusively borrowed at $(eval) call site — re-entrancy bug"
                         );
                         let result = unsafe {
                             let self_ptr: *mut Self = self as *const Self as *mut Self;
