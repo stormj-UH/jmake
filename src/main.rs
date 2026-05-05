@@ -247,7 +247,7 @@ mod security_tests {
     fn makeflags_jobs_long_valid() {
         let mut args = MakeArgs::default();
         parse_makeflags("--jobs=4", &mut args);
-        assert_eq!(args.jobs, 4);
+        assert_eq!(args.jobs.get(), 4);
         assert!(args.jobs_explicit, "--jobs= from MAKEFLAGS must set jobs_explicit");
     }
 
@@ -288,7 +288,7 @@ mod security_tests {
     fn makeflags_jobs_short_sets_explicit() {
         let mut args = MakeArgs::default();
         parse_makeflags("-j8", &mut args);
-        assert_eq!(args.jobs, 8);
+        assert_eq!(args.jobs.get(), 8);
         assert!(args.jobs_explicit,
             "-j in MAKEFLAGS must set jobs_explicit to protect against makefile override");
     }
