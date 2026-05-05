@@ -1,4 +1,129 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Evaluation engine — the central state machine that drives jmake.
+//!
+//! This module owns `MakeState`, which is the single authoritative structure
+//! that exists for the lifetime of one jmake invocation.  Everything that
+//! turns a parsed makefile into a built target passes through here: variable
+//! initialization, makefile reading, conditional evaluation, rule registration,
+//! include-file rebuilding, and the main `run` entry point.
+//!
+//! Variable *expansion* lives in the submodule `expand` (`expand.rs`).  The
+//! split is intentional: mod.rs handles the *state machine* (what to do with
+//! each parsed line), and expand.rs handles the *string transformations* (how
+//! to substitute `$(VAR)` references).
+//!
+//! # Pipeline overview
+//!
+//! ```text
+//! main()
+//!   └─► MakeState::new(args)
+//!         └─► MakeState::run()
+//!               ├── init_variables()      — built-ins, env, cmdline vars
+//!               ├── read_makefiles()      — MAKEFILES var + default/named files
+//!               │     └─► read_makefile() → process_parsed_lines()
+//!               │                           (one call per file, recursive for includes)
+//!               ├── [flush eval_pending]  — eval'd content from makefile body
+//!               ├── try_update_makefiles() — rebuild stale makefiles, re-exec if any changed
+//!               └── exec::Executor::build_targets()
+//! ```
+//!
+//! # Key data structures
+//!
+//! | Structure | Purpose |
+//! |-----------|---------|
+//! | `MakeState` | Top-level runtime state; owns the database, shell, and all flags |
+//! | `MakeDatabase` (in `database`) | The rule and variable store built during parsing |
+//! | `Rule` (in `types`) | One rule entry: targets, prerequisites, recipe lines |
+//! | `Variable` (in `types`) | Name, raw value, flavor, origin, export flag |
+//! | `PendingInclude` | A deferred `include` that couldn't be resolved immediately |
+//! | `IncludeRuleInfo` | Computed description of a rule that can rebuild an include |
+//!
+//! # Evaluation lifecycle
+//!
+//! 1. **Parse** — `Parser` (in `parser`) yields `ParsedLine` variants for each
+//!    logical line (continuation lines joined, comments stripped, tabs preserved).
+//!
+//! 2. **Expand** — `process_parsed_lines` expands the parsed line's text with
+//!    `self.expand(…)` before dispatching on the `ParsedLine` variant.  Recipe
+//!    lines and recursive-variable values are stored *un-expanded* and expanded
+//!    later when the recipe runs or the variable is referenced.
+//!
+//! 3. **Evaluate** — the expanded line is categorised:
+//!    * Variable assignment → `set_variable`
+//!    * Rule header → `register_rule`
+//!    * Conditional directive → `evaluate_condition`
+//!    * Include directive → `read_makefile_display` (recursive)
+//!    * Special directives (`define`, `undefine`, `export`, `unexport`, `vpath`)
+//!      → handled inline
+//!
+//! 4. **Execute** — after all makefiles are read, `exec::Executor` traverses the
+//!    dependency graph, expands recipe lines with target-specific automatic
+//!    variables, and runs each recipe in the configured shell.
+//!
+//! # Re-entrancy model — how `$(eval)` works
+//!
+//! `$(eval CONTENT)` is processed by `expand_function` (in `expand.rs`) while
+//! the caller is in the middle of expanding a string.  `expand_function` holds
+//! only a shared reference `&self`, but `eval_string` requires `&mut self` to
+//! modify `self.db`.  The current implementation uses an `&self → *mut Self`
+//! cast guarded by three invariants:
+//!
+//! 1. **Single-threaded** — jmake never uses multiple threads during expansion.
+//! 2. **No live borrows into `self.db.variables`** — every call site that reads
+//!    a variable clones it (`.cloned()`) before calling `expand_var_value`, so
+//!    no `&Variable` reference from the map is live on the stack when eval runs.
+//! 3. **All `RefCell` guards dropped** — `debug_assert!(try_borrow().is_ok())`
+//!    verifies this in debug builds at each `$(eval)` call site.
+//!
+//! A future refactor will wrap `MakeDatabase` in a `RefCell` to eliminate the
+//! unsafe cast entirely.
+//!
+//! # Variable scoping
+//!
+//! Variables have three scopes, checked in this priority order during lookup:
+//!
+//! 1. **Automatic variables** — `$@`, `$<`, `$^`, `$*`, `$+`, `$?`, `$%`,
+//!    `$|`, and `$1`…`$N` (call arguments) in the `auto_vars` map passed to
+//!    `expand_with_auto_vars`.  These are transient and never stored in the db.
+//!
+//! 2. **Target-specific variables** — stored per `Rule` and per
+//!    `PatternSpecificVar` in `MakeDatabase`.  Applied by the executor when it
+//!    sets up the environment for a specific target's recipe.
+//!
+//! 3. **Global variables** — stored in `MakeDatabase::variables` (an
+//!    `IndexMap` that preserves insertion order, needed for `.VARIABLES`
+//!    expansion and deterministic `make -p` output).
+//!
+//! Variable *origin* (`VarOrigin`) records how a variable was set:
+//! `Default` < `Environment` < `File` < `CommandLine` < `Override`.  A
+//! non-`override` assignment cannot replace a `CommandLine` or `Override`
+//! variable; `set_variable` enforces this.
+//!
+//! # Thread safety
+//!
+//! `MakeState` is `!Send` and `!Sync`.  The only concurrency in jmake is in
+//! `exec::Executor` (recipe execution), which does not hold a reference to
+//! `MakeState` during recipe execution proper.  Include-file recipes are
+//! parallelised in `try_update_makefiles` via `std::thread::spawn`, but those
+//! threads receive pre-expanded recipe strings and never access `MakeState`.
+//!
+//! # Pattern matching
+//!
+//! Pattern rules use `%` as a stem wildcard.  The matching algorithm
+//! (`parser::match_pattern`) finds the longest literal prefix + suffix pair
+//! that can be satisfied by the target name; the matching portion becomes `$*`.
+//! For static pattern rules (`targets: target-pat: prereq-pat`), the stem is
+//! computed at parse time and stored in `Rule::static_stem`.
+//!
+//! Secondary expansion (`.SECONDEXPANSION:`) defers prerequisite expansion to
+//! build time so that automatic variables like `$@` are available inside
+//! prerequisite lists.  `in_second_expansion` is set to `true` by the executor
+//! before re-expanding prerequisites, blocking `$(eval)` from defining rules in
+//! that context.
+
 // Evaluation engine - variable expansion, rule processing, main state machine
 
 mod expand;
@@ -27,12 +152,24 @@ fn strip_dot_slash(s: &str) -> &str {
     s.strip_prefix("./").unwrap_or(s)
 }
 
-/// A pending include that couldn't be resolved during initial makefile reading.
+/// A deferred `include` (or `-include` / `sinclude`) directive whose target
+/// file did not exist when the directive was first encountered.
+///
+/// jmake defers resolution rather than failing immediately because the makefile
+/// itself may contain a rule to *build* the missing file.  After all makefile
+/// content has been read, `try_update_makefiles` checks every `PendingInclude`
+/// against the rule database and either builds the file, ignores the miss
+/// (when `ignore_missing` is true), or reports a fatal error.
 #[derive(Clone)]
 pub struct PendingInclude {
+    /// Path as it appeared in the `include` directive (not yet resolved via `-I`).
     pub file: String,
+    /// The makefile that issued this include (used in error messages).
     pub parent: String,
+    /// Line number within `parent` where the include appeared.
     pub lineno: usize,
+    /// True for `-include` and `sinclude`: a missing file that cannot be built
+    /// is silently ignored rather than being a fatal error.
     pub ignore_missing: bool,
 }
 
@@ -58,6 +195,31 @@ struct IncludeRuleInfo {
     stem: String,
 }
 
+/// The central runtime state for one jmake invocation.
+///
+/// `MakeState` is created once in `main`, passed to `run`, and lives until the
+/// process exits.  It owns every piece of mutable state that spans the
+/// parse→expand→execute pipeline:
+///
+/// * The parsed **rule and variable database** (`db: MakeDatabase`)
+/// * The **command-line arguments** and their makefile-modified view (`args`)
+/// * **File/line context** for error messages (`current_file`, `current_line`)
+/// * **Re-entrancy flags** that constrain what `$(eval)` may do at each phase
+/// * **Shell** command and flags used when running recipes
+/// * **Include tracking** (`pending_includes`, `include_recipe_ran`, etc.)
+/// * **Call/expansion stacks** needed for correct error location reporting
+///
+/// All fields that are mutated during a shared-borrow `expand_with_auto_vars`
+/// call are wrapped in `RefCell`; the rest are mutated only while `&mut self`
+/// is held (during `process_parsed_lines`, `register_rule`, etc.).
+///
+/// # Invariants
+///
+/// * Only one `MakeState` exists at a time.
+/// * `MakeState` is never sent to another thread.
+/// * `db.variables` must not be borrowed when `eval_string` is called (the
+///   unsafe `$(eval)` implementation relies on this; `debug_assert!` verifies
+///   it in debug builds).
 pub struct MakeState {
     pub args: MakeArgs,
     /// Snapshot of args as parsed from the command line (before any makefile modifications).
@@ -336,6 +498,27 @@ impl MakeState {
         state
     }
 
+    /// Execute a complete make run from start to finish.
+    ///
+    /// This is the top-level entry point called by `main` after `MakeState::new`.
+    /// The sequence is:
+    ///
+    /// 1. `init_variables` — register built-in variables (`MAKE`, `CURDIR`,
+    ///    `MAKEFLAGS`, etc.) and import the process environment.
+    /// 2. Register built-in implicit rules and default variables (unless `-r`/`-R`).
+    /// 3. Process `--eval` (`-E`) strings as if they appeared before the makefile.
+    /// 4. `read_makefiles` — read the `MAKEFILES` env variable, then the default
+    ///    or `-f`-specified makefiles.
+    /// 5. Drain `eval_pending` — execute any `$(eval)` content that was deferred
+    ///    at top-level during makefile parsing.
+    /// 6. `try_update_makefiles` — rebuild stale makefiles and re-exec if any
+    ///    changed.  This call may never return (it calls `exec` on success).
+    /// 7. Determine targets (from `-t` arguments or `.DEFAULT_GOAL`).
+    /// 8. Print database and exit if `-p`.
+    /// 9. Build targets via `exec::Executor`.
+    ///
+    /// Returns `Ok(())` on success, `Err(message)` for fatal errors that should
+    /// be printed and turned into a non-zero exit code by the caller.
     pub fn run(&mut self) -> Result<(), String> {
         self.init_variables();
 
@@ -1120,12 +1303,53 @@ impl MakeState {
         self.process_parsed_lines(&mut parser)
     }
 
+    /// Parse and evaluate a makefile-syntax string as if it appeared inline in
+    /// the current makefile.
+    ///
+    /// Creates an ephemeral `Parser` labelled `"<eval>"` and passes it through
+    /// `process_parsed_lines`.  Used both for `$(eval CONTENT)` (via the unsafe
+    /// re-entrant path in `expand_function`) and for `--eval` (`-E`) strings
+    /// processed before any makefile is read.
+    ///
+    /// Any rules, variable assignments, or directives in `content` are applied
+    /// to `self.db` as if the content appeared at the call site in the makefile.
+    /// Definition order relative to surrounding rules is preserved because
+    /// top-level `$(eval)` calls first flush `current_rule` before executing the
+    /// eval'd content (see the `eval_pending` drain in `process_parsed_lines`).
     pub fn eval_string(&mut self, content: &str) -> Result<(), String> {
         let mut parser = Parser::new(PathBuf::from("<eval>"));
         parser.load_string(content);
         self.process_parsed_lines(&mut parser)
     }
 
+    /// Process every logical line produced by `parser` and apply its effect to
+    /// `self`.
+    ///
+    /// This is the innermost loop of the evaluation engine.  For each line:
+    ///
+    /// 1. **Context update** — set `current_file`/`current_line` for diagnostics.
+    /// 2. **Define/endef accumulation** — if `parser.in_define`, accumulate lines
+    ///    until the matching `endef`, then store the result as a variable.
+    /// 3. **Conditional gating** — if the current branch is inactive (dead
+    ///    `ifdef`/`ifeq` block), only conditional directives are processed.
+    /// 4. **Selective expansion** — recipe lines are stored verbatim; assignment
+    ///    values are expanded only for `:=`/`::=` (simple) flavors.  Recursive
+    ///    (`=`) and append (`+=`) values are stored raw.  Inline recipes (`;` in
+    ///    a rule header) have only the header portion expanded.
+    /// 5. **Dispatch** — the expanded line is parsed into a `ParsedLine` variant
+    ///    and processed:
+    ///    * `Rule` → update `.DEFAULT_GOAL` if needed, save to `current_rule`
+    ///    * `Recipe` → append to `current_rule`
+    ///    * `VariableAssignment` → flush `current_rule`, call `set_variable` or
+    ///      update target-specific/pattern-specific variable store
+    ///    * `Include` → `read_makefile_display` (recursive) or `pending_includes`
+    ///    * `Conditional`, `Else`, `Endif` → manage `conditional_stack`
+    ///    * `Define`, `Undefine`, `Export`, `UnExport`, `VpathDirective` → in-place
+    /// 6. **Eval drain** — after each non-recipe line, drain `eval_pending` so
+    ///    deferred `$(eval)` content takes effect before the next line is processed.
+    ///
+    /// `current_rule` is flushed to `register_rule` whenever a non-recipe line
+    /// is encountered, at end-of-file, or before running deferred eval content.
     fn process_parsed_lines(&mut self, parser: &mut Parser) -> Result<(), String> {
         let mut current_rule: Option<Rule> = None;
         // When a static pattern rule expands to multiple targets, all targets
@@ -2147,6 +2371,41 @@ impl MakeState {
         Ok(())
     }
 
+    /// Insert a fully-parsed `Rule` into `self.db`.
+    ///
+    /// This function is called after a rule's recipe has been collected (when
+    /// the next non-recipe line is encountered, or at end-of-file).  It handles:
+    ///
+    /// * **`./` stripping** — normalizes `./foo` to `foo` in targets,
+    ///   prerequisites, and grouped siblings (but NOT in recipe text).
+    ///
+    /// * **Grouped target validation** — rules with `&:` syntax must provide a
+    ///   recipe; an empty-recipe grouped rule is a fatal error unless a prior
+    ///   rule for the same targets already has one.
+    ///
+    /// * **Special target dispatch** — if a target matches a `SpecialTarget`
+    ///   (`.PHONY`, `.PRECIOUS`, `.SUFFIXES`, `.SECONDEXPANSION`, etc.), the
+    ///   rule's prerequisites update the appropriate database field instead of
+    ///   the regular rule store.
+    ///
+    /// * **Default target** — the first non-special, non-pattern target in the
+    ///   file becomes `db.default_target` and sets `.DEFAULT_GOAL`.
+    ///
+    /// * **Pattern rules** — pushed to `db.pattern_rules`.  A no-recipe pattern
+    ///   rule cancels matching built-in rules (exact target+prereq pattern match).
+    ///   Double-colon pattern rules are marked `is_terminal`.
+    ///
+    /// * **Suffix rules** — detected via `is_suffix_rule` and converted to
+    ///   pattern rules via `suffix_to_pattern_rule`.
+    ///
+    /// * **Explicit rules** — merged into `db.rules[target]`:
+    ///   * Double-colon rules are always appended.
+    ///   * Single-colon rules merge prerequisites (recipe-bearing rule's prereqs
+    ///     come first) and replace the recipe only when the new rule has one
+    ///     (emitting a "overriding recipe" warning if the old rule also had one).
+    ///   * Order-only vs. normal prerequisite promotion is handled here: a prereq
+    ///     that appears as order-only in an earlier rule and as normal in a later
+    ///     rule is promoted to normal in the merged entry.
     fn register_rule(&mut self, rule: Rule) {
         // Canonicalize: strip leading "./" from target names, prerequisites, and
         // grouped sibling names so they match GNU make file-table behavior.
@@ -2610,6 +2869,45 @@ impl MakeState {
         }
     }
 
+    /// Store or update a variable in `self.db.variables`.
+    ///
+    /// This is the single authoritative path for all variable assignments that
+    /// originate from makefile content (not from the command line or the process
+    /// environment, which are handled in `init_variables`).
+    ///
+    /// # Assignment semantics by flavor
+    ///
+    /// * **`=` (Recursive)** — stores `value` verbatim; expansion happens at
+    ///   reference time.
+    /// * **`:=` / `::=` (Simple)** — `value` is already expanded by the
+    ///   caller (in `process_parsed_lines`); stored and returned as-is.
+    /// * **`:::=` (PosixSimple)** — `value` is already expanded; stored with
+    ///   `$` → `$$` escaping so that `+=` appends raw (unexpanded) text and the
+    ///   combined value can be lazily expanded as a Recursive variable.
+    /// * **`+=` (Append)** — if the existing variable is `Simple`, the appended
+    ///   value is expanded immediately; otherwise stored raw.  If the variable
+    ///   does not yet exist, creates it as Recursive.
+    /// * **`?=` (Conditional)** — no-op if the variable is already defined.
+    /// * **`!=` (Shell)** — expands `value` as a shell command via
+    ///   `shell_exec_with_env` and stores the output.
+    ///
+    /// # Override and protection rules
+    ///
+    /// * A `CommandLine` or `Override` variable cannot be replaced by a plain
+    ///   file assignment (non-`override`).
+    /// * With `-e` (`environment_overrides`), environment variables also cannot
+    ///   be overridden by file assignments.
+    /// * `MAKEFLAGS` is additionally protected against file assignments when
+    ///   `-e` is active.
+    ///
+    /// # Side effects
+    ///
+    /// * Assigning to `MAKEFLAGS` triggers `apply_makeflags_from_makefile` to
+    ///   re-parse and apply the new flags.
+    /// * Assigning to `MAKEOVERRIDES` rebuilds `MAKEFLAGS` with the new variable
+    ///   section.
+    /// * Assigning to `.DEFAULT_GOAL` updates `db.default_target` and the
+    ///   `default_goal_explicit` flag.
     fn set_variable(&mut self, name: &str, value: &str, flavor: &VarFlavor, is_override: bool, is_export: bool) {
         let origin = if is_override { VarOrigin::Override } else { VarOrigin::File };
         // Capture current source location for error reporting during lazy expansion.

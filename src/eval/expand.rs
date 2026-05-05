@@ -1,5 +1,96 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Variable expansion engine
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Variable expansion engine for jmake.
+//!
+//! This module implements `MakeState`'s expansion methods, turning strings that
+//! contain `$(VAR)`, `${VAR}`, and `$X` references into their final values.
+//! It is the innermost hot path of the entire build system: every rule header,
+//! every recipe line, every conditional guard, and every function argument
+//! passes through here at least once.
+//!
+//! # Position in the pipeline
+//!
+//! ```text
+//! Parser (lexical lines)
+//!   └─► process_parsed_lines  (mod.rs)
+//!         ├─► expand / expand_with_auto_vars   ← THIS FILE
+//!         │     ├─► expand_reference
+//!         │     │     ├─► expand_var_value        (recursive vars)
+//!         │     │     ├─► expand_function         (built-in calls)
+//!         │     │     └─► expand_substitution_ref ($(var:pat=rep))
+//!         │     └─► … recurse for nested $(…)
+//!         └─► register_rule / set_variable  (mod.rs)
+//! ```
+//!
+//! # Two-tier entry points
+//!
+//! * **`expand`** — expands a string with no automatic variables.  Used for
+//!   variable-definition values, include paths, and directive arguments where
+//!   `$@`, `$<`, `$^`, etc. are not in scope.
+//!
+//! * **`expand_with_auto_vars`** — the primary entry point everywhere else.
+//!   Callers supply a `&HashMap<String,String>` containing the automatic
+//!   variables in scope for the current recipe or pattern rule stem.  The map
+//!   is passed by reference and threaded through all recursive calls so that
+//!   inner expansions (nested `$(...)`, `$(call ...)`, `$(foreach ...)`) can
+//!   resolve `$@` without re-reading the global variable store.
+//!
+//! # Re-entrancy and the `$(eval)` problem
+//!
+//! `$(eval CONTENT)` is a first-class make function: it is processed inside
+//! `expand_function` while the caller is mid-expansion.  `eval_string` takes
+//! `&mut self`, but `expand_function` only has `&self`.  The unsafe `*const →
+//! *mut` cast (documented in the SAFETY comments at each call site) is the
+//! current workaround.  The invariant that makes it safe in practice:
+//!
+//! 1. **jmake is single-threaded** — no concurrent writer exists.
+//! 2. **All `Variable` values are cloned** before entering `expand_var_value`.
+//!    No `&Variable` borrow into `self.db.variables` is live across any
+//!    call that could reallocate the map.
+//! 3. **All `RefCell` guards are dropped** before the unsafe block executes.
+//!    `debug_assert!` checks on `try_borrow()` enforce this in debug builds.
+//!
+//! A fully sound alternative is to wrap `MakeDatabase` in a `RefCell`; that
+//! refactor is tracked but deferred because it would permeate the executor.
+//!
+//! # Variable flavors and expansion timing
+//!
+//! | Flavor | `VarFlavor` variant | Expansion timing |
+//! |--------|---------------------|-----------------|
+//! | `=` recursive | `Recursive` | Lazy — every time the variable is referenced |
+//! | `:=` simple | `Simple` | Eager — once at definition |
+//! | `:::=` POSIX simple | `PosixSimple` | Eager, then `$` → `$$` in stored value |
+//! | `!=` shell | `Shell` | Eager — runs shell at definition |
+//!
+//! `expand_var_value` dispatches on `VarFlavor`.  For `Recursive` variables it
+//! temporarily updates `current_file`/`current_line` to the variable's
+//! *definition* site so that error messages from functions like `$(error ...)` or
+//! `$(word ...)` point at the right location, while the `expansion_caller_stack`
+//! preserves the *reference* site for `$(warning)` and `$(error)`.
+//!
+//! # Infinite-recursion guard
+//!
+//! Recursive variables can reference themselves via `$(eval)`.  The
+//! `vars_being_expanded` set (keyed on `source_file:source_line` or raw value)
+//! breaks the cycle by returning an empty string if the same variable is
+//! encountered while it is already being expanded.
+//!
+//! # Automatic variables and the D/F modifier
+//!
+//! Single-character automatic variables (`$@`, `$<`, `$^`, `$+`, `$*`, `$?`,
+//! `$%`, `$|`) are resolved from the `auto_vars` map before consulting the
+//! global variable store.  The `$(var_D)` / `$(var_F)` directory/file modifier
+//! form is handled in `expand_reference` by slicing off the trailing `D` or `F`
+//! and calling `dir_part` / `file_part` on the expanded base value.
+//!
+//! # Thread safety
+//!
+//! None of these functions are `Send` or `Sync`.  `MakeState` is designed for
+//! single-threaded use throughout.  The thread-local `IN_SHELL_EXEC_WITH_ENV`
+//! flag (in `mod.rs`) guards against accidental re-entrancy in the one code path
+//! that calls back into the OS environment.
 
 use crate::eval::MakeState;
 use crate::eval::make_progname;
@@ -8,12 +99,53 @@ use crate::types::*;
 use std::collections::HashMap;
 
 impl MakeState {
-    /// Expand all variable references and function calls in a string
+    /// Expand all variable and function references in `input`, with no automatic
+    /// variables in scope.
+    ///
+    /// Delegates to [`expand_with_auto_vars`] with an empty `auto_vars` map.
+    /// Use this for contexts where `$@`, `$<`, `$^`, etc. are undefined:
+    /// variable-assignment values, `include` paths, conditional arguments, and
+    /// any directive that is evaluated outside a recipe or pattern-rule body.
     pub fn expand(&self, input: &str) -> String {
         self.expand_with_auto_vars(input, &HashMap::new())
     }
 
-    /// Expand with automatic variables ($@, $<, $^, etc.)
+    /// Expand all variable and function references in `input`, with automatic
+    /// variables in scope.
+    ///
+    /// # Parameters
+    ///
+    /// * `input` — the raw makefile text to expand.  May contain any mix of
+    ///   `$(VAR)`, `${VAR}`, `$X` single-character references, `$$` literals,
+    ///   and plain text.
+    /// * `auto_vars` — automatic variables for the current recipe invocation or
+    ///   pattern rule.  Keys are single characters (`"@"`, `"<"`, `"^"`, `"+"`,
+    ///   `"*"`, `"?"`, `"%"`, `"|"`) or numeric call-argument positions
+    ///   (`"1"`, `"2"`, …) as used by `$(call)`, `$(foreach)`, and `$(let)`.
+    ///   This map is threaded through every recursive call so inner expansions
+    ///   see the same automatic-variable scope as the outer one.
+    ///
+    /// # Returns
+    ///
+    /// The fully expanded string.  Undefined variables expand to the empty
+    /// string (optionally with a warning if `--warn-undefined-variables` is
+    /// active).  Unterminated `$(` / `${` is a fatal error that prints a
+    /// diagnostic and calls `std::process::exit(2)`.
+    ///
+    /// # Re-entrancy
+    ///
+    /// This function is re-entrant through `$(eval)`.  Calling `$(eval ...)` in
+    /// the middle of expansion causes `eval_string` to run, which may call back
+    /// into `expand_with_auto_vars` for the newly parsed content.  The
+    /// `vars_being_expanded` set and the `expansion_caller_stack` together
+    /// prevent infinite recursion and preserve correct error-reporting locations.
+    ///
+    /// # Performance
+    ///
+    /// The function iterates over `input` byte-by-byte.  For ASCII-only input
+    /// (the overwhelming common case for makefiles) this is a single pass with
+    /// no heap allocation until the first `$` is encountered.  Multi-byte UTF-8
+    /// characters are forwarded via `str::chars()` to avoid splitting sequences.
     pub fn expand_with_auto_vars(&self, input: &str, auto_vars: &HashMap<String, String>) -> String {
         let mut result = String::with_capacity(input.len());
         let bytes = input.as_bytes();
@@ -139,6 +271,29 @@ impl MakeState {
         result
     }
 
+    /// Dispatch a single `$(…)` or `${…}` reference once the delimiters have
+    /// been stripped.
+    ///
+    /// `content` is the raw text between the opening `$(` (or `${`) and the
+    /// matching `)` (or `}`), for example:
+    ///
+    /// * `"CC"` — simple variable lookup
+    /// * `"OBJS:.o=.d"` — substitution reference
+    /// * `"patsubst %.c,%.o,$(SRCS)"` — function call
+    /// * `"@D"` — automatic-variable with D/F modifier
+    ///
+    /// Decision tree (in order):
+    ///
+    /// 1. Colon found before whitespace → substitution reference.
+    /// 2. Whitespace found and the prefix is a known built-in → function call.
+    /// 3. Two-character content ending in `D` or `F` with a single-char prefix →
+    ///    directory/file modifier on an automatic variable.
+    /// 4. Otherwise → simple variable lookup (name is itself expanded first to
+    ///    support computed variable names like `$($(WHICH))`).
+    ///
+    /// The `.SHELLSTATUS` and `.VARIABLES` pseudo-variables are synthesised here
+    /// rather than stored in `db.variables` because their values change
+    /// dynamically and cannot be cached.
     fn expand_reference(&self, content: &str, auto_vars: &HashMap<String, String>) -> String {
         // Check for substitution reference: $(var:pattern=replacement)
         // GNU Make allows `\:` as the separator, with the `\` stripped from the var name.
@@ -273,6 +428,33 @@ impl MakeState {
         String::new()
     }
 
+    /// Expand a single `Variable`'s value according to its flavor.
+    ///
+    /// # Flavor dispatch
+    ///
+    /// * **`Simple` / `PosixSimple`** — the value was already expanded at
+    ///   assignment time; return it verbatim.  No allocation is needed.
+    ///
+    /// * **`Recursive`** — the value must be expanded now.  Three things happen:
+    ///   1. The recursion guard (`vars_being_expanded`) prevents a variable from
+    ///      expanding itself.  The key is `"source_file:source_line"` when those
+    ///      are known, falling back to the raw value string.
+    ///   2. `current_file`/`current_line` are temporarily overridden to the
+    ///      variable's *definition* site so that functions like `$(word ...)` that
+    ///      validate their arguments report the right location.
+    ///   3. The current `(file, line)` is pushed onto `expansion_caller_stack` so
+    ///      `$(error)` and `$(warning)` can report the *reference* site instead.
+    ///
+    /// * **Everything else** (e.g. `Append` or `Shell` stored intermediaries) —
+    ///   treated as recursive: expand the stored value.
+    ///
+    /// # Re-entrancy via `$(eval)`
+    ///
+    /// `expand_with_auto_vars` called from this function may encounter `$(eval)`
+    /// and call back into `eval_string`.  `eval_string` can insert new entries
+    /// into `self.db.variables`, potentially reallocating its backing storage.
+    /// **Callers must clone the `Variable` before calling this function** so
+    /// that no `&Variable` reference into the map is live across the call.
     fn expand_var_value(&self, var: &Variable, auto_vars: &HashMap<String, String>) -> String {
         match var.flavor {
             VarFlavor::Recursive => {
@@ -332,6 +514,17 @@ impl MakeState {
         }
     }
 
+    /// Evaluate a substitution reference `$(var:pattern=replacement)`.
+    ///
+    /// Substitution references are syntactic sugar for `$(patsubst ...)`:
+    /// each whitespace-separated word in `$(var)` has `pattern` replaced by
+    /// `replacement`, with `%` acting as the wildcard.  When neither `pattern`
+    /// nor `replacement` contains `%`, an implicit `%` is prepended to each,
+    /// making them suffix-match rules (e.g. `$(OBJS:.o=.d)`).
+    ///
+    /// All three components — `var_name`, `pattern`, and `replacement` — are
+    /// expanded via `expand_with_auto_vars` before the substitution is applied,
+    /// so computed variable names and patterns work as expected.
     fn expand_substitution_ref(&self, var_name: &str, pattern: &str, replacement: &str, auto_vars: &HashMap<String, String>) -> String {
         let expanded_name = self.expand_with_auto_vars(var_name, auto_vars);
         let var_value = if let Some(val) = auto_vars.get(&expanded_name) {
@@ -367,6 +560,57 @@ impl MakeState {
         results.join(" ")
     }
 
+    /// Expand a built-in function call `$(name args_str)`.
+    ///
+    /// # Parameters
+    ///
+    /// * `name` — the function name with no surrounding whitespace (e.g.
+    ///   `"patsubst"`, `"eval"`, `"call"`).
+    /// * `args_str` — everything after the first whitespace, including commas
+    ///   that separate arguments.  Arguments are **not** pre-split; each special
+    ///   case or the generic `split_function_args_max` call does the splitting.
+    /// * `auto_vars` — threaded through from `expand_with_auto_vars`.
+    ///
+    /// # Dispatch strategy
+    ///
+    /// Functions fall into two categories:
+    ///
+    /// 1. **State-accessing** — handled by an explicit `match` arm here because
+    ///    they need `&self` or need to call `eval_string`:
+    ///    `eval`, `info`, `warning`, `error`, `value`, `origin`, `flavor`,
+    ///    `call`, `foreach`, `let`, `if`, `or`, `and`, `shell`, `file`.
+    ///
+    /// 2. **Pure** — dispatched through the `functions::get_builtin_functions()`
+    ///    table as `(handler_fn, min_args, max_args)` triples.  Arguments are
+    ///    expanded up to `max_args` before being passed to the handler.
+    ///    `word`, `wordlist`, and `intcmp` have their numeric arguments validated
+    ///    before the dispatch.
+    ///
+    /// # `$(eval)` specifics
+    ///
+    /// `$(eval)` has two execution paths depending on context:
+    ///
+    /// * **Inside `$(call)`, `$(foreach)`, or `$(let)`** (i.e. `auto_vars` is
+    ///   non-empty): the content is expanded and then executed *immediately* via
+    ///   the `&self → *mut Self` unsafe cast.  Immediate execution is required
+    ///   so that variable assignments made by `$(eval)` are visible to subsequent
+    ///   iterations of the loop.
+    ///
+    /// * **At top level** (empty `auto_vars`): the expanded content is pushed
+    ///   onto `eval_pending` and executed after the current source line is fully
+    ///   processed.  Deferral preserves definition order for double-colon rules
+    ///   that appear before the `$(eval)` call on the same logical line.
+    ///
+    /// In both paths, calling `$(eval)` from within a recipe (`in_recipe_execution`)
+    /// or a second-expansion context (`in_second_expansion`) that defines new
+    /// prerequisites is a fatal error (`"prerequisites cannot be defined in recipes"`).
+    ///
+    /// # `$(call)` specifics
+    ///
+    /// `$(call)` is handled by `expand_call`.  It pushes a new frame onto
+    /// `call_context_stack` before expanding the body so that `$(eval)` inside
+    /// the body can resolve `$1`, `$2`, etc. correctly even after the first
+    /// expansion pass has collapsed `$$1` → `$1`.
     fn expand_function(&self, name: &str, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         let builtins = functions::get_builtin_functions();
 
@@ -892,6 +1136,28 @@ impl MakeState {
         String::new()
     }
 
+    /// Implement `$(call var,arg1,arg2,…)`.
+    ///
+    /// Builds a new `auto_vars` frame (`call_auto_vars`) containing:
+    ///
+    /// * `"0"` → the variable name being called
+    /// * `"1"` … `"N"` → positional arguments, each expanded in the *outer*
+    ///   `auto_vars` context (not the call frame, to prevent the callee from
+    ///   seeing its own arguments while evaluating its own arguments).
+    /// * Positions beyond the passed count (up to 9) are explicitly set to `""`
+    ///   so that stale values from an outer `$(call)` do not bleed in.
+    ///
+    /// Non-numeric automatic variables from `auto_vars` (e.g. `$@`, `$<`) are
+    /// inherited into the call frame so that calls nested inside recipe contexts
+    /// still see the target's automatic variables.
+    ///
+    /// The frame is pushed onto `call_context_stack` before expanding the body
+    /// and popped afterwards.  `eval_string` checks `call_context_stack` when it
+    /// needs to resolve `$1`, `$2`, etc. in eval'd content inside the call body.
+    ///
+    /// If `var` does not name a user-defined variable, the call falls through to
+    /// `expand_function` with the remaining arguments, allowing `$(call builtin,
+    /// args)` as an alias for `$(builtin args)`.
     fn expand_call(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         let args = split_function_args(args_str);
         if args.is_empty() {
@@ -948,6 +1214,22 @@ impl MakeState {
         result
     }
 
+    /// Implement `$(foreach var,list,body)`.
+    ///
+    /// For each whitespace-separated word in the expanded `list`, binds `var` to
+    /// that word, expands `body`, and collects the results into a
+    /// space-separated string.
+    ///
+    /// The binding is done both by textual substitution in `body` (replacing all
+    /// `$(var)`, `${var}`, and single-char `$v` occurrences) and by insertion
+    /// into the `loop_auto_vars` map that is passed to `expand_with_auto_vars`.
+    /// The dual approach means that even computed references to the loop variable
+    /// (e.g. `$($(var))` after the substitution becomes `$(word_value)`) are
+    /// resolved correctly.
+    ///
+    /// Because `$(eval)` inside a `foreach` body sees non-empty `auto_vars`, it
+    /// executes immediately, so variable changes take effect for subsequent
+    /// iterations within the same `$(foreach)`.
     fn expand_foreach(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         let args = split_function_args(args_str);
         if args.len() < 3 {
@@ -981,6 +1263,21 @@ impl MakeState {
         results.join(" ")
     }
 
+    /// Implement the `$(file op filename[,text])` built-in.
+    ///
+    /// Three operations are supported:
+    ///
+    /// * `<filename` — read `filename` and return its content with exactly one
+    ///   trailing newline stripped (GNU Make compatible).  The text argument is
+    ///   forbidden.
+    /// * `>filename` — overwrite `filename` with `text + "\n"` (or create an
+    ///   empty file when no comma is present in the argument list).
+    /// * `>>filename` — append `text + "\n"` to `filename` (creating it if it
+    ///   does not exist).  With a comma but empty text, appends just a newline.
+    ///   With no comma, does nothing.
+    ///
+    /// All write/append paths append a newline unless `text` already ends with
+    /// one, matching GNU Make 4.4 behaviour.  IO errors are fatal.
     fn expand_file_function(&self, args_str: &str, auto_vars: &HashMap<String, String>) -> String {
         use std::io::Write;
 
@@ -1144,6 +1441,16 @@ impl MakeState {
     }
 }
 
+/// Find the index of the `close` byte that balances the `open` byte already
+/// consumed at `start - 2`.
+///
+/// Depth tracking is required because make allows nested references inside
+/// function arguments: `$(patsubst $(SUFFIX),%,$(SRCS))`.  A `$(`/`${` pair
+/// always starts a nested context regardless of which delimiters the outer
+/// function uses, so both `(` and `{` must increment the depth counter.
+///
+/// Returns `None` if no matching close is found before the end of `bytes`,
+/// which indicates an unterminated reference (a fatal error the caller handles).
 fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Option<usize> {
     let mut depth = 1;
     let mut i = start;
@@ -1170,6 +1477,13 @@ fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Optio
     None
 }
 
+/// Locate the `:` that separates the variable name from the substitution
+/// pattern in `$(var:pat=rep)`, skipping nested `$(…)` references.
+///
+/// A `:` inside a nested reference (`$(var:$(X)=y)` where `X` contains `:`)
+/// belongs to the inner reference and is skipped.  A space or tab before the
+/// first `:` means the content is a function call rather than a substitution
+/// reference, so `None` is returned early.
 fn find_subst_ref_colon(content: &str) -> Option<usize> {
     // Find ':' that's a substitution reference, not inside a function call.
     // GNU Make allows '\:' as the colon separator (the backslash is stripped
@@ -1200,10 +1514,25 @@ fn find_subst_ref_colon(content: &str) -> Option<usize> {
     None
 }
 
+/// Split a function's argument string on commas, respecting nested `$(…)`.
+///
+/// Delegates to [`split_function_args_max`] with no limit.
 pub fn split_function_args(s: &str) -> Vec<String> {
     split_function_args_max(s, usize::MAX)
 }
 
+/// Split a function's argument string on commas, respecting nested `$(…)`,
+/// stopping after `max_args` arguments have been collected.
+///
+/// Commas that appear inside a `$(…)` or `${…}` group are part of the nested
+/// expression and are **not** treated as argument separators.  This correctly
+/// handles cases like `$(if $(filter a,$(X)), yes, no)`.
+///
+/// `max_args` is used by functions with a fixed arity (e.g. `max_args = 3`
+/// for `$(patsubst pat,rep,text)`) to avoid O(N) scanning of long text
+/// arguments that contain many commas: once the last argument slot is filled,
+/// the remainder of the string (including any commas it contains) is gathered
+/// verbatim into the final argument.
 pub fn split_function_args_max(s: &str, max_args: usize) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
