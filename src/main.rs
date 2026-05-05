@@ -225,3 +225,80 @@ mod tests {
         assert_eq!(lines[1], format!("Built for {}", target_triple()));
     }
 }
+
+/// Security-hardening unit tests.
+///
+/// These tests cover the specific vulnerabilities addressed in the
+/// hardening/security-audit pass:
+///
+/// 1. MAKEFLAGS `-j` overflow / silent-fallback fix (cli.rs)
+/// 2. MAKEFLAGS `-j` sets `jobs_explicit` (cli.rs)
+/// 3. Expansion depth limit (eval/expand.rs)
+#[cfg(test)]
+mod security_tests {
+    use crate::cli::{parse_makeflags, MakeArgs};
+
+    // -------------------------------------------------------------------------
+    // MAKEFLAGS --jobs= parsing (overflow / silent-fallback)
+    // -------------------------------------------------------------------------
+
+    /// A valid --jobs= value in MAKEFLAGS is accepted and sets jobs_explicit.
+    #[test]
+    fn makeflags_jobs_long_valid() {
+        let mut args = MakeArgs::default();
+        parse_makeflags("--jobs=4", &mut args);
+        assert_eq!(args.jobs, 4);
+        assert!(args.jobs_explicit, "--jobs= from MAKEFLAGS must set jobs_explicit");
+    }
+
+    /// A --jobs= value that would overflow usize is silently ignored (jobs stays
+    /// at the default), not wrapped or silently set to 1.
+    /// Previously this path did `token[7..].parse().unwrap_or(1)`, so a value
+    /// like "99999999999999999999" would produce jobs=1 with no indication of error.
+    #[test]
+    fn makeflags_jobs_long_overflow_ignored() {
+        let mut args = MakeArgs::default();
+        let default_jobs = args.jobs;
+        // A value that overflows usize on any 64-bit target.
+        parse_makeflags("--jobs=99999999999999999999", &mut args);
+        // Should leave jobs unchanged (not silently set to 1).
+        assert_eq!(args.jobs, default_jobs,
+            "overflow --jobs= in MAKEFLAGS must not silently change the job count");
+        assert!(!args.jobs_explicit,
+            "failed --jobs= parse must not set jobs_explicit");
+    }
+
+    /// A malformed --jobs= (non-numeric) is silently ignored.
+    #[test]
+    fn makeflags_jobs_long_nonnumeric_ignored() {
+        let mut args = MakeArgs::default();
+        let default_jobs = args.jobs;
+        parse_makeflags("--jobs=abc", &mut args);
+        assert_eq!(args.jobs, default_jobs);
+        assert!(!args.jobs_explicit);
+    }
+
+    // -------------------------------------------------------------------------
+    // MAKEFLAGS -j (short flag) must set jobs_explicit
+    // -------------------------------------------------------------------------
+
+    /// -j N in MAKEFLAGS sets the job count and marks it explicit so that
+    /// apply_makeflags_from_makefile cannot silently override it.
+    #[test]
+    fn makeflags_jobs_short_sets_explicit() {
+        let mut args = MakeArgs::default();
+        parse_makeflags("-j8", &mut args);
+        assert_eq!(args.jobs, 8);
+        assert!(args.jobs_explicit,
+            "-j in MAKEFLAGS must set jobs_explicit to protect against makefile override");
+    }
+
+    /// Bare -j in MAKEFLAGS (no number) also sets jobs_explicit.
+    #[test]
+    fn makeflags_jobs_short_bare_sets_explicit() {
+        let mut args = MakeArgs::default();
+        parse_makeflags("-j", &mut args);
+        assert!(args.jobs_explicit,
+            "bare -j in MAKEFLAGS must set jobs_explicit");
+    }
+}

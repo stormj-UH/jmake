@@ -192,3 +192,50 @@ fn test_wildcard_no_prefix() {
         stdout
     );
 }
+
+// ── Security hardening: expansion depth limit ──────────────────────────────
+
+/// A Makefile with a chain of 1001 distinct recursive variables that reference
+/// each other (V0 = $(V1), V1 = $(V2), …, V1000 = bottom) must abort with
+/// exit code 2 and a diagnostic instead of stack-overflowing the process.
+///
+/// This exercises the MAX_EXPANSION_DEPTH = 1000 limit added in the
+/// hardening/security-audit pass.  The vars_being_expanded circular-reference
+/// guard does NOT fire here because each variable is distinct; without the
+/// depth limit the call stack would grow until SIGSEGV.
+#[test]
+fn test_expansion_depth_limit_kills_deep_chain() {
+    let tmp = tempfile::TempDir::new().expect("TempDir");
+
+    // Generate: V0 = $(V1)\nV1 = $(V2)\n…\nV1000 = bottom\nall:\n\t@echo $(V0)
+    let mut mk = String::new();
+    let depth = 1001usize; // one more than the 1000-level limit
+    for i in 0..depth {
+        mk.push_str(&format!("V{} = $(V{})\n", i, i + 1));
+    }
+    mk.push_str(&format!("V{} = bottom\nall:\n\t@echo $(V0)\n", depth));
+
+    std::fs::write(tmp.path().join("deep.mk"), &mk).unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} -f deep.mk 2>&1", jmake.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run jmake");
+
+    // Must exit with a non-zero code (2) — not crash with SIGSEGV.
+    let status = out.status.code().unwrap_or(-1);
+    assert_ne!(status, 0,
+        "deep variable chain must fail, not succeed");
+    // Must not be a signal-killed exit (which on Linux produces a negative or
+    // 128+signal exit code from the shell, but the key check is non-zero).
+    // We just verify it terminated cleanly (not killed by a signal like SIGSEGV).
+    let combined = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        combined.contains("Recursive variable") || combined.contains("references itself"),
+        "expected depth-limit diagnostic in output, got: {:?}", combined
+    );
+}
