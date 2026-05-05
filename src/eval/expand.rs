@@ -360,7 +360,7 @@ impl MakeState {
                 return match modifier {
                     "D" => dir_part(&base_val),
                     "F" => file_part(&base_val),
-                    _ => unreachable!(),
+                    _ => unreachable!(), // PANIC-SAFE: the enclosing if guards `modifier == "D" || modifier == "F"`
                 };
             }
         }

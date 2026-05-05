@@ -257,7 +257,7 @@ pub fn spawn_workers(
             let tx = result_tx.clone();
             thread::spawn(move || loop {
                 let job = {
-                    let receiver = rx.lock().unwrap();
+                    let receiver = rx.lock().unwrap(); // PANIC-SAFE: no thread holds this lock while executing a job, so the mutex cannot be poisoned
                     match receiver.recv() {
                         Ok(j) => j,
                         Err(_) => return, // channel closed → exit

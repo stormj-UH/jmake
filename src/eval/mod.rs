@@ -1575,7 +1575,7 @@ impl MakeState {
             let expanded = if line.starts_with('\t') || is_custom_recipe_line {
                 line.clone()
             } else if !raw_is_var_assignment && parser::find_semicolon(&line).is_some() {
-                let semi_pos = parser::find_semicolon(&line).unwrap();
+                let semi_pos = parser::find_semicolon(&line).unwrap(); // PANIC-SAFE: is_some() checked on the same input in the branch condition
                 // Check whether the part before `;` contains a `:` (rule colon).
                 // If it does, this is an inline recipe: expand only the header.
                 let pre_semi = &line[..semi_pos];
@@ -2020,7 +2020,7 @@ impl MakeState {
                     // The last rule is `current_rule` (it collects following
                     // recipe lines).  The others are siblings: they will get a
                     // copy of the recipe when `current_rule` is finalised.
-                    let last_rule = prepared.pop().unwrap();
+                    let last_rule = prepared.pop().unwrap(); // PANIC-SAFE: empty expanded_rules case already handled by `continue` above
                     static_rule_siblings = prepared;
                     parser.in_recipe = true;
                     current_rule = Some(last_rule);
@@ -2990,7 +2990,7 @@ impl MakeState {
                         value.to_string()
                     };
                     if !append_val.is_empty() {
-                        let existing = self.db.variables.get_mut(name).unwrap();
+                        let existing = self.db.variables.get_mut(name).unwrap(); // PANIC-SAFE: get(name) returned Some above and no removal can occur between the two calls
                         if existing_is_empty {
                             existing.value = append_val;
                         } else {
@@ -3944,7 +3944,7 @@ impl MakeState {
                     // File doesn't exist → needs rebuild
                     true
                 } else {
-                    let target_time = target_mtime.unwrap();
+                    let target_time = target_mtime.unwrap(); // PANIC-SAFE: else branch of `if target_mtime.is_none()` guarantees Some
                     // A phony prerequisite always makes the target out of date.
                     // A regular prereq triggers rebuild only if it now EXISTS and is newer.
                     // A prereq that has ANY rule but doesn't exist (e.g. `force:` with no
@@ -4338,7 +4338,7 @@ impl MakeState {
                         source_file: source_file.clone(),
                     }
                 } else {
-                    unreachable!()
+                    unreachable!() // PANIC-SAFE: recipe_indices only contains indices where outcome is RunRecipe (filter_map above)
                 }
             }).collect();
 
@@ -4354,7 +4354,7 @@ impl MakeState {
                             (tw.idx, r)
                         })
                     }).collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    handles.into_iter().map(|h| h.join().unwrap()).collect() // PANIC-SAFE: worker closures only call execute_include_recipe_expanded which returns Result and never panics
                 });
 
             for (idx, result) in results {
@@ -4485,7 +4485,7 @@ impl MakeState {
                 PendingOutcome::RunRecipe { .. } => {
                     // Use as_ref() (not take()) so SiblingOf items processed later
                     // can still inspect recipe_results[i].
-                    let result = recipe_results[i].as_ref().unwrap();
+                    let result = recipe_results[i].as_ref().unwrap(); // PANIC-SAFE: recipe_results[i] is set for every RunRecipe index in Phase B above
                     match result {
                         Ok(()) => {
                             if file_path.exists() {
