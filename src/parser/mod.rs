@@ -1,5 +1,120 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Makefile parser - lexing and parsing of Makefile syntax
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Makefile lexer and parser.
+//!
+//! # Role in the pipeline
+//!
+//! The parser is the second stage of the jmake pipeline.  The evaluator (see
+//! [`crate::eval`]) drives the parser by calling `load_file` / `load_string` and
+//! then repeatedly calling `next_logical_line` + `parse_line`.  Each call to
+//! `parse_line` returns a [`ParsedLine`] variant that the evaluator acts on.
+//!
+//! # Parsing phases
+//!
+//! A single Makefile is processed in the following passes, in order:
+//!
+//! 1. **Line continuation** (`next_logical_line`): physical lines are joined into
+//!    *logical lines* by consuming `\<newline>` sequences.  The joining rules differ
+//!    by context:
+//!    - *Recipe lines* (tab-prefixed or custom `.RECIPEPREFIX`): the `\<newline>` is
+//!      preserved verbatim so the shell can join them itself.  One leading prefix
+//!      character is stripped from each continuation line.
+//!    - *Inline recipes* (`target:;cmd\<newline>`): same as recipe lines — the
+//!      `\<newline>` is preserved.
+//!    - *All other lines*: the `\` and `\n` are replaced by a single space, and
+//!      the next line's leading whitespace is trimmed.  In `.POSIX` mode, trailing
+//!      whitespace before the joining space is *not* stripped (POSIX requires it be
+//!      preserved).  The special form `$\<newline>` (dollar immediately before the
+//!      backslash) is a *concatenating continuation*: both `$` and `\` are removed
+//!      and the next line is trimmed and appended directly (no space inserted).
+//!    - *End of file*: a trailing `\` on a non-recipe line consumes the backslash
+//!      and appends a space, matching GNU Make's EOF continuation behavior.
+//!
+//! 2. **Comment stripping** (`strip_comment`): inline `#` characters that are
+//!    outside `$(...)` or `${...}` references and not escaped with `\` begin a
+//!    comment that is removed.  The semi-colon that begins an inline recipe
+//!    (`target:;cmd`) is handled specially: only the portion before the `;` has
+//!    comments stripped; the recipe content is preserved verbatim.
+//!
+//! 3. **Directive detection** (`parse_line`): the stripped logical line is checked
+//!    against the ordered set of directive prefixes:
+//!    - Conditional directives (`ifdef`, `ifndef`, `ifeq`, `ifneq`).
+//!    - `else` and `endif`.
+//!    - `undefine` (distinguishing the directive from a variable named `undefine`
+//!      by checking that the next token is not `:` or an assignment operator).
+//!    - `define` / `endef` (same disambiguation: `define = val` is a regular
+//!      assignment, not a multi-line define directive).
+//!    - `include`, `-include`, `sinclude` — both space- and tab-separated forms
+//!      are accepted.
+//!    - `vpath`.
+//!    - `export` / `unexport`.
+//!    - Variable assignment (tried via `try_parse_variable_assignment`).
+//!    - Rule parsing (tried via `try_parse_rule`).
+//!    - Fallthrough to `MissingSeparator` error.
+//!
+//! # Recipe line classification
+//!
+//! A line is classified as a recipe only when **both** of the following are true:
+//!
+//! 1. It begins with the recipe prefix character (default: `\t`; overridable via
+//!    `.RECIPEPREFIX`).
+//! 2. The parser is currently inside a rule's recipe block (`self.in_recipe ==
+//!    true`).
+//!
+//! This prevents tab-indented variable assignments inside `ifeq` / `ifdef` blocks
+//! from being misclassified as recipes (a real-world issue encountered in
+//! Dropbear's `Makefile.in`).
+//!
+//! # Conditional nesting
+//!
+//! The parser maintains `conditional_stack: Vec<ConditionalState>`.  Each
+//! conditional directive pushes a [`ConditionalState`]:
+//!
+//! * `active`: whether the current branch should be processed.
+//! * `seen_true`: whether any branch of this conditional has been active so far
+//!   (prevents an `else` branch from activating after a true `if` branch).
+//! * `in_else`: whether we are inside an `else` branch.
+//!
+//! `is_conditionally_active` returns true only when every frame on the stack is
+//! active, implementing correct nested conditional semantics.  Directives and rules
+//! inside inactive branches are skipped by the evaluator without being parsed
+//! further (except for tracking nested `if`/`endif` depth).
+//!
+//! # Multi-line `define`
+//!
+//! The parser tracks a `define_depth: usize` counter to handle *nested* defines:
+//!
+//! ```makefile
+//! define outer
+//! define inner
+//! endef
+//! endef
+//! ```
+//!
+//! When `in_define` is true and the parser sees another `define`, `define_depth`
+//! increments.  When it sees `endef`, `define_depth` decrements; only when it
+//! reaches zero does the define block end.  This is necessary for `$(eval ...)` use
+//! cases that embed sub-`define` blocks.
+//!
+//! # Comment handling
+//!
+//! `strip_comment` uses a depth counter to skip `$(...)` / `${...}` nesting.  A
+//! `#` at depth 0 that is not preceded by `\` starts a comment; the `\#` escape
+//! is consumed (the `\` is dropped) and the `#` is kept as a literal character.
+//! A `\` not followed by `#` is kept verbatim.
+//!
+//! The `find_inline_recipe_semi_pos` function performs a similar depth-tracking
+//! scan to locate the `;` that begins an inline recipe, distinguishing it from `;`
+//! inside variable references and `;` inside assignment values.
+//!
+//! # `.POSIX` mode
+//!
+//! Setting `.POSIX:` in a Makefile (or passing `-p` / `--posix` on the command
+//! line) switches the parser to POSIX-compliant continuation handling: trailing
+//! whitespace before a `\<newline>` is *not* stripped (POSIX 2024 §2.13.1).
+//! All other behaviour remains unchanged.
 
 mod lexer;
 mod directives;

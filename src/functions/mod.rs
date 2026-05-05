@@ -1,5 +1,114 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// GNU Make built-in functions
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! GNU Make built-in function implementations.
+//!
+//! # Role in the pipeline
+//!
+//! When the evaluator (see [`crate::eval`]) encounters a `$(name ...)` reference
+//! during variable expansion it first checks whether `name` is a built-in function.
+//! If it is, it calls the corresponding handler from this module.  Variable
+//! references that are *not* function calls are resolved as ordinary variable
+//! lookups instead.
+//!
+//! # Function dispatch
+//!
+//! [`get_builtin_functions`] returns a `HashMap<String, (FnHandler, usize, usize)>`
+//! where the tuple is `(handler, min_args, max_args)`.  A `max_args` of `0` means
+//! the function accepts an unlimited number of comma-separated arguments (used by
+//! `$(or ...)`, `$(and ...)`, `$(call ...)`, etc.).
+//!
+//! The caller is responsible for splitting the argument string on commas (respecting
+//! `$(...)` nesting), trimming leading whitespace from the first argument, and
+//! enforcing the arity constraints before invoking the handler.  Handlers receive a
+//! `&[String]` of already-split (but not yet expanded) arguments and a closure
+//! `expand: &dyn Fn(&str) -> String` for deferred expansion of arguments that must
+//! only be evaluated conditionally (e.g. the branches of `$(if ...)`,
+//! `$(foreach ...)`, `$(or ...)`, `$(and ...)`).
+//!
+//! # GNU Make compatibility notes by function
+//!
+//! **Text functions**
+//!
+//! | Function | Notes |
+//! |---|---|
+//! | `$(subst from,to,text)` | Simple string replacement, no glob. |
+//! | `$(patsubst pattern,replacement,text)` | Word-level `%`-pattern substitution via [`patsubst_word`].  Suffix substitution `$(var:%.o=%.c)` is desugared to `patsubst` by the evaluator before reaching this module. |
+//! | `$(strip text)` | Splits on whitespace and rejoins with single spaces. |
+//! | `$(findstring find,text)` | Returns `find` if found, empty otherwise. |
+//! | `$(filter patterns,text)` | Supports multiple space-separated patterns; each may contain one `%` wildcard.  `\%` is a literal percent; `\\` is a literal backslash. |
+//! | `$(filter-out patterns,text)` | Inverse of `filter`. |
+//! | `$(sort list)` | Lexicographic sort with deduplication. |
+//! | `$(word n,list)` | 1-based indexing; returns empty for out-of-range. |
+//! | `$(wordlist s,e,list)` | Inclusive range; clamps `e` to list length. |
+//! | `$(words list)` | Count of whitespace-separated words. |
+//! | `$(firstword list)` / `$(lastword list)` | GNU Make extensions; `lastword` is not POSIX make. |
+//!
+//! **File name functions** — all operate word-by-word on whitespace-split lists.
+//!
+//! | Function | Notes |
+//! |---|---|
+//! | `$(dir names)` | Returns the directory component including the trailing `/`; bare filenames return `./`. |
+//! | `$(notdir names)` | Strips the directory component. |
+//! | `$(suffix names)` | Returns the last `.`-delimited extension of the filename component; no extension → empty. |
+//! | `$(basename names)` | Strips the final extension; no extension → unchanged. |
+//! | `$(addsuffix suffix,names)` | Appends `suffix` to every word. |
+//! | `$(addprefix prefix,names)` | Prepends `prefix` to every word. |
+//! | `$(join list1,list2)` | Pairwise concatenation; excess words from the longer list are appended unchanged. |
+//! | `$(wildcard pattern)` | Shell glob expansion.  Results are sorted lexicographically per GNU Make.  The `./`-prefix and directory-prefix preservation logic works around an asymmetry in the `glob` crate: see the inline comments for the `./src/*.h` and `src/*/*.c` cases. |
+//! | `$(realpath names)` | Resolves symlinks via `fs::canonicalize`; missing paths are silently omitted. |
+//! | `$(abspath names)` | Absolute path without resolving symlinks; collapses `..` and `.` components via [`normalize_path`]. |
+//!
+//! **Conditional / flow functions**
+//!
+//! | Function | Notes |
+//! |---|---|
+//! | `$(if cond,then[,else])` | `cond` is already-expanded by the caller; non-empty → true.  `then` and `else` are expanded lazily via the `expand` closure. |
+//! | `$(or arg1,arg2,...)` | Short-circuit: returns the first non-empty expansion. |
+//! | `$(and arg1,arg2,...)` | Short-circuit: returns empty on first empty expansion, otherwise the last. |
+//! | `$(intcmp a,b[,lt][,eq-or-ge][,gt])` | Arbitrary-precision integer comparison via [`bigint_cmp`]; the 4-arg form uses arg4 as a "greater-or-equal" catch-all. |
+//!
+//! **Advanced / side-effecting functions** — these functions are handled primarily
+//! by the evaluator and expander; the stubs here are never reached directly.
+//!
+//! | Function | Notes |
+//! |---|---|
+//! | `$(foreach var,list,text)` | The body (`text`) is re-expanded for each word.  **Performance**: this is O(words × expansion cost).  Avoid using `$(eval ...)` inside `$(foreach ...)` bodies on large lists; each iteration incurs a full re-parse of the eval fragment. |
+//! | `$(call var,arg1,...)` | Expands `$(var)` with `$1`, `$2`, … set.  The actual implementation lives in the evaluator which has direct variable access; the stub here just expands the first argument for completeness. |
+//! | `$(eval text)` | Causes `text` to be parsed as Makefile content.  **Performance**: each `$(eval ...)` triggers a full parser invocation.  Avoid in hot loops. |
+//! | `$(value var)` | Returns the unexpanded value of `var`; handled in the evaluator. |
+//! | `$(origin var)` | Returns a string describing where `var` was defined; handled in the evaluator. |
+//! | `$(flavor var)` | Returns `"recursive"`, `"simple"`, or `"undefined"`; handled in the evaluator. |
+//! | `$(let vars,list,text)` | Assigns successive words from `list` to named variables within `text`.  The last variable absorbs all remaining words. |
+//! | `$(file op,filename[,text])` | Writes to or reads from a file.  `>file` truncates and writes; `>>file` appends; `<file` reads.  A trailing newline is appended when writing non-empty content. |
+//!
+//! **Shell / I/O functions**
+//!
+//! | Function | Notes |
+//! |---|---|
+//! | `$(shell cmd)` | Runs `cmd` through `/bin/sh -c`; replaces internal newlines with spaces and strips one trailing newline.  stderr is printed with the make program name as prefix (shell prefix such as `sh: ` is stripped). |
+//! | `$(error msg)` | Prints `*** msg.  Stop.` and exits with code 2. |
+//! | `$(warning msg)` | Prints `msg` to stderr and returns empty. |
+//! | `$(info msg)` | Prints `msg` to stdout and returns empty. |
+//! | `$(guile ...)` | Not implemented; always returns empty. |
+//!
+//! # `pattern_matches` — filter pattern semantics
+//!
+//! GNU Make filter patterns support backslash-escaping: `\%` is a literal `%` and
+//! `\\` is a literal `\`.  Only the *first* unescaped `%` is treated as a wildcard.
+//! The implementation in [`pattern_matches`] parses the pattern byte-by-byte,
+//! building a literal prefix and suffix (with escape processing) on either side of
+//! the first unescaped `%`.  A word matches iff it starts with the prefix and ends
+//! with the suffix, with `prefix.len() + suffix.len() <= word.len()`.
+//!
+//! # `bigint_cmp` — arbitrary-precision integer comparison
+//!
+//! `$(intcmp a,b,...)` must handle integers that may exceed `i64` range (Make does
+//! not restrict integer size).  [`bigint_cmp`] compares two decimal integer strings
+//! by sign first, then by digit-string length, then lexicographically — equivalent
+//! to numeric comparison but without parsing into a machine integer.  Supports
+//! leading `+`/`-` signs, leading zeros, and treats `+0`/`-0`/`0` as equal.
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -1,5 +1,169 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Recipe execution engine - dependency resolution and recipe running
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Recipe execution engine: dependency resolution, recipe expansion, and target building.
+//!
+//! # Role in the pipeline
+//!
+//! The executor is the final stage of a make run.  By the time it is called the
+//! Makefile has been fully parsed (see [`crate::parser`]), all variables evaluated
+//! (see [`crate::eval`]), and the target database populated
+//! (see [`crate::database`]).  The executor's job is to walk the dependency graph
+//! and run the shell commands (recipes) required to bring targets up to date.
+//!
+//! Two execution paths are available, selected at build time:
+//!
+//! * **Sequential** (`jobs == 1` or `.NOTPARALLEL` is set): a single recursive DFS
+//!   walk that builds prerequisites depth-first before their parents.
+//! * **Parallel** (`jobs > 1` and `.NOTPARALLEL` absent): a two-phase approach —
+//!   sequential graph resolution followed by concurrent job dispatch.  See
+//!   [`parallel`] for the scheduler.
+//!
+//! # Key data structure: `Executor`
+//!
+//! [`Executor`] is a short-lived struct (one per `make` invocation) that owns:
+//!
+//! * References to the immutable [`MakeDatabase`] and [`MakeState`].
+//! * Runtime bookkeeping tables: `built` (memoization), `building` + `building_stack`
+//!   (cycle detection), `intermediate_built` (cleanup list), and `inherited_vars_stack`
+//!   (target-specific variable inheritance during DFS).
+//! * Parallel-mode scratch fields: `collect_plans_mode`, `pending_plans`,
+//!   `parallel_plans`, and per-target prerequisite staging vectors.
+//! * A memoization cache for pattern rule lookup (`pattern_rule_cache`) because
+//!   large projects (e.g. CPython 3.14) can trigger the same `find_pattern_rule`
+//!   call tens of thousands of times; the cache converts O(rules × targets) repeated
+//!   scans into O(1) hash lookups after the first visit.
+//!
+//! # Dependency resolution algorithm
+//!
+//! `build_target` is the entry point for building a single target.  It implements
+//! a DFS with the following properties:
+//!
+//! 1. **Memoization**: the `built` map records every target that has been visited.
+//!    A second call for the same target returns immediately.
+//! 2. **Cycle detection**: the `building` set holds all targets currently on the
+//!    call stack.  If `build_target` is re-entered for a target already in
+//!    `building`, the cycle is printed and the dependency is dropped (GNU Make
+//!    compatible "Circular X <- Y dependency dropped" message).
+//! 3. **Rule selection**: explicit rules in `db.rules` take priority over pattern
+//!    rules.  If no explicit rule exists, `find_pattern_rule` performs a linear scan
+//!    over `db.pattern_rules` looking for the first rule whose target pattern matches
+//!    the target name.  The `%` wildcard captures the *stem*, which is then
+//!    substituted into prerequisite patterns.  Results are cached in
+//!    `pattern_rule_cache`.
+//! 4. **Terminal rules**: a terminal pattern rule (declared with `::`) prevents the
+//!    implicit rule search from continuing to intermediate rules, matching GNU Make's
+//!    "terminal rules do not apply to intermediate files" semantics.
+//! 5. **Double-colon rules**: each `::` rule for a target is evaluated independently.
+//!    A target is rebuilt if *any* of its `::` rules is out of date.
+//!
+//! # Recipe expansion and execution
+//!
+//! Before a recipe line is passed to the shell it is expanded with
+//! `state.expand_with_auto_vars`, which resolves:
+//!
+//! * Standard automatic variables (`$@`, `$<`, `$^`, `$?`, `$*`, `$+`, `$|`, and
+//!   their `D`/`F` suffixes).
+//! * Target-specific variables (see *target-specific variables* below).
+//! * All normal Make variable references.
+//!
+//! The expanded text is then split on bare (non-backslash-escaped) newlines into
+//! *sub-lines*, each of which is run as a separate shell invocation (or, in
+//! `.ONESHELL` mode, joined into a single script).
+//!
+//! Recipe prefix characters are interpreted before the shell sees the command:
+//!
+//! * `@` — suppress echoing the command.
+//! * `-` — ignore non-zero exit status.
+//! * `+` — force execution even under `--dry-run`.
+//!
+//! # Target-specific variables
+//!
+//! GNU Make allows variables to be scoped to a target:
+//!
+//! ```makefile
+//! foo: CFLAGS = -O0
+//! foo: bar.o
+//! ```
+//!
+//! During the DFS walk, when `build_with_rules` processes a target it collects
+//! target-specific variable assignments from the rule's `target_specific_vars`
+//! list and pushes them onto `inherited_vars_stack`.  Prerequisites built during
+//! that target's subtree inherit the scope.  The stack is popped when the subtree
+//! returns.  Export/unexport annotations on target-specific variables are handled
+//! by `target_extra_exports` and `target_extra_unexports`.
+//!
+//! # Pattern rule stem computation
+//!
+//! Given a target `foo.o` and a pattern rule `%.o: %.c`, the stem is `foo`.
+//! `find_pattern_rule` extracts the stem by matching the target against the rule's
+//! target pattern: strip the fixed prefix and suffix around the `%`, check that the
+//! remaining middle portion constitutes a valid stem (non-empty for non-terminal
+//! matches), and return `(rule, stem)`.  The stem is later substituted into
+//! prerequisite patterns and stored in `$*`.
+//!
+//! # Special targets
+//!
+//! | Target | Effect |
+//! |---|---|
+//! | `.PHONY` | Target is always considered out of date; no mtime check. |
+//! | `.PRECIOUS` | Target file is not deleted on error or as an intermediate. |
+//! | `.INTERMEDIATE` | Target is treated as an intermediate file (deleted after build). |
+//! | `.SECONDARY` | Like `.INTERMEDIATE` but never deleted automatically. |
+//! | `.NOTINTERMEDIATE` | Overrides `.INTERMEDIATE` for specific targets. |
+//! | `.NOTPARALLEL` | Disables parallel execution for the entire build. |
+//! | `.ONESHELL` | Runs all recipe lines in a single shell invocation. |
+//! | `.DELETE_ON_ERROR` | Deletes the target file if its recipe fails. |
+//! | `.WAIT` | Serialisation marker inside a prerequisite list (parallel builds). |
+//!
+//! # Second expansion
+//!
+//! When `.SECONDEXPANSION` is in effect, prerequisite lists may contain `$$`
+//! references that are expanded a *second* time just before the target is built,
+//! with automatic variables (`$$@`, `$$*`, etc.) available.  The executor detects
+//! rules that carry `second_expansion_prereqs` and calls
+//! `state.expand_with_auto_vars` a second time on those strings, merging the
+//! resulting prerequisites into the normal list.
+//!
+//! # Implicit rule search during execution
+//!
+//! For a target with no explicit rule the executor calls `find_pattern_rule`, which
+//! scans `db.pattern_rules` in order.  For each candidate rule it checks:
+//!
+//! 1. The target name matches the rule's target pattern.
+//! 2. Every normal prerequisite produced by substituting the stem into the rule's
+//!    prerequisite patterns either *exists on disk* or *has its own rule*.
+//! 3. The rule is not terminal (or, if it is, the target is not itself being built
+//!    as an intermediate).
+//!
+//! The first rule that passes all checks wins.  VPATH directories are searched when
+//! checking prerequisite existence, so a file that lives under a `vpath` directory
+//! satisfies condition 2 even if it is not present in the current directory.
+//!
+//! # VPATH and library search
+//!
+//! VPATH directories are searched for source files that are prerequisites.
+//! `-lname` prerequisites trigger a library search: the executor looks for
+//! `libname.a` and `libname.so` in VPATH directories (controlled by
+//! `.LIBPATTERNS`) and substitutes the resolved path into `$^`/`$<`.
+//!
+//! # Parallel build overview
+//!
+//! See [`parallel`] for the full parallel scheduler.  At a high level:
+//!
+//! 1. **Phase 1 — graph resolution**: `collect_plans` runs the sequential DFS in
+//!    `collect_plans_mode`, where `execute_recipe` stores a [`parallel::TargetPlan`]
+//!    instead of spawning a process.  The result is a complete map of every target
+//!    that needs to be built, with pre-expanded recipe lines and pre-computed
+//!    automatic variables.
+//! 2. **Phase 2 — scheduling**: [`parallel::ParallelScheduler`] is initialised with
+//!    the plans.  Worker threads are spawned (one per `-j` slot).
+//! 3. **Phase 3 — dispatch loop**: the main thread repeatedly pops ready targets from
+//!    the scheduler, converts them to [`parallel::Job`]s via `build_job_from_plan`,
+//!    and sends them to workers.  Completed results arrive via an `mpsc` channel and
+//!    are fed to `scheduler.handle_completion`, which propagates readiness to
+//!    dependent targets.
 
 pub mod parallel;
 

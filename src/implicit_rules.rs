@@ -1,5 +1,96 @@
-// Copyright (c) 2026 Jon-Erik G. Storm. All rights reserved.
-// Built-in implicit rules matching GNU Make defaults
+// (c) 2026 Jon-Erik G. Storm, Inc., a California Corporation,
+// doing business as LAVA GOAT SOFTWARE. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+//! Built-in implicit rules and default variables, matching GNU Make 4.4 defaults.
+//!
+//! # Role in the pipeline
+//!
+//! This module is called once during Makefile database initialisation (before
+//! parsing begins) to populate [`MakeDatabase`] with the standard pattern rules
+//! and default variable values that GNU Make provides out of the box.  User-written
+//! rules and variable assignments override these defaults through the normal
+//! precedence rules.
+//!
+//! # Default variables
+//!
+//! [`register_default_variables`] inserts variables with origin
+//! [`VarOrigin::Default`] and flavour [`VarFlavor::Recursive`] using
+//! `entry(...).or_insert_with(...)`, so user assignments at `override` level or
+//! plain assignments already in the database take precedence.
+//!
+//! The registered variables mirror GNU Make 4.4.1's built-in set:
+//!
+//! | Variable | Default value |
+//! |---|---|
+//! | `CC` | `cc` |
+//! | `CXX` | `g++` |
+//! | `AR` / `ARFLAGS` | `ar` / `rv` |
+//! | `LEX` / `YACC` | `lex` / `yacc` |
+//! | `COMPILE.c` | `$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c` |
+//! | `LINK.o` | `$(CC) $(LDFLAGS) $(TARGET_ARCH)` |
+//! | `OUTPUT_OPTION` | `-o $@` |
+//! | `.LIBPATTERNS` | `lib%.a lib%.so` |
+//!
+//! `MAKE` is set to `$(MAKE_COMMAND)`, which the executor replaces with the actual
+//! binary path at build time so recursive `$(MAKE)` invocations find the correct
+//! executable.
+//!
+//! # Built-in pattern rules
+//!
+//! [`register_implicit_rules`] pushes pattern rules onto `db.pattern_rules` in
+//! the order the executor's implicit rule search (`find_pattern_rule`) will try
+//! them.  Rules registered first have higher priority.
+//!
+//! The full set of registered rules (in priority order):
+//!
+//! | Target | Prerequisites | Language |
+//! |---|---|---|
+//! | `%.o` | `%.c` | C compilation |
+//! | `%.o` | `%.cc` | C++ compilation |
+//! | `%.o` | `%.cpp` | C++ compilation |
+//! | `%.o` | `%.C` | C++ compilation (uppercase extension) |
+//! | `%.o` | `%.f` | Fortran compilation |
+//! | `%.o` | `%.F` | Fortran with preprocessing |
+//! | `%.o` | `%.s` | Assembly |
+//! | `%.o` | `%.S` | Assembly with C preprocessor |
+//! | `%` | `%.o` | Link from object file |
+//! | `%` | `%.c` | Compile and link from C |
+//! | `%` | `%.cc` | Compile and link from C++ |
+//! | `%` | `%.cpp` | Compile and link from C++ |
+//! | `%` | `%.f` | Compile and link from Fortran |
+//! | `%` | `%.F` | Compile and link from Fortran (preprocessed) |
+//! | `%` | `%.r` | Compile and link from Ratfor |
+//! | `%.c` | `%.y` | Yacc → C source |
+//! | `%.c` | `%.l` | Lex → C source |
+//!
+//! All rules are constructed via [`make_pattern_rule`], which produces a [`Rule`]
+//! with `is_pattern = true`, `is_terminal = false`, and `lineno = 0` (built-in
+//! rules have no source location).
+//!
+//! After `register_implicit_rules` returns, `db.builtin_pattern_rules_count` is
+//! set to the number of rules just added.  This count is used by the parser to
+//! implement `.SUFFIXES:` (empty): clearing `.SUFFIXES` removes all built-in
+//! pattern rules by truncating `db.pattern_rules` to zero.
+//!
+//! # Suffix rules
+//!
+//! jmake converts old-style suffix rules (`.c.o:`) to the equivalent pattern rule
+//! (`%.o: %.c`) during parsing (see [`crate::parser`]).  This module only provides
+//! the modern pattern-rule equivalents; it does not register any suffix rules
+//! directly.
+//!
+//! # Disabling built-in rules
+//!
+//! A Makefile can suppress all built-in pattern rules by writing:
+//!
+//! ```makefile
+//! .SUFFIXES:
+//! ```
+//!
+//! or by running `jmake -r` / `jmake --no-builtin-rules`.  In both cases the
+//! executor's implicit rule search finds no built-in candidates and falls through
+//! to an error for targets with no matching rule.
 
 use crate::types::{Rule, VarFlavor, Variable, VarOrigin};
 use crate::database::MakeDatabase;
