@@ -168,7 +168,12 @@ fn main() {
         process::exit(0);
     }
 
-    let mut state = eval::MakeState::new(args);
+    // Capture the process environment once before constructing MakeState.
+    // After this point the core MUST NOT call std::env::var directly; it reads
+    // from state.env_config instead.
+    let env_config = eval::EnvConfig::from_process_env();
+
+    let mut state = eval::MakeState::new(args, env_config);
 
     let result = state.run();
 
