@@ -1390,3 +1390,13 @@ all:
     assert!(stderr.contains("warn_message"), "stderr: {}", stderr);
     assert!(stdout.contains("recipe"), "stdout: {}", stdout);
 }
+
+/// `$(value VAR)` returns the raw, unexpanded text of a recursive variable.
+/// Regression: `$(X)` inside a recursive variable's value must not be dropped.
+#[test]
+fn test_fn_value() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "X = world\nREC = hello $(X)\nall:\n\t@echo '$(value REC)'\n", "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "hello $(X)");
+}
