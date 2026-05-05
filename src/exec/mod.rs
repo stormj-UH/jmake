@@ -165,6 +165,55 @@
 //!    are fed to `scheduler.handle_completion`, which propagates readiness to
 //!    dependent targets.
 
+// INVARIANTS: src/exec/mod.rs — recipe executor
+//
+// X1. mtime_cache consistency:
+//     mtime_cache maps path → Option<SystemTime> for every path that has been
+//     stat(2)'d during the current build.  A None entry means the file did not
+//     exist at lookup time.  After a recipe executes and may have created or
+//     modified a file, invalidate_mtime_cache(path) removes the entry so the
+//     next file_mtime call re-stats it.
+//     INVARIANT: No file is stat(2)'d more than once per build cycle for the
+//     purpose of needs_rebuild comparisons (subsequent calls return the cached value).
+//     INVARIANT: After execute_recipe returns Ok, the target path is NOT in the cache
+//     (it has been evicted by invalidate_mtime_cache so subsequent checks see the new mtime).
+//
+// X2. built map completeness:
+//     built[target] is set to Some(rebuilt: bool) exactly once, immediately after
+//     build_target_inner returns (whether Ok or Err).  A target is never re-entered
+//     once it is in `built` (memoization).
+//     INVARIANT: building.contains(target) == true iff build_target is currently on
+//     the call stack for `target`.  building is consistent with building_stack (same
+//     entries in a different data structure).
+//
+// X3. Parallel safety — no shared mutable state across threads:
+//     Worker threads (exec::parallel) receive pre-expanded TargetPlans (owned data)
+//     and communicate results back via mpsc channels.  They do not hold references to
+//     Executor, MakeDatabase, or MakeState.  The Executor's fields (built, building,
+//     mtime_cache, etc.) are accessed only from the main thread during both the
+//     sequential and the parallel-scheduler dispatch loop.
+//     The only Arc<Mutex<…>> shared with workers is the job sender channel.
+//
+// X4. Recipe ordering (sequential execution):
+//     Within a single target, recipe lines are executed in the order they appear in
+//     Rule::recipe (ascending line number — M3).  Dependencies are built depth-first
+//     before their parents, ensuring a target's recipe runs only after all prerequisite
+//     recipes have completed.
+//
+// X5. inherited_vars_stack balance:
+//     When build_with_rules processes a target with target-specific variables it pushes
+//     one frame onto inherited_vars_stack before recursing into prerequisites, and pops
+//     it after.  The stack depth after any build_with_rules call equals the depth before,
+//     regardless of whether the call succeeded or returned an error.
+//     CAVEAT: if build_with_rules propagates a panic (OOM), the stack may be left with an
+//     extra entry — but OOM is fatal and the process will abort.
+//
+// X6. Signal safety for temp files:
+//     Temp stdin files (used for -f- re-exec) are registered with signal_handler via
+//     set_temp_stdin_path BEFORE the temp file's path is used in a subprocess call.
+//     After the subprocess exits, clear_temp_stdin_path is called.
+//     This ensures SIGTERM during subprocess execution can clean up the temp file.
+
 pub mod parallel;
 
 use crate::cli::ShuffleMode;
@@ -944,6 +993,19 @@ impl<'a> Executor<'a> {
         }
     }
 
+    // PRE:  self satisfies X1–X6 on entry.
+    //       `target` is a non-empty string (empty target names should not appear in db.rules).
+    // POST: On Ok(rebuilt):
+    //       - built[target] == Some(rebuilt).
+    //       - If rebuilt == true, the target's recipe ran and mtime_cache[target] was evicted (X1).
+    //       - If rebuilt == false, the target was already up to date.
+    //       building does NOT contain `target` on return (X2).
+    //       On Err(msg): failed_targets contains `target` (keep-going mode).
+    //       building does NOT contain `target` on return regardless of result (X2).
+    //       inherited_vars_stack has the same depth as on entry (X5).
+    // NOTE: Panic/drop safety: building is cleaned up by explicit remove/pop in the match
+    //       after build_target_inner returns — NOT via Drop.  If build_target_inner panics,
+    //       building will contain a stale entry.  OOM panics are fatal; this is acceptable.
     fn build_target(&mut self, target: &str) -> Result<bool, String> {
         // Already built?
         if let Some(&rebuilt) = self.built.get(target) {
@@ -5006,6 +5068,13 @@ impl<'a> Executor<'a> {
     /// successfully writes a file, ensuring subsequent mtime checks see the
     /// updated timestamp.  This eliminates redundant `stat(2)` calls on header
     /// files shared by many translation units (e.g. 10 000+ calls on CPython).
+    // PRE:  `path` is a valid file-system path string (may not exist on disk).
+    // POST: Returns Some(mtime) if the file exists; None otherwise.
+    //       mtime_cache[path] is set to the returned value (X1 — at most one stat per path).
+    //       For subsequent calls with the same `path`, returns the cached value without a syscall.
+    // NOTE: Panic/drop safety: RefCell borrow/borrow_mut panics if already mutably borrowed
+    //       from the same thread — but mtime_cache is only accessed from the main thread and
+    //       no re-entrant call can hold a mutable borrow across a file_mtime call.
     fn file_mtime(&self, path: &str) -> Option<SystemTime> {
         // Fast path: check cache first (single HashMap lookup, no syscall).
         if let Some(cached) = self.mtime_cache.borrow().get(path) {
@@ -5026,11 +5095,26 @@ impl<'a> Executor<'a> {
     /// Must be called after any recipe that may have modified `path` so that
     /// subsequent mtime comparisons read the fresh on-disk value rather than
     /// the pre-build cached result.
+    //
+    // PRE:  None — safe to call even if `path` is not in the cache.
+    // POST: mtime_cache does not contain `path`.  Restores X1 post-recipe consistency:
+    //       the next file_mtime call for `path` will perform a fresh stat(2).
+    // NOTE: Panic/drop safety: RefCell::borrow_mut panics only if a borrow is already
+    //       active — same guarantee as file_mtime.
     #[inline]
     fn invalidate_mtime_cache(&self, path: &str) {
         self.mtime_cache.borrow_mut().remove(path);
     }
 
+    // PRE:  Every path in `prereqs` that needs a mtime comparison has either been stat(2)'d
+    //       (in mtime_cache) or will be stat(2)'d by file_mtime (which caches the result — X1).
+    //       `any_prereq_rebuilt` is true iff at least one direct prerequisite was rebuilt in
+    //       the current build cycle (passed in by build_with_rules / build_with_pattern_rule).
+    // POST: Returns true iff the target must be rebuilt; false iff it is up to date.
+    //       mtime_cache is updated for any path that was not previously cached (X1).
+    //       self.built, self.building, and all other mutable fields are NOT modified.
+    // NOTE: Panic/drop safety: file_mtime can panic only on RefCell double-borrow (see
+    //       file_mtime PRE/NOTE).  Under normal conditions no panic is possible here.
     fn needs_rebuild(&self, target: &str, prereqs: &[String], any_prereq_rebuilt: bool) -> bool {
         if any_prereq_rebuilt {
             return true;
@@ -5349,6 +5433,19 @@ impl<'a> Executor<'a> {
         false
     }
 
+    // PRE:  self satisfies X1–X6.
+    //       `recipe` lines are in definition order (M3); each is a raw unexpanded string.
+    //       `auto_vars` contains the automatic variable bindings for `target`
+    //       (e.g. $@ = target, $< = first prereq, $^ = all prereqs).
+    //       set_term_message has been called with the Terminated message for this recipe (X6).
+    // POST: On Ok(true):  the recipe ran at least one shell command.
+    //       On Ok(false): no non-empty commands were run (dry_run, touch mode, or empty recipe).
+    //       On Err(msg):  at least one recipe command failed; msg contains context.
+    //       After return: invalidate_mtime_cache(target) has been called (X1) and
+    //       clear_term_message() has been called (X6).
+    //       target_extra_exports and target_extra_unexports are unchanged (managed by caller).
+    // NOTE: Panic/drop safety: shell Command::status can block but not panic under normal use.
+    //       process::exit(2) is called for fatal errors (e.g. "Error N (ignored)") — not panic.
     fn execute_recipe(&mut self, target: &str, recipe: &[(usize, String)], source_file: &str, auto_vars: &HashMap<String, String>, _is_phony: bool) -> Result<bool, String> {
         // ------------------------------------------------------------------
         // Plan collection mode: store a TargetPlan instead of running the recipe.

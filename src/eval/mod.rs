@@ -124,6 +124,52 @@
 //! before re-expanding prerequisites, blocking `$(eval)` from defining rules in
 //! that context.
 
+// INVARIANTS: src/eval/mod.rs — central MakeState state machine
+//
+// S1. MakeState field consistency (invariants that hold while MakeState is in use):
+//     a. include_depth <= 200 at all times.  read_makefile_display increments it on
+//        entry and decrements it on every exit (normal, early-return, and error).
+//        A depth of 201 is immediately rejected with an error before any re-entrant work.
+//     b. expansion_depth (RefCell<usize>) <= MAX_EXPANSION_DEPTH (1000) on entry to any
+//        public function.  expand_var_value enforces this internally via process::exit.
+//     c. eval_pending is empty between any two calls to process_parsed_lines unless an
+//        active $(eval) is queuing content for the NEXT top-level drain.
+//     d. call_context_stack depth equals the number of currently-active $(call) frames.
+//        It is pushed on call entry and popped on call return (no early-exit leaks).
+//     e. in_second_expansion and in_recipe_execution are RefCell<bool> flags that are
+//        only true while the corresponding operation is actually in progress.  They are
+//        set to false by the caller's cleanup code on every exit path.
+//
+// S2. Variable scoping — target-specific variables do not leak:
+//     Target-specific variables are stored in Rule::target_specific_vars and are pushed
+//     onto the executor's inherited_vars_stack during build_with_rules.  They are never
+//     written to MakeDatabase::variables.  set_variable always writes to db.variables;
+//     it is never called with a target context during rule execution.
+//
+// S3. Rule registration atomicity:
+//     register_rule is called only when a Rule is complete (all recipe lines appended).
+//     A partial Rule (Rule::new() with no targets, or a Rule with targets but no recipe
+//     yet) is held in the local `current_rule: Option<Rule>` variable inside
+//     process_parsed_lines and is NEVER inserted into db.rules while mid-construction.
+//     If process_parsed_lines returns early (error), the partial Rule is simply dropped —
+//     no partial entry is visible in db.rules.
+//
+// S4. Default goal tracking:
+//     db.default_target is set to the first non-special, non-pattern, non-dot target
+//     seen in any makefile UNLESS db.default_goal_explicit == true (i.e., .DEFAULT_GOAL
+//     was explicitly assigned in the Makefile, which locks the value).
+//     Invariant: db.default_goal_explicit == true implies db.default_target.is_some()
+//     (except when .DEFAULT_GOAL is set to empty, which resets default_goal_explicit to false).
+//
+// S5. Include depth bound (security):
+//     include_depth is bounded at 200 (see S1.a).  This prevents stack overflow from
+//     a chain of files each including the next or from a self-including Makefile.
+//
+// S6. Single-instance, non-Send invariant:
+//     Only one MakeState exists per process.  MakeState is !Send and !Sync.
+//     The only concurrency in jmake is in exec::Executor (recipe execution); those
+//     threads receive pre-expanded data and hold no reference to MakeState.
+
 // Evaluation engine - variable expansion, rule processing, main state machine
 
 mod expand;
@@ -431,6 +477,13 @@ fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
 }
 
 impl MakeState {
+    // PRE:  Called at most once per process.  `args` is the fully-parsed command-line state.
+    // POST: Returns a MakeState satisfying all S1–S6 invariants:
+    //       include_depth == 0, expansion_depth == 0, call_context_stack is empty,
+    //       in_second_expansion == false, in_recipe_execution == false.
+    //       If args.directory is set and chdir fails, the process exits with code 2.
+    // NOTE: Panic/drop safety: env::set_current_dir error triggers process::exit(2).
+    //       No invariant can be broken because the new MakeState has not been shared yet.
     pub fn new(args: MakeArgs) -> Self {
         let cmdline_args = args.clone();
         let mut state = MakeState {
@@ -530,6 +583,19 @@ impl MakeState {
     ///
     /// Returns `Ok(())` on success, `Err(message)` for fatal errors that should
     /// be printed and turned into a non-zero exit code by the caller.
+    //
+    // PRE:  self was created by MakeState::new (invariants S1–S6 hold).
+    //       init_variables has NOT been called yet (called internally at the start of run).
+    // POST: On Ok(()): all targets were up to date or successfully built.
+    //       On Err(msg): a fatal error occurred; msg is the human-readable message.
+    //       Either way, all S1–S6 invariants hold on return (include_depth == 0,
+    //       expansion_depth == 0, call_context_stack empty, etc.).
+    // NOTE: try_update_makefiles may call std::process::exec (re-exec) — this function
+    //       may never return in that case.  That is an expected, documented behavior and
+    //       not a violation of any invariant.
+    // NOTE: Panic/drop safety: all sub-calls that can fail return Result; panics from
+    //       OOM would leave include_depth/expansion_depth in a potentially inconsistent
+    //       state, but OOM is unrecoverable and the process will abort.
     pub fn run(&mut self) -> Result<(), String> {
         self.init_variables();
 
@@ -1219,6 +1285,16 @@ impl MakeState {
 
     /// Like read_makefile but uses `display_name` as the filename shown in error messages.
     /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
+    //
+    // PRE:  include_depth < 200 (enforced internally — depth > 200 returns an Err immediately).
+    //       S1.a holds on entry.
+    // POST: On Ok(()): all rules, variables, and directives in `path` have been applied to self.db.
+    //       include_depth is exactly the same as on entry (incremented then decremented — S1.a).
+    //       On Err(msg): include_depth is still the same as on entry (decremented in error path too).
+    // NOTE: Panic/drop safety: include_depth is decremented via explicit `self.include_depth -= 1`
+    //       in both the success and the error path of read_makefile_display (not via Drop).
+    //       If an inner call panics (OOM), include_depth may be left incremented — but the panic
+    //       is fatal and the process will abort, so no invariant needs to be preserved across it.
     pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
         // Guard against infinite include recursion (e.g., a makefile including itself)
         // SECURITY: verified — depth capped at 200, preventing stack exhaustion from
@@ -1335,6 +1411,18 @@ impl MakeState {
     /// Definition order relative to surrounding rules is preserved because
     /// top-level `$(eval)` calls first flush `current_rule` before executing the
     /// eval'd content (see the `eval_pending` drain in `process_parsed_lines`).
+    //
+    // PRE:  No &Variable borrows into self.db.variables are live on the caller's stack (E2).
+    //       All RefCell guards (eval_pending, current_file, current_line, etc.) are NOT
+    //       held by the caller (i.e., borrow_mut() would succeed for all RefCells) — this
+    //       is checked by debug_assert! at each call site in expand_function.
+    //       in_second_expansion == false (eval must not define new rules during SE — S1.e).
+    // POST: On Ok(()): `content` was fully evaluated; self.db updated accordingly (S3 holds).
+    //       current_file and current_line are restored to their values before the eval (S1).
+    //       On Err(msg): self.db may be partially modified by lines processed before the error.
+    // NOTE: Panic/drop safety: eval_string is called from expand_function via an unsafe
+    //       *const → *mut cast.  If process_parsed_lines panics, the MakeState is in an
+    //       undefined state — but this is only reachable via OOM and the process will abort.
     pub fn eval_string(&mut self, content: &str) -> Result<(), String> {
         let mut parser = Parser::new(PathBuf::from("<eval>"));
         parser.load_string(content);
@@ -2425,6 +2513,20 @@ impl MakeState {
     ///   * Order-only vs. normal prerequisite promotion is handled here: a prereq
     ///     that appears as order-only in an earlier rule and as normal in a later
     ///     rule is promoted to normal in the merged entry.
+    // PRE:  rule.targets.len() >= 1 (M2 — a rule with no targets is a logic error).
+    //       All recipe lines in rule.recipe are in ascending line-number order (M3).
+    //       self satisfies S1–S4 on entry.
+    // POST: If rule.targets contains only special targets (e.g. ".PHONY"), only
+    //       self.db.special_targets is updated; self.db.rules is unchanged.
+    //       If rule.is_pattern == true, rule is appended to self.db.pattern_rules.
+    //       Otherwise rule is inserted into self.db.rules[target] (one entry per target).
+    //       self.db.default_target is updated if S4 applies (first non-special target).
+    //       All S1–S4 invariants hold on return.
+    // NOTE: Panic/drop safety: self.db.rules.insert and HashSet::extend can only panic on OOM.
+    //       On OOM the process aborts; no partial state is visible to other components because
+    //       the partial insertions either fully complete or the process dies.
+    //       process::exit(2) is called for certain conflict errors (e.g. .NOTINTERMEDIATE +
+    //       .SECONDARY conflict) — this is intentional and not a panic.
     fn register_rule(&mut self, rule: Rule) {
         // Canonicalize: strip leading "./" from target names, prerequisites, and
         // grouped sibling names so they match GNU make file-table behavior.
@@ -2927,6 +3029,22 @@ impl MakeState {
     ///   section.
     /// * Assigning to `.DEFAULT_GOAL` updates `db.default_target` and the
     ///   `default_goal_explicit` flag.
+    // PRE:  `name` is the already-expanded variable name (may be empty, which GNU Make allows).
+    //       `value` is the raw value text — pre-expanded for Simple/PosixSimple; raw for others.
+    //       `flavor` is the assignment operator flavor (one of the VarFlavor variants).
+    //       self.db.variables is accessible for mutation (no outstanding borrows — E2).
+    // POST: If the variable is protected (CommandLine/Override origin and !is_override),
+    //       self is unchanged (early return — S2).
+    //       Otherwise self.db.variables[name] is updated to reflect the new value/flavor/origin.
+    //       For Append (+=): the existing variable's flavor is preserved; value is appended.
+    //       For Conditional (?=): variable is set only if not already defined.
+    //       For Shell (!=): the shell command is executed; result stored as Recursive.
+    //       All M1 flavor/origin invariants hold for the resulting Variable.
+    //       source_file and source_line are set to the current parse location (current_file,
+    //       current_line) for all newly created or updated entries.
+    // NOTE: Panic/drop safety: Shell assignment calls shell_exec_with_env which may block
+    //       but does not panic under normal conditions.  IndexMap::insert can panic on OOM.
+    //       Early-return paths (protected variable) leave self unchanged — no invariant broken.
     fn set_variable(&mut self, name: &str, value: &str, flavor: &VarFlavor, is_override: bool, is_export: bool) {
         let origin = if is_override { VarOrigin::Override } else { VarOrigin::File };
         // Capture current source location for error reporting during lazy expansion.

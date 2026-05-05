@@ -26,6 +26,45 @@
 //! worker threads in `exec::parallel` receive already-resolved data and do
 //! not access the database directly.
 
+// INVARIANTS: src/types.rs — core data structures
+//
+// M1. Variable flavor/origin consistency:
+//     A Variable's `flavor` field always reflects the operator used at definition:
+//     - `VarFlavor::Simple`      ← `:=` / `::=`
+//     - `VarFlavor::PosixSimple` ← `:::=`  (stored as Recursive after escaping)
+//     - `VarFlavor::Recursive`   ← `=`, `!=`, and any Append/Conditional that creates new
+//     - `VarFlavor::Append`      ← `+=`  (only in ParsedLine; stored vars are promoted to the
+//                                          existing variable's flavor by set_variable)
+//     - `VarFlavor::Conditional` ← `?=`  (only in ParsedLine; stored vars use Recursive)
+//     - `VarFlavor::Shell`       ← `!=`  (only in ParsedLine; stored vars use Recursive)
+//     Automatic variables (`$@`, `$<`, etc.) are NEVER stored in MakeDatabase::variables;
+//     they exist only in the transient `auto_vars` HashMap passed to expand_with_auto_vars.
+//
+// M2. Rule target invariant:
+//     Every Rule inserted into MakeDatabase::rules or MakeDatabase::pattern_rules has
+//     `targets.len() >= 1`.  Rule::new() starts with an empty Vec; callers (register_rule)
+//     must populate targets before calling this function.
+//     Rules in db.rules are keyed by target name; a Rule at db.rules[k] has targets[0] == k
+//     for single-target rules; multi-target rules are stored once per target.
+//
+// M3. Recipe storage order:
+//     Rule::recipe lines are stored in definition order (ascending line numbers).
+//     The tuple (usize, String) is (makefile_line_number, raw_unexpanded_text).
+//     Recipe lines are never pre-expanded at storage time; expansion happens at build time.
+//
+// M4. MakeDatabase field consistency:
+//     - `builtin_pattern_rules_count <= pattern_rules.len()` always.
+//     - `default_goal_explicit == true` implies `default_target.is_some()`.
+//       (Exception: .DEFAULT_GOAL = "" sets default_goal_explicit back to false.)
+//     - `export_all` is the canonical mirror of
+//       `special_targets[ExportAllVariables].is_some()`.
+//     - `second_expansion`, `one_shell`, `posix_mode`, `not_parallel` are monotone flags:
+//       they only transition false → true during the evaluator's run (no directive un-sets them).
+//
+// M5. MakeDatabase thread safety:
+//     MakeDatabase is accessed exclusively from the main thread.  Worker threads in
+//     exec::parallel receive pre-resolved TargetPlans and hold no reference to MakeDatabase.
+
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -113,6 +152,13 @@ impl Variable {
     ///
     /// Export status defaults to `None` (inherit global default), `is_private`
     /// to `false`, and source location to unknown (`""` / `0`).
+    //
+    // PRE:  `flavor` and `origin` are valid enum variants (type system guarantees this).
+    //       `value` is the raw (unexpanded for Recursive; already-expanded for Simple) text.
+    // POST: Returns a Variable satisfying M1: flavor and origin are set as supplied.
+    //       export == None, is_private == false, source_file == "", source_line == 0.
+    // NOTE: Panic/drop safety: this function cannot panic; no invariant can be broken
+    //       by an early return because no shared state is modified.
     pub fn new(value: String, flavor: VarFlavor, origin: VarOrigin) -> Self {
         Variable {
             value,
@@ -189,6 +235,12 @@ impl Rule {
     ///
     /// Callers are expected to fill in at minimum `targets` before registering
     /// the rule with the database.
+    //
+    // PRE:  None — this is a constructor; all fields are initialized to safe defaults.
+    // POST: Returns a Rule with targets.is_empty() == true.
+    //       IMPORTANT: the returned Rule violates M2 (targets must be non-empty before
+    //       registration).  Callers MUST push at least one target before calling register_rule.
+    // NOTE: Panic/drop safety: this function cannot panic.
     pub fn new() -> Self {
         Rule {
             targets: Vec::new(),
@@ -451,6 +503,14 @@ pub struct MakeDatabase {
 impl MakeDatabase {
     /// Create a new, empty [`MakeDatabase`] pre-populated with the standard
     /// `.SUFFIXES` list from POSIX Make.
+    //
+    // PRE:  None — constructor.
+    // POST: All invariants M1–M5 hold.
+    //       suffixes is populated with the POSIX default list.
+    //       builtin_pattern_rules_count == 0 (no pattern rules yet).
+    //       default_goal_explicit == false.
+    // NOTE: Panic/drop safety: Vec/HashMap allocations may panic on OOM;
+    //       that is unrecoverable and does not break any invariant.
     pub fn new() -> Self {
         MakeDatabase {
             rules: IndexMap::new(),
@@ -500,12 +560,20 @@ impl MakeDatabase {
     /// Targets that exist only because an implicit rule matched them are NOT
     /// considered explicitly mentioned, and remain eligible for intermediate
     /// file cleanup.
+    //
+    // PRE:  Self satisfies M4 (rules and explicitly_mentioned are consistent).
+    // POST: Returns a bool; does not mutate self.  All invariants hold on return.
+    // NOTE: Panic/drop safety: HashMap/IndexMap lookups cannot panic.
     pub fn is_explicitly_mentioned(&self, name: &str) -> bool {
         self.explicitly_mentioned.contains(name)
             || self.rules.contains_key(name)
     }
 
     /// Returns `true` if `target` is listed under `.PHONY`.
+    //
+    // PRE:  None beyond a shared reference to self.
+    // POST: Returns bool; self unchanged.
+    // NOTE: Panic/drop safety: read-only, no panics possible.
     pub fn is_phony(&self, target: &str) -> bool {
         self.special_targets
             .get(&SpecialTarget::Phony)
@@ -518,6 +586,10 @@ impl MakeDatabase {
     /// - `.PRECIOUS:` with no prerequisites was seen (all targets are precious), OR
     /// - The target name is listed explicitly under `.PRECIOUS:`, OR
     /// - The target name matches a `%`-pattern listed under `.PRECIOUS:`.
+    //
+    // PRE:  None beyond a shared reference to self.
+    // POST: Returns bool; self unchanged.  Pattern matching is O(|.PRECIOUS set|) per call.
+    // NOTE: Panic/drop safety: read-only; no panics possible.
     pub fn is_precious(&self, target: &str) -> bool {
         let set = match self.special_targets.get(&SpecialTarget::Precious) {
             Some(s) => s,

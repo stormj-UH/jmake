@@ -45,6 +45,37 @@
 //! signal handler itself runs asynchronously on whatever thread receives the
 //! signal, but invariant I1 ensures that does not create a data race.
 
+// INVARIANTS: src/signal_handler.rs — async-signal-safe SIGTERM cleanup
+//
+// I1. Single-threaded write rule:
+//     set_temp_stdin_path, clear_temp_stdin_path, set_term_message, and
+//     clear_term_message are called ONLY from the main thread.  The signal
+//     handler (sigterm_handler) runs asynchronously on whichever thread receives
+//     SIGTERM, but because jmake has only one thread during these writes there is
+//     no concurrent-writer data race.
+//
+// I2. Acquire/Release ordering (buffer visibility):
+//     Every set_* call writes the buffer bytes BEFORE storing the length with
+//     Ordering::Release.  sigterm_handler loads the length with Ordering::Acquire
+//     before reading buffer bytes.  This Release-before-Acquire pairing guarantees
+//     the handler never observes a partially-written buffer.
+//
+// I3. Async-signal-safe syscalls only:
+//     sigterm_handler calls ONLY write(2), unlink(2), signal(2), raise(2) — all
+//     listed as async-signal-safe in POSIX.1-2017 §2.4.3.  It must NEVER call
+//     malloc, free, any lock-taking function, eprintln!, format!, or any Rust
+//     allocator function.
+//
+// I4. No live Rust references during raw-pointer writes:
+//     No `&` or `&mut` reference to the interior of TEMP_FILE_BUF or TERM_MSG_BUF
+//     is ever alive at the same time as the raw-pointer copy_nonoverlapping writes
+//     inside set_*.  UnsafeCell::get() returns *mut without creating a reference.
+//
+// I5. Buffer capacity invariant:
+//     TEMP_FILE_BUF has capacity MAX_PATH bytes; TERM_MSG_BUF has capacity MAX_MSG.
+//     set_* caps the written length at N-1 (leaving room for the NUL terminator).
+//     TEMP_FILE_LEN and TERM_MSG_LEN are always <= MAX_PATH-1 and MAX_MSG-1 respectively.
+
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -115,6 +146,14 @@ static TERM_MSG_LEN: AtomicUsize = AtomicUsize::new(0);
 static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// Set the temp stdin file path for the SIGTERM handler to clean up.
+//
+// PRE:  Called only from the main thread (I1).
+//       `path` is a valid UTF-8 string; if longer than MAX_PATH-1 bytes it is silently truncated.
+// POST: TEMP_FILE_BUF[0..len] contains the UTF-8 bytes of `path`; TEMP_FILE_BUF[len] == 0.
+//       TEMP_FILE_LEN is stored with Release ordering so sigterm_handler sees the full write (I2).
+//       All invariants I1–I5 hold on return.
+// NOTE: Panic/drop safety: copy_nonoverlapping is unsafe but cannot unwind; AtomicUsize::store
+//       cannot panic.  Early-return impossible — no invariant can be left broken.
 pub fn set_temp_stdin_path(path: &str) {
     let bytes = path.as_bytes();
     let len = bytes.len().min(MAX_PATH - 1);
@@ -136,12 +175,23 @@ pub fn set_temp_stdin_path(path: &str) {
 }
 
 /// Clear the temp stdin path.
+//
+// PRE:  Called only from the main thread (I1).
+// POST: TEMP_FILE_LEN == 0 (Release).  After this, sigterm_handler will skip unlink(2).
+//       Buffer bytes are left as-is but are inaccessible because length is 0.
+// NOTE: Panic/drop safety: atomic store cannot panic.
 pub fn clear_temp_stdin_path() {
     TEMP_FILE_LEN.store(0, Ordering::Release);
 }
 
 /// Set the Terminated message for the SIGTERM handler to print.
 /// Format: "progname: *** [file:line: target] Terminated\n"
+//
+// PRE:  Called only from the main thread (I1).
+//       `msg` is valid UTF-8; silently truncated to MAX_MSG-1 bytes if longer.
+// POST: TERM_MSG_BUF[0..len] holds the message bytes; TERM_MSG_BUF[len] == 0.
+//       TERM_MSG_LEN stored with Release ordering (I2).  I1–I5 hold on return.
+// NOTE: Panic/drop safety: same as set_temp_stdin_path.
 pub fn set_term_message(msg: &str) {
     let bytes = msg.as_bytes();
     let len = bytes.len().min(MAX_MSG - 1);
@@ -159,6 +209,10 @@ pub fn set_term_message(msg: &str) {
 }
 
 /// Clear the Terminated message.
+//
+// PRE:  Called only from the main thread (I1).
+// POST: TERM_MSG_LEN == 0 (Release).  Handler will skip write(2) for this message.
+// NOTE: Panic/drop safety: atomic store cannot panic.
 pub fn clear_term_message() {
     TERM_MSG_LEN.store(0, Ordering::Release);
 }
@@ -235,6 +289,14 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 }
 
 /// Install the SIGTERM handler.
+//
+// PRE:  Called at most once, from the main thread, before any SIGTERM can be delivered
+//       for which set_term_message / set_temp_stdin_path must have already been called.
+//       (If neither buffer needs to be used before the first signal, the ordering
+//       requirement is vacuous.)
+// POST: SIGTERM is handled by sigterm_handler for the lifetime of the process.
+//       All invariants I1–I5 remain valid (this function does not write any buffer).
+// NOTE: Panic/drop safety: libc::signal is an FFI call; it cannot unwind into Rust.
 pub fn install_sigterm_handler() {
     // SAFETY:
     // - libc::signal is an FFI call to the POSIX signal(2) syscall.

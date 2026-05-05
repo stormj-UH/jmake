@@ -92,6 +92,48 @@
 //! flag (in `mod.rs`) guards against accidental re-entrancy in the one code path
 //! that calls back into the OS environment.
 
+// INVARIANTS: src/eval/expand.rs — variable expansion engine
+//
+// E1. Termination guarantee (depth limit):
+//     expand_var_value increments `expansion_depth` (RefCell<usize>) on entry and
+//     decrements it via a DropGuard on every exit path (normal return, early return,
+//     process::exit).  When depth reaches MAX_EXPANSION_DEPTH (1000) the process
+//     exits — it does NOT continue recursing.  This bounds the Rust call stack even
+//     for non-circular chains like A = $(B), B = $(C), … up to depth 1000.
+//
+// E2. No dangling variable references during $(eval) re-entrancy:
+//     Before calling expand_var_value (which may invoke $(eval) and reallocate
+//     db.variables), callers always CLONE the Variable value out of the map:
+//       `self.db.variables.get(&name).cloned()`
+//     This ensures no &Variable borrow into db.variables is live when $(eval) runs.
+//     The cloned value is a plain String on the stack; reallocation of the IndexMap
+//     does not invalidate it.
+//
+// E3. vars_being_expanded prevents circular expansion:
+//     When expand_var_value begins expanding a Recursive variable it inserts a
+//     recursion key into `vars_being_expanded`.  If the same key is encountered
+//     again before the first expansion finishes, the inner call returns empty string
+//     immediately.  The key is removed from the set on every exit path via explicit
+//     `remove` after the expand call (not via Drop — callers must ensure this).
+//
+// E4. find_matching_close is O(n), single-pass:
+//     The function scans `bytes` once from `start`, maintaining a depth counter.
+//     It handles nested $(…) and ${…} references by tracking their own depth
+//     inline.  It returns Some(index) as soon as depth reaches 0, or None if the
+//     input is exhausted.  No backtracking; no allocation.
+//
+// E5. expand_with_auto_vars never modifies self.db:
+//     It holds only a shared reference (&self).  The $(eval) side-channel that
+//     calls eval_string(&mut self) is the ONLY path that can mutate self.db during
+//     expansion.  That path uses an unsafe *const → *mut cast, which is safe only
+//     because (a) jmake is single-threaded and (b) invariant E2 holds at the cast site.
+//
+// E6. expansion_caller_stack balance:
+//     expand_var_value pushes (saved_file, saved_line) to expansion_caller_stack
+//     before entering recursive expansion and pops it after.  The push/pop are
+//     paired on every exit path, so the stack depth after any expand call equals
+//     the depth before.
+
 use crate::eval::MakeState;
 use crate::eval::make_progname;
 use crate::functions;
@@ -115,6 +157,17 @@ impl MakeState {
     /// Use this for contexts where `$@`, `$<`, `$^`, etc. are undefined:
     /// variable-assignment values, `include` paths, conditional arguments, and
     /// any directive that is evaluated outside a recipe or pattern-rule body.
+    //
+    // PRE:  `input` is valid UTF-8 (Rust strings are always UTF-8).
+    //       expansion_depth == 0 at the outermost call site (not required for nested calls).
+    //       No &Variable borrows into self.db.variables are live on the caller's stack (E2).
+    // POST: Returns the fully expanded string.
+    //       self.db may have been modified if $(eval) ran during expansion (E5).
+    //       expansion_depth is unchanged from before the call (E1 — DepthGuard ensures this).
+    //       vars_being_expanded is empty if no circular chain was interrupted (E3).
+    // NOTE: Panic/drop safety: unterminated `$(` / `${` causes process::exit(2), not panic.
+    //       An OOM during String::push_str can panic — no invariant is broken because
+    //       the partial string is on the stack and is simply abandoned.
     pub fn expand(&self, input: &str) -> String {
         // Avoid a heap allocation on every call by reusing a static empty map.
         // expand_with_auto_vars only reads from auto_vars; a shared reference to a
@@ -159,6 +212,16 @@ impl MakeState {
     /// (the overwhelming common case for makefiles) this is a single pass with
     /// no heap allocation until the first `$` is encountered.  Multi-byte UTF-8
     /// characters are forwarded via `str::chars()` to avoid splitting sequences.
+    //
+    // PRE:  No &Variable borrows into self.db.variables are live on the caller's stack (E2).
+    //       `expansion_depth` < MAX_EXPANSION_DEPTH (otherwise the first Recursive variable
+    //       expansion would immediately abort via process::exit — which is correct behavior).
+    // POST: Returns the fully expanded string.  self.db may be modified by $(eval) (E5).
+    //       All RefCell guards borrowed during expansion are released before return (E6).
+    //       expansion_depth is the same as on entry (DepthGuard in expand_var_value, E1).
+    // NOTE: Panic/drop safety: unterminated `$(` → process::exit(2), not unwind.
+    //       String growth may panic on OOM; state left consistent because partial result
+    //       is a local variable on the stack — db invariants are not affected.
     pub fn expand_with_auto_vars(&self, input: &str, auto_vars: &HashMap<String, String>) -> String {
         let mut result = String::with_capacity(input.len());
         let bytes = input.as_bytes();
@@ -468,6 +531,19 @@ impl MakeState {
     /// into `self.db.variables`, potentially reallocating its backing storage.
     /// **Callers must clone the `Variable` before calling this function** so
     /// that no `&Variable` reference into the map is live across the call.
+    // PRE:  `var` is a cloned Variable (not a reference into self.db.variables) — E2.
+    //       No RefCell guards for db.variables are held by the caller — E2.
+    //       expansion_depth < MAX_EXPANSION_DEPTH (caller's responsibility for initial entry;
+    //       the depth check inside this function handles breach at any recursion level).
+    // POST: Returns the expanded string.
+    //       expansion_depth is the same as on entry (DepthGuard decrements on all exits — E1).
+    //       vars_being_expanded has the recursion_key removed (explicit remove before return — E3).
+    //       expansion_caller_stack has the same depth as on entry (push/pop paired — E6).
+    // NOTE: Panic/drop safety: process::exit(2) is called when depth limit is hit — no panic.
+    //       If expand_with_auto_vars panics mid-recursion, the DepthGuard Drop impl decrements
+    //       expansion_depth correctly; but vars_being_expanded may retain a stale key if the
+    //       explicit `remove` after the expand call is skipped by the unwind.  This is acceptable
+    //       because a panic at this point is always a fatal, non-recoverable condition (OOM).
     fn expand_var_value(&self, var: &Variable, auto_vars: &HashMap<String, String>) -> String {
         match var.flavor {
             VarFlavor::Recursive => {
@@ -1499,6 +1575,14 @@ impl MakeState {
 /// of `expand_with_auto_vars`; inlining eliminates the call overhead and lets
 /// the compiler hoist the `open`/`close` byte comparisons.
 #[inline]
+// PRE:  `start` <= bytes.len() (if start == bytes.len() the function returns None immediately).
+//       `open` and `close` are distinct bytes (e.g. b'(' and b')' or b'{' and b'}').
+//       Depth at entry is implicitly 1 (the caller has already consumed the opening delimiter).
+// POST: Returns Some(i) where bytes[i] == close and the bracket at `start-2` is matched,
+//       or None if the input is exhausted without a match.
+//       Scans bytes[start..] in a single pass (O(n)); no allocation; no mutation.
+// NOTE: Panic/drop safety: only array indexing (bounds-checked) and integer arithmetic.
+//       Integer overflow is impossible: depth can only reach bytes.len() which fits in usize.
 fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Option<usize> {
     let mut depth = 1;
     let mut i = start;
