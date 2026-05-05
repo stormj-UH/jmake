@@ -107,7 +107,11 @@ impl MakeState {
     /// variable-assignment values, `include` paths, conditional arguments, and
     /// any directive that is evaluated outside a recipe or pattern-rule body.
     pub fn expand(&self, input: &str) -> String {
-        self.expand_with_auto_vars(input, &HashMap::new())
+        // Avoid a heap allocation on every call by reusing a static empty map.
+        // expand_with_auto_vars only reads from auto_vars; a shared reference to a
+        // zero-element map is indistinguishable from a fresh empty map.
+        static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+        self.expand_with_auto_vars(input, EMPTY.get_or_init(HashMap::new))
     }
 
     /// Expand all variable and function references in `input`, with automatic
@@ -1451,6 +1455,10 @@ impl MakeState {
 ///
 /// Returns `None` if no matching close is found before the end of `bytes`,
 /// which indicates an unterminated reference (a fatal error the caller handles).
+/// Marked `#[inline]` — called once per `$(...)` in the innermost scan loop
+/// of `expand_with_auto_vars`; inlining eliminates the call overhead and lets
+/// the compiler hoist the `open`/`close` byte comparisons.
+#[inline]
 fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Option<usize> {
     let mut depth = 1;
     let mut i = start;
@@ -1484,6 +1492,10 @@ fn find_matching_close(bytes: &[u8], start: usize, open: u8, close: u8) -> Optio
 /// belongs to the inner reference and is skipped.  A space or tab before the
 /// first `:` means the content is a function call rather than a substitution
 /// reference, so `None` is returned early.
+/// Marked `#[inline]` — called for every `$(...)` that could be a substitution
+/// reference; inlining avoids a call frame for the common fast-exit path when
+/// the content starts with a space (function call) or has no colon.
+#[inline]
 fn find_subst_ref_colon(content: &str) -> Option<usize> {
     // Find ':' that's a substitution reference, not inside a function call.
     // GNU Make allows '\:' as the colon separator (the backslash is stripped
@@ -1534,8 +1546,13 @@ pub fn split_function_args(s: &str) -> Vec<String> {
 /// the remainder of the string (including any commas it contains) is gathered
 /// verbatim into the final argument.
 pub fn split_function_args_max(s: &str, max_args: usize) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
+    // Pre-size the output vec to the minimum of max_args and a small constant so
+    // that the common 1-, 2-, and 3-arg calls never reallocate.
+    let expected = if max_args == usize::MAX { 4 } else { max_args.min(8) };
+    let mut args = Vec::with_capacity(expected);
+    // Pre-size the accumulator to the average expected argument length;
+    // most make function arguments are short variable references.
+    let mut current = String::with_capacity(s.len().min(64));
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut depth = 0i32;
