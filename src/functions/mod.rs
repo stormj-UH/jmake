@@ -456,6 +456,12 @@ fn fn_join(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 }
 
 fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+    // SECURITY: path traversal — trust boundary.
+    // $(wildcard ../../etc/passwd) is permitted.  A Makefile is trusted
+    // authored content; restricting which paths it may reference would break
+    // legitimate cross-directory build systems.  The trust model is identical
+    // to that of a shell script: the author of the Makefile owns the paths it
+    // can access.  No sanitisation is applied here.
     let patterns: Vec<&str> = args[0].split_whitespace().collect();
     let mut results = Vec::new();
     for pattern in patterns {
@@ -561,6 +567,10 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 }
 
 fn fn_realpath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+    // SECURITY: path traversal — trust boundary.  See fn_wildcard comment.
+    // $(realpath ../../etc/passwd) resolves the symlink chain and returns the
+    // canonical path.  This is intended behavior; the Makefile author is trusted.
+    // SECURITY: verified — no sanitisation required.
     let words: Vec<&str> = args[0].split_whitespace().collect();
     let results: Vec<String> = words.iter().filter_map(|w| {
         std::fs::canonicalize(w).ok().map(|p| p.to_string_lossy().to_string())
@@ -569,6 +579,10 @@ fn fn_realpath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 }
 
 fn fn_abspath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+    // SECURITY: path traversal — trust boundary.  See fn_wildcard comment.
+    // $(abspath ../../etc/passwd) normalises the path without resolving symlinks.
+    // The Makefile author is trusted; no path filtering is applied.
+    // SECURITY: verified — no sanitisation required.
     let words: Vec<&str> = args[0].split_whitespace().collect();
     let cwd = std::env::current_dir().unwrap_or_default();
     let results: Vec<String> = words.iter().map(|w| {

@@ -462,6 +462,12 @@ fn execute_job_normal(job: Job) -> JobResult {
 
             any_cmd_ran = true;
 
+            // SECURITY: trust boundary — see the matching comment in exec/mod.rs.
+            // Recipe commands are not sanitised before being passed to the shell.
+            // Makefiles are trusted authored content; no escaping or filtering
+            // is applied.  `cmd` is passed as a single argv element to the shell
+            // (no shell-meta-character injection risk on the direct exec path).
+            //
             // Determine effective shell/flags for this command.
             // (target-specific SHELL/.SHELLFLAGS are already baked into the job's
             // shell/shell_flags fields by the scheduler.)
