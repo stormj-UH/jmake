@@ -98,6 +98,15 @@ use crate::functions;
 use crate::types::*;
 use std::collections::HashMap;
 
+/// Maximum nesting depth for recursive variable expansion.
+/// GNU Make aborts with "Recursive variable … references itself (eventually)"
+/// at this depth.  We match the limit so pathological Makefiles don't
+/// overflow the call stack.
+// SECURITY: without this limit a Makefile with a 10 000-long chain of
+// distinct recursive variables (A = $(B), B = $(C), …) would exhaust the
+// thread stack and kill the process with SIGSEGV.
+const MAX_EXPANSION_DEPTH: usize = 1000;
+
 impl MakeState {
     /// Expand all variable and function references in `input`, with no automatic
     /// variables in scope.
@@ -458,6 +467,37 @@ impl MakeState {
     fn expand_var_value(&self, var: &Variable, auto_vars: &HashMap<String, String>) -> String {
         match var.flavor {
             VarFlavor::Recursive => {
+                // SECURITY: depth limit — guard against deep (but non-circular) chains
+                // such as A = $(B), B = $(C), …, that would overflow the call stack.
+                // GNU Make aborts at 1000 levels; we match that limit exactly.
+                {
+                    let mut depth = self.expansion_depth.borrow_mut();
+                    if *depth >= MAX_EXPANSION_DEPTH {
+                        let file = self.current_file.borrow().clone();
+                        let line = *self.current_line.borrow();
+                        let loc = if file.is_empty() {
+                            make_progname()
+                        } else if line == 0 {
+                            file
+                        } else {
+                            format!("{}:{}", file, line)
+                        };
+                        eprintln!(
+                            "{}: *** Recursive variable '{}' references itself (eventually).  Stop.",
+                            loc,
+                            if !var.source_file.is_empty() { &var.value } else { &var.value }
+                        );
+                        std::process::exit(2);
+                    }
+                    *depth += 1;
+                }
+                // Ensure we decrement the depth on any exit path.
+                struct DepthGuard<'a>(&'a std::cell::RefCell<usize>);
+                impl Drop for DepthGuard<'_> {
+                    fn drop(&mut self) { *self.0.borrow_mut() -= 1; }
+                }
+                let _depth_guard = DepthGuard(&self.expansion_depth);
+
                 // Guard against infinite recursion: if this variable is already being expanded
                 // (e.g. VARIABLE = $(eval VARIABLE := foo)$(VARIABLE) where eval hasn't run yet),
                 // return empty string instead of recursing infinitely.

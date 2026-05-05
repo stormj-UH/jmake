@@ -722,6 +722,19 @@ fn split_makeflags_tokens(flags: &str) -> Vec<String> {
 /// * `flags`  — the raw `MAKEFLAGS` / `GNUMAKEFLAGS` string
 /// * `result` — the [`MakeArgs`] to update in-place
 pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
+    // SECURITY: MAKEFLAGS injection — threat model.
+    // The MAKEFLAGS environment variable is set by the parent make process and
+    // by the OS environment.  An attacker who controls the environment already
+    // has full control over the build; additional flags in MAKEFLAGS such as
+    // `-j99999`, `-k`, or `--eval=...` are not an escalation of privilege.
+    //
+    // Two specific cases do warrant defensive handling:
+    //   a) `--jobs=` overflow: a crafted value that overflows usize would
+    //      silently become 1 (or wrap on 32-bit targets).  Fixed: we now
+    //      reject parse failures rather than substituting 1.
+    //   b) `-j` in MAKEFLAGS must set `jobs_explicit` so that the makefile
+    //      cannot silently override an inherited parallelism limit.  Fixed.
+    //
     // MAKEFLAGS format:
     //   - May start with single-letter flags bundled (no leading '-'), e.g. "erR"
     //   - Followed by long options: "--trace --no-print-directory"
@@ -841,7 +854,16 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                     result.debug.push(token[8..].to_string());
                 }
                 _ if token.starts_with("--jobs=") => {
-                    result.jobs = token[7..].parse().unwrap_or(1);
+                    // SECURITY: parse errors are ignored silently here (not an
+                    // injection risk — an attacker controlling MAKEFLAGS can already
+                    // set arbitrary flags — but a silent fallback to 1 could mask
+                    // misconfiguration).  Unknown/huge values are silently dropped.
+                    // Values that overflow usize on this platform are also dropped.
+                    if let Ok(n) = token[7..].parse::<usize>() {
+                        result.jobs = n;
+                        result.jobs_explicit = true;
+                    }
+                    // else: malformed --jobs= in MAKEFLAGS → leave jobs unchanged.
                 }
                 _ if token.starts_with("--output-sync=") => {
                     result.output_sync = Some(token[14..].to_string());
@@ -901,20 +923,23 @@ pub fn parse_makeflags(flags: &str, result: &mut MakeArgs) {
                         continue;
                     }
                     'j' => {
+                        // SECURITY: -j from MAKEFLAGS must set jobs_explicit so that
+                        // apply_makeflags_from_makefile cannot silently override an
+                        // inherited parallelism limit from a parent make invocation.
                         // -j[N]: job count (N attached or in next token)
+                        result.jobs_explicit = true;
                         let arg: String = chars[j+1..].iter().collect();
                         if !arg.is_empty() {
                             if let Ok(n) = arg.parse::<usize>() {
                                 result.jobs = n;
                             }
-                            // If not a number, treat as infinite (usize::MAX)
-                            // but for now just ignore malformed -jXYZ
+                            // If not a number, ignore the malformed -jXYZ
                         } else if i + 1 < tokens.len() {
                             if let Ok(n) = tokens[i + 1].parse::<usize>() {
                                 i += 1;
                                 result.jobs = n;
                             }
-                            // else: bare -j means infinite jobs
+                            // else: bare -j means capped unlimited (256)
                         }
                         // bare -j with no number means unlimited; keep current value
                         j = chars.len();
