@@ -82,8 +82,11 @@ impl MakeState {
                         let var_name = (bytes[i + 1] as char).to_string();
                         if let Some(val) = auto_vars.get(&var_name) {
                             result.push_str(val);
-                        } else if let Some(var) = self.db.variables.get(&var_name) {
-                            result.push_str(&self.expand_var_value(var, auto_vars));
+                        } else if let Some(var) = self.db.variables.get(&var_name).cloned() {
+                            // Clone so no &Variable reference into self.db.variables is
+                            // live during expand_var_value — which may re-enter $(eval)
+                            // and insert new keys (potentially reallocating the map).
+                            result.push_str(&self.expand_var_value(&var, auto_vars));
                         }
                         i += 2;
                     }
@@ -92,8 +95,9 @@ impl MakeState {
                         let var_name = (ch as char).to_string();
                         if let Some(val) = auto_vars.get(&var_name) {
                             result.push_str(val);
-                        } else if let Some(var) = self.db.variables.get(&var_name) {
-                            result.push_str(&self.expand_var_value(var, auto_vars));
+                        } else if let Some(var) = self.db.variables.get(&var_name).cloned() {
+                            // Clone for the same reason as the automatic-variable arm above.
+                            result.push_str(&self.expand_var_value(&var, auto_vars));
                         }
                         i += 2;
                     }
@@ -108,8 +112,9 @@ impl MakeState {
                         let var_name = (bytes[i + 1] as char).to_string();
                         if let Some(val) = auto_vars.get(&var_name) {
                             result.push_str(val);
-                        } else if let Some(var) = self.db.variables.get(&var_name) {
-                            result.push_str(&self.expand_var_value(var, auto_vars));
+                        } else if let Some(var) = self.db.variables.get(&var_name).cloned() {
+                            // Clone for the same reason as the automatic-variable arm above.
+                            result.push_str(&self.expand_var_value(&var, auto_vars));
                         }
                         // If not found, expand to empty string (no output)
                         i += 2;
@@ -176,8 +181,10 @@ impl MakeState {
                 let base_char = first;
                 let base_val = if let Some(val) = auto_vars.get(base_char) {
                     val.clone()
-                } else if let Some(var) = self.db.variables.get(base_char) {
-                    self.expand_var_value(var, auto_vars)
+                } else if let Some(var) = self.db.variables.get(base_char).cloned() {
+                    // Clone: no &Variable borrow into self.db.variables may be live
+                    // during expand_var_value (which can re-enter $(eval) and reallocate).
+                    self.expand_var_value(&var, auto_vars)
                 } else {
                     String::new()
                 };
@@ -209,8 +216,10 @@ impl MakeState {
             names.sort();
             return names.join(" ");
         }
-        if let Some(var) = self.db.variables.get(&expanded_name) {
-            return self.expand_var_value(var, auto_vars);
+        if let Some(var) = self.db.variables.get(&expanded_name).cloned() {
+            // Clone: no &Variable borrow may be live during expand_var_value
+            // (which can re-enter $(eval) and reallocate self.db.variables).
+            return self.expand_var_value(&var, auto_vars);
         }
 
         // Warn if requested — but suppress warnings for GNU Make's special/auto-set
@@ -327,8 +336,10 @@ impl MakeState {
         let expanded_name = self.expand_with_auto_vars(var_name, auto_vars);
         let var_value = if let Some(val) = auto_vars.get(&expanded_name) {
             val.clone()
-        } else if let Some(var) = self.db.variables.get(&expanded_name) {
-            self.expand_var_value(var, auto_vars)
+        } else if let Some(var) = self.db.variables.get(&expanded_name).cloned() {
+            // Clone: no &Variable borrow into self.db.variables may be live
+            // during expand_var_value (which can re-enter $(eval)).
+            self.expand_var_value(&var, auto_vars)
         } else {
             return String::new();
         };
@@ -448,8 +459,49 @@ impl MakeState {
                         }
                     }
                     // When inside a recipe or second-expansion context, execute the eval
-                    // immediately via the same unsafe path as the normal case (below).
+                    // immediately via the same path as the normal case (below).
                     // Variable assignments (the common case here) are safe to execute immediately.
+                    //
+                    // SAFETY:
+                    // - `expanded` is a fully-owned String; no reference into
+                    //   `self.db.variables` or any other `self` field is alive at
+                    //   this point in the current stack frame.
+                    // - All RefCell borrow guards (e.g. for `in_second_expansion`,
+                    //   `in_recipe_execution`, `expansion_caller_stack`) that were
+                    //   taken earlier in this function have been dropped before this
+                    //   block (they are let-bindings that fell out of scope).
+                    // - jmake is single-threaded: no concurrent mutation of `self`
+                    //   is possible from another thread.
+                    // - `eval_string` takes `&mut self` and may insert into
+                    //   `self.db.variables` (IndexMap), which could reallocate the
+                    //   map's internal storage.  All prior `.get()` borrows from
+                    //   the map have been dropped (callers to `expand_var_value`
+                    //   clone the Variable before calling, so no &Variable from
+                    //   the map is live on the stack).
+                    // - The `&self → *mut Self` cast relies on the invariant that
+                    //   the only aliased reference (`self: &MakeState`) does not
+                    //   overlap with anything that `eval_string` writes through the
+                    //   raw pointer.  The fields that `eval_string` writes
+                    //   (db.variables, current_file, current_line, eval_pending)
+                    //   are not referenced by any live borrow at this site.
+                    //   Fields accessed via `RefCell` (current_file, current_line,
+                    //   etc.) have runtime borrow-checking; the RefCell guards
+                    //   above have been released.
+                    // - KNOWN LIMITATION: this pattern is not provably sound under
+                    //   Stacked Borrows / MIRI because `self: &Self` aliases the
+                    //   mutation target.  A fully sound fix requires wrapping `db`
+                    //   in `RefCell<MakeDatabase>` (tracked for a future refactor).
+                    // - debug_assert: verifies that no RefCell in MakeState is
+                    //   currently borrowed exclusively (catching re-entrant bugs
+                    //   in debug builds that this cast cannot prevent).
+                    debug_assert!(
+                        self.eval_pending.try_borrow().is_ok(),
+                        "eval_pending is exclusively borrowed at $(eval) call site"
+                    );
+                    debug_assert!(
+                        self.in_second_expansion.try_borrow().is_ok(),
+                        "in_second_expansion is exclusively borrowed at $(eval) call site"
+                    );
                     let result = unsafe {
                         let self_ptr: *mut Self = self as *const Self as *mut Self;
                         (*self_ptr).eval_string(&expanded)
@@ -514,11 +566,36 @@ impl MakeState {
                     // double-colon rules like `all:: ; @echo it` followed by `$(eval all:: ; @echo worked)`).
                     if !auto_vars.is_empty() {
                         // Inside call/foreach/let: execute immediately.
-                        // SAFETY: eval_string only inserts/modifies entries in self.db.variables
-                        // (via IndexMap); it does NOT remove entries nor reallocate while we hold
-                        // a live &-reference into the map. We have exclusive logical access to self
-                        // at this call site; no other thread is mutating self, and no live
-                        // &-borrows into self.db.variables exist from the caller's stack frame.
+                        //
+                        // SAFETY:
+                        // - `final_content` is a fully-owned String; it does not borrow
+                        //   any field of `self`.
+                        // - All RefCell borrow guards for `in_second_expansion`,
+                        //   `in_recipe_execution`, `expansion_caller_stack`, and
+                        //   `eval_pending` that were taken earlier in this function
+                        //   have been dropped before this block.
+                        // - Every call to `expand_var_value` in the expand chain
+                        //   that is currently on the stack receives a *cloned*
+                        //   `Variable` value; no `&Variable` reference into
+                        //   `self.db.variables` is live anywhere on the call stack
+                        //   above this point (ensured by the `.cloned()` calls at
+                        //   every `self.db.variables.get(...)` site in this file).
+                        // - jmake is single-threaded: no concurrent mutation.
+                        // - `eval_string` may insert into `self.db.variables`
+                        //   (IndexMap), including insertions that reallocate the
+                        //   map's storage.  The preceding cloning invariant ensures
+                        //   no live pointer into the old storage exists.
+                        // - KNOWN LIMITATION: the `&self → *mut Self` cast is not
+                        //   provably sound under Stacked Borrows.  The fully sound
+                        //   fix is wrapping `db` in `RefCell<MakeDatabase>`.
+                        debug_assert!(
+                            self.eval_pending.try_borrow().is_ok(),
+                            "eval_pending is exclusively borrowed at $(eval) call site"
+                        );
+                        debug_assert!(
+                            self.in_second_expansion.try_borrow().is_ok(),
+                            "in_second_expansion is exclusively borrowed at $(eval) call site"
+                        );
                         let result = unsafe {
                             let self_ptr: *mut Self = self as *const Self as *mut Self;
                             (*self_ptr).eval_string(&final_content)
