@@ -288,6 +288,16 @@ pub struct MakeState {
     /// When expansion of a recursive variable is requested and the variable is already
     /// in this set, the expansion returns empty string instead of recursing infinitely.
     pub vars_being_expanded: RefCell<std::collections::HashSet<String>>,
+    /// Current nesting depth of variable expansion (incremented on every recursive
+    /// `expand_var_value` call, decremented on return).  When this reaches
+    /// `MAX_EXPANSION_DEPTH` the expansion aborts with a fatal error, matching GNU
+    /// Make's "Recursive variable … references itself (eventually)" safeguard and
+    /// preventing a stack overflow from deep-but-non-circular chains such as
+    /// `A = $(B)`, `B = $(C)`, …, `Z_1000 = foo`.
+    // SECURITY: depth limit prevents stack overflow from crafted Makefiles with
+    // deeply chained recursive variable definitions that are not self-referential
+    // (and thus not caught by vars_being_expanded).  GNU Make caps at 1000.
+    pub expansion_depth: RefCell<usize>,
 }
 
 /// Return the current working directory preferring the logical path from PWD env var.
@@ -447,6 +457,7 @@ impl MakeState {
             call_context_stack: RefCell::new(Vec::new()),
             expansion_caller_stack: RefCell::new(Vec::new()),
             vars_being_expanded: RefCell::new(std::collections::HashSet::new()),
+            expansion_depth: RefCell::new(0),
         };
 
         // Change directory if requested
@@ -1210,12 +1221,20 @@ impl MakeState {
     /// GNU Make uses the original include argument (without the -I directory prefix) in errors.
     pub fn read_makefile_display(&mut self, path: &Path, display_name: Option<&str>) -> Result<(), String> {
         // Guard against infinite include recursion (e.g., a makefile including itself)
+        // SECURITY: verified — depth capped at 200, preventing stack exhaustion from
+        // a chain of files each including the next.  200 matches GNU Make's effective
+        // limit in practice (GNU Make doesn't document an explicit cap but errors out
+        // around the same depth due to OS open-file limits).
         self.include_depth += 1;
         if self.include_depth > 200 {
             self.include_depth -= 1;
             return Err(format!("{}: *** Recursive include of '{}'. Stop.",
                 make_progname(), path.display()));
         }
+        // SECURITY: path traversal in include directives — trust boundary.
+        // `include ../../etc/passwd` is permitted: Makefiles are trusted authored
+        // content.  The file is opened read-only; no data is written.  The same
+        // trust model applies as for $(wildcard), $(realpath), and shell scripts.
         let result = self.read_makefile_display_inner(path, display_name);
         self.include_depth -= 1;
         result

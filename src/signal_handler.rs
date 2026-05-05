@@ -174,6 +174,16 @@ pub fn signal_received() -> bool {
 ///
 /// Async-signal-safety: only `write`, `unlink`, `signal`, and `raise` are
 /// called, all of which are async-signal-safe per POSIX.1-2017 §2.4.3.
+///
+/// SECURITY: verified — the following invariants hold:
+/// 1. No heap allocation inside the handler (no Box, Vec, String, format!, eprintln!).
+/// 2. No mutex or lock acquisition (no std::sync::Mutex, no RefCell borrow).
+/// 3. Only async-signal-safe syscalls: write(2), unlink(2), signal(2), raise(2).
+/// 4. Buffer reads are guarded by Acquire-load of the length atomics (written
+///    with Release by the set_* functions), so no partially-written buffer is
+///    ever visible to the handler.
+/// 5. The SyncBuffer statics are written only from the main thread (I1), so
+///    there is no concurrent-write data race.
 extern "C" fn sigterm_handler(_sig: libc::c_int) {
     SIGNAL_RECEIVED.store(true, Ordering::Release);
 

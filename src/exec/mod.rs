@@ -673,6 +673,18 @@ impl<'a> Executor<'a> {
     /// Build the global environment ops list for worker threads.
     /// Returns a Vec of (name, Some(value)) to set or (name, None) to remove.
     fn build_env_ops_for_workers(&self) -> Vec<(String, Option<String>)> {
+        // SECURITY: environment variable propagation — trust boundary.
+        // jmake forwards environment variables (including LD_PRELOAD,
+        // LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, PATH, etc.) to child
+        // processes.  This is the correct and expected behavior: GNU Make
+        // also propagates the full environment, and Makefiles depend on it
+        // (e.g. CC is found via PATH; sanitised builds use LD_PRELOAD).
+        // Filtering LD_PRELOAD or PATH would break legitimate use cases.
+        // The trust model is: jmake is run by a user who owns the Makefile
+        // and the environment; restricting propagation is the user's
+        // responsibility (via `unexport LD_PRELOAD` in the Makefile or
+        // via the shell before invoking jmake).
+        // SECURITY: verified — no additional filtering is needed here.
         use crate::types::VarOrigin;
         let mut ops: Vec<(String, Option<String>)> = Vec::new();
         for (name, var) in &self.db.variables {
@@ -5624,6 +5636,23 @@ impl<'a> Executor<'a> {
                     }
                 };
 
+                // SECURITY: trust boundary — recipe commands are NOT sanitised
+                // before being passed to the shell.  This is intentional: a Makefile
+                // is trusted authored content, equivalent to a shell script.  Any
+                // variable value that ends up in a recipe command was either written
+                // directly in the Makefile or imported from the environment (which is
+                // equally trusted).  There is no injection risk above and beyond what
+                // is already possible by writing a malicious Makefile; hardening
+                // against untrusted Makefile content is explicitly out of scope.
+                //
+                // The expanded `cmd` string is passed as a SINGLE argv element to
+                // the shell (not interpolated into a shell command string), so no
+                // additional shell-meta-character escaping is required.  The
+                // "SHELL contains spaces" branch is the only path where `cmd` is
+                // embedded into a larger shell string; that branch is only reached
+                // when the user has explicitly set SHELL to a multi-word value,
+                // so they own the quoting responsibility.
+                //
                 // When SHELL contains spaces (e.g. "echo hi"), GNU Make composes the full
                 // invocation as a shell string and runs it through /bin/sh -c, so that
                 // shell quoting in .SHELLFLAGS is properly interpreted.
