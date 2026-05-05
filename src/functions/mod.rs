@@ -753,9 +753,10 @@ fn fn_call(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
     expand(&args[0])
 }
 
-fn fn_value(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    // $(value var) returns the unexpanded value - handled in expander
-    args[0].clone()
+fn fn_value(_args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+    // $(value var) is fully handled in expand_function before the generic
+    // builtin dispatch; this stub is unreachable in correct operation.
+    unreachable!("fn_value should never be called: $(value) is handled in expand_function")
 }
 
 fn fn_eval(_args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
