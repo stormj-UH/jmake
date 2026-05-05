@@ -296,6 +296,25 @@ pub struct Executor<'a> {
     /// the sequential exec path and the parallel path's collect_plans phase is
     /// also single-threaded (runs sequential build in dry-run mode).
     pattern_rule_cache: std::cell::RefCell<HashMap<String, Option<(Rule, String)>>>,
+    /// Per-build cache for `file_mtime` (stat) results.
+    ///
+    /// # Performance rationale
+    ///
+    /// During `needs_rebuild` each target's mtime is fetched, then each
+    /// prerequisite's mtime is fetched — potentially hitting the same path many
+    /// times when a header is shared by many translation units.  On large projects
+    /// (e.g. CPython) this produces tens of thousands of redundant `stat(2)` calls.
+    /// Caching the result within one build run is safe because:
+    ///   1. Files whose mtime matters are only updated by recipes, which run AFTER
+    ///      the current `needs_rebuild` check completes.
+    ///   2. Any file that is built during this run is explicitly invalidated via
+    ///      `invalidate_mtime_cache` after its recipe executes.
+    ///
+    /// `None` in the map means the file did not exist at lookup time.
+    /// The key is the path string as passed to `file_mtime` (not canonicalised).
+    ///
+    /// RefCell: same threading note as `pattern_rule_cache`.
+    mtime_cache: std::cell::RefCell<HashMap<String, Option<SystemTime>>>,
 }
 
 impl<'a> Executor<'a> {
@@ -376,6 +395,7 @@ impl<'a> Executor<'a> {
             vpath_extra_se_texts: HashMap::new(),
             se_search_fired: HashSet::new(),
             pattern_rule_cache: std::cell::RefCell::new(HashMap::new()),
+            mtime_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -4977,12 +4997,38 @@ impl<'a> Executor<'a> {
     /// When check_symlink_times is true, returns the symlink's own mtime (lstat),
     /// which allows dangling symlinks to return Some() with their own mtime.
     /// When false (default), follows symlinks (stat), returning None for dangling symlinks.
+    /// Return the modification time of `path`, using the per-build mtime cache.
+    ///
+    /// # Caching policy
+    ///
+    /// Results are cached for the lifetime of one `build_targets` invocation.
+    /// Entries are invalidated by `invalidate_mtime_cache` after a recipe
+    /// successfully writes a file, ensuring subsequent mtime checks see the
+    /// updated timestamp.  This eliminates redundant `stat(2)` calls on header
+    /// files shared by many translation units (e.g. 10 000+ calls on CPython).
     fn file_mtime(&self, path: &str) -> Option<SystemTime> {
-        if self.state.args.check_symlink_times {
+        // Fast path: check cache first (single HashMap lookup, no syscall).
+        if let Some(cached) = self.mtime_cache.borrow().get(path) {
+            return *cached;
+        }
+        // Slow path: syscall + cache insertion.
+        let result = if self.state.args.check_symlink_times {
             get_mtime_symlink(path)
         } else {
             get_mtime(path)
-        }
+        };
+        self.mtime_cache.borrow_mut().insert(path.to_owned(), result);
+        result
+    }
+
+    /// Evict `path` from the mtime cache.
+    ///
+    /// Must be called after any recipe that may have modified `path` so that
+    /// subsequent mtime comparisons read the fresh on-disk value rather than
+    /// the pre-build cached result.
+    #[inline]
+    fn invalidate_mtime_cache(&self, path: &str) {
+        self.mtime_cache.borrow_mut().remove(path);
     }
 
     fn needs_rebuild(&self, target: &str, prereqs: &[String], any_prereq_rebuilt: bool) -> bool {
@@ -5396,6 +5442,9 @@ impl<'a> Executor<'a> {
             }
             if !self.dry_run {
                 touch_file(target);
+                // Invalidate cached mtime so subsequent up-to-date checks see
+                // the freshly updated timestamp rather than the pre-touch value.
+                self.invalidate_mtime_cache(target);
             }
             self.any_recipe_ran = true;
             return Ok(true);
@@ -5526,6 +5575,11 @@ impl<'a> Executor<'a> {
                 }
             }
 
+            // Invalidate cached mtime after the oneshell script ran successfully,
+            // so dependents' needs_rebuild checks see the freshly written file.
+            if !self.dry_run {
+                self.invalidate_mtime_cache(target);
+            }
             return Ok(true);
         }
 
@@ -5744,6 +5798,12 @@ impl<'a> Executor<'a> {
         // Return true (rebuilt) only if actual shell commands ran.
         // If only make-functions ($(info), etc.) ran, return false so
         // "is up to date" message can be printed for the target.
+        if any_cmd_ran && !self.dry_run {
+            // Invalidate the target's cached mtime so that any subsequent
+            // needs_rebuild checks for dependents see the freshly written file
+            // rather than the pre-recipe cached timestamp.
+            self.invalidate_mtime_cache(target);
+        }
         Ok(any_cmd_ran)
     }
 

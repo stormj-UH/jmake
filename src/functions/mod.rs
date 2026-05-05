@@ -113,56 +113,82 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub type FnHandler = fn(args: &[String], expand: &dyn Fn(&str) -> String) -> String;
 
-pub fn get_builtin_functions() -> HashMap<String, (FnHandler, usize, usize)> {
-    // (handler, min_args, max_args) - max_args 0 means unlimited
-    let mut map: HashMap<String, (FnHandler, usize, usize)> = HashMap::new();
+/// Global cache for the builtin-function dispatch table.
+///
+/// # Performance rationale
+///
+/// `get_builtin_functions` is called on every `$(name ...)` dispatch in the
+/// expansion hot path — once to check whether a token is a function name
+/// (in `expand_reference`) and again to retrieve the handler (in
+/// `expand_function`).  Building and heap-allocating a 34-entry `HashMap`
+/// each time is the dominant allocator pressure during variable expansion.
+/// Using `OnceLock` eliminates all but the first allocation and reduces each
+/// subsequent call to a single pointer load.
+///
+/// jmake is single-threaded during expansion, so the `Send + Sync` bound on
+/// `OnceLock`'s contents is satisfied by the fact that `FnHandler` is a bare
+/// `fn` pointer and all tuple fields are `Copy`.
+static BUILTIN_FUNCTIONS: OnceLock<HashMap<String, (FnHandler, usize, usize)>> = OnceLock::new();
 
-    map.insert("subst".into(), (fn_subst as FnHandler, 3, 3));
-    map.insert("patsubst".into(), (fn_patsubst as FnHandler, 3, 3));
-    map.insert("strip".into(), (fn_strip as FnHandler, 1, 1));
-    map.insert("findstring".into(), (fn_findstring as FnHandler, 2, 2));
-    map.insert("filter".into(), (fn_filter as FnHandler, 2, 2));
-    map.insert("filter-out".into(), (fn_filter_out as FnHandler, 2, 2));
-    map.insert("sort".into(), (fn_sort as FnHandler, 1, 1));
-    map.insert("word".into(), (fn_word as FnHandler, 2, 2));
-    map.insert("wordlist".into(), (fn_wordlist as FnHandler, 3, 3));
-    map.insert("words".into(), (fn_words as FnHandler, 1, 1));
-    map.insert("firstword".into(), (fn_firstword as FnHandler, 1, 1));
-    map.insert("lastword".into(), (fn_lastword as FnHandler, 1, 1));
-    map.insert("dir".into(), (fn_dir as FnHandler, 1, 1));
-    map.insert("notdir".into(), (fn_notdir as FnHandler, 1, 1));
-    map.insert("suffix".into(), (fn_suffix as FnHandler, 1, 1));
-    map.insert("basename".into(), (fn_basename as FnHandler, 1, 1));
-    map.insert("addsuffix".into(), (fn_addsuffix as FnHandler, 2, 2));
-    map.insert("addprefix".into(), (fn_addprefix as FnHandler, 2, 2));
-    map.insert("join".into(), (fn_join as FnHandler, 2, 2));
-    map.insert("wildcard".into(), (fn_wildcard as FnHandler, 1, 1));
-    map.insert("realpath".into(), (fn_realpath as FnHandler, 1, 1));
-    map.insert("abspath".into(), (fn_abspath as FnHandler, 1, 1));
-    map.insert("if".into(), (fn_if as FnHandler, 2, 3));
-    map.insert("or".into(), (fn_or as FnHandler, 1, 0));
-    map.insert("and".into(), (fn_and as FnHandler, 1, 0));
-    map.insert("foreach".into(), (fn_foreach as FnHandler, 3, 3));
-    map.insert("file".into(), (fn_file as FnHandler, 1, 2));
-    map.insert("call".into(), (fn_call as FnHandler, 1, 0));
-    map.insert("value".into(), (fn_value as FnHandler, 1, 1));
-    map.insert("eval".into(), (fn_eval as FnHandler, 1, 1));
-    map.insert("origin".into(), (fn_origin as FnHandler, 1, 1));
-    map.insert("flavor".into(), (fn_flavor as FnHandler, 1, 1));
-    map.insert("shell".into(), (fn_shell as FnHandler, 1, 1));
-    map.insert("error".into(), (fn_error as FnHandler, 1, 1));
-    map.insert("warning".into(), (fn_warning as FnHandler, 1, 1));
-    map.insert("info".into(), (fn_info as FnHandler, 1, 1));
-    map.insert("guile".into(), (fn_guile as FnHandler, 1, 1));
-    map.insert("let".into(), (fn_let as FnHandler, 3, 3));
-    map.insert("intcmp".into(), (fn_intcmp as FnHandler, 2, 5));
+/// Return a reference to the global builtin-function dispatch table.
+///
+/// The table is built at most once per process; all subsequent calls return
+/// the cached reference in O(1) with no heap allocation.
+pub fn get_builtin_functions() -> &'static HashMap<String, (FnHandler, usize, usize)> {
+    BUILTIN_FUNCTIONS.get_or_init(|| {
+        // (handler, min_args, max_args) - max_args 0 means unlimited
+        let mut map: HashMap<String, (FnHandler, usize, usize)> =
+            HashMap::with_capacity(36); // exact count of entries below
 
-    map
+        map.insert("subst".into(), (fn_subst as FnHandler, 3, 3));
+        map.insert("patsubst".into(), (fn_patsubst as FnHandler, 3, 3));
+        map.insert("strip".into(), (fn_strip as FnHandler, 1, 1));
+        map.insert("findstring".into(), (fn_findstring as FnHandler, 2, 2));
+        map.insert("filter".into(), (fn_filter as FnHandler, 2, 2));
+        map.insert("filter-out".into(), (fn_filter_out as FnHandler, 2, 2));
+        map.insert("sort".into(), (fn_sort as FnHandler, 1, 1));
+        map.insert("word".into(), (fn_word as FnHandler, 2, 2));
+        map.insert("wordlist".into(), (fn_wordlist as FnHandler, 3, 3));
+        map.insert("words".into(), (fn_words as FnHandler, 1, 1));
+        map.insert("firstword".into(), (fn_firstword as FnHandler, 1, 1));
+        map.insert("lastword".into(), (fn_lastword as FnHandler, 1, 1));
+        map.insert("dir".into(), (fn_dir as FnHandler, 1, 1));
+        map.insert("notdir".into(), (fn_notdir as FnHandler, 1, 1));
+        map.insert("suffix".into(), (fn_suffix as FnHandler, 1, 1));
+        map.insert("basename".into(), (fn_basename as FnHandler, 1, 1));
+        map.insert("addsuffix".into(), (fn_addsuffix as FnHandler, 2, 2));
+        map.insert("addprefix".into(), (fn_addprefix as FnHandler, 2, 2));
+        map.insert("join".into(), (fn_join as FnHandler, 2, 2));
+        map.insert("wildcard".into(), (fn_wildcard as FnHandler, 1, 1));
+        map.insert("realpath".into(), (fn_realpath as FnHandler, 1, 1));
+        map.insert("abspath".into(), (fn_abspath as FnHandler, 1, 1));
+        map.insert("if".into(), (fn_if as FnHandler, 2, 3));
+        map.insert("or".into(), (fn_or as FnHandler, 1, 0));
+        map.insert("and".into(), (fn_and as FnHandler, 1, 0));
+        map.insert("foreach".into(), (fn_foreach as FnHandler, 3, 3));
+        map.insert("file".into(), (fn_file as FnHandler, 1, 2));
+        map.insert("call".into(), (fn_call as FnHandler, 1, 0));
+        map.insert("value".into(), (fn_value as FnHandler, 1, 1));
+        map.insert("eval".into(), (fn_eval as FnHandler, 1, 1));
+        map.insert("origin".into(), (fn_origin as FnHandler, 1, 1));
+        map.insert("flavor".into(), (fn_flavor as FnHandler, 1, 1));
+        map.insert("shell".into(), (fn_shell as FnHandler, 1, 1));
+        map.insert("error".into(), (fn_error as FnHandler, 1, 1));
+        map.insert("warning".into(), (fn_warning as FnHandler, 1, 1));
+        map.insert("info".into(), (fn_info as FnHandler, 1, 1));
+        map.insert("guile".into(), (fn_guile as FnHandler, 1, 1));
+        map.insert("let".into(), (fn_let as FnHandler, 3, 3));
+        map.insert("intcmp".into(), (fn_intcmp as FnHandler, 2, 5));
+
+        map
+    })
 }
 
+#[inline]
 fn fn_subst(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let from = &args[0];
     let to = &args[1];
@@ -170,6 +196,7 @@ fn fn_subst(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     text.replace(from.as_str(), to.as_str())
 }
 
+#[inline]
 fn fn_patsubst(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let pattern = &args[0];
     let replacement = &args[1];
@@ -180,6 +207,10 @@ fn fn_patsubst(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     results.join(" ")
 }
 
+/// Apply a single `patsubst` pattern to one word.
+/// Marked `#[inline]` because it is called in tight loops from both
+/// `fn_patsubst` and `expand_substitution_ref` in the expansion hot path.
+#[inline]
 pub fn patsubst_word(word: &str, pattern: &str, replacement: &str) -> String {
     if let Some(percent_pos) = pattern.find('%') {
         let prefix = &pattern[..percent_pos];
@@ -241,6 +272,11 @@ fn fn_filter_out(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 ///
 /// This function handles all three cases and correctly matches words against
 /// patterns that contain literal `%` characters.
+///
+/// Marked `#[inline]` because it is the inner predicate in `$(filter)` /
+/// `$(filter-out)` loops and the optimizer can eliminate it when the pattern
+/// is a compile-time constant.
+#[inline]
 fn pattern_matches(pattern: &str, word: &str) -> bool {
     // Parse the pattern to find the first unescaped `%` (the wildcard).
     // Build a literal prefix and suffix (with backslash-escape processing).
@@ -329,8 +365,10 @@ fn pattern_matches(pattern: &str, word: &str) -> bool {
 }
 
 fn fn_sort(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
+    // Collect, sort, then dedup in a single pass — split_whitespace already
+    // returns only non-empty tokens so no empty-string edge case exists.
     let mut words: Vec<&str> = args[0].split_whitespace().collect();
-    words.sort();
+    words.sort_unstable(); // unstable sort is faster and output order of duplicates is irrelevant
     words.dedup();
     words.join(" ")
 }
