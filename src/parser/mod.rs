@@ -1824,6 +1824,7 @@ fn find_pipe(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval::EnvConfig;
 
     /// Helper: pluck (name, value, flavor) out of a ParsedLine::VariableAssignment.
     fn va(p: ParsedLine) -> (String, String, VarFlavor) {
@@ -1901,7 +1902,7 @@ mod tests {
     /// instead of being treated as top-level syntax errors.
     #[test]
     fn bare_colon_rule_is_not_dropped() {
-        let state = MakeState::new(crate::cli::MakeArgs::default());
+        let state = MakeState::new(crate::cli::MakeArgs::default(), EnvConfig::from_process_env());
         let parser = Parser::new(PathBuf::from("Makefile"));
         match parser.parse_line(":", &state) {
             ParsedLine::Rule(rule) => {
@@ -1916,7 +1917,7 @@ mod tests {
     /// commands remain recipe lines instead of tripping "missing separator".
     #[test]
     fn bare_colon_rule_keeps_recipe_context() {
-        let state = MakeState::new(crate::cli::MakeArgs::default());
+        let state = MakeState::new(crate::cli::MakeArgs::default(), EnvConfig::from_process_env());
         let mut parser = Parser::new(PathBuf::from("Makefile"));
         match parser.parse_line(":", &state) {
             ParsedLine::Rule(rule) => assert!(rule.targets.is_empty()),

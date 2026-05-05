@@ -172,13 +172,17 @@
 
 // Evaluation engine - variable expansion, rule processing, main state machine
 
+pub mod env_config_mod;
 mod expand;
+
+pub use env_config_mod::EnvConfig;
 
 use crate::cli::MakeArgs;
 use crate::database::MakeDatabase;
 use crate::exec;
 use crate::functions;
 use crate::implicit_rules;
+use crate::io_traits::{RealFs, RealShell};
 use crate::parser::{self, Parser};
 use crate::types::*;
 
@@ -272,6 +276,11 @@ pub struct MakeState {
     /// Used by apply_makeflags_from_makefile to preserve cmdline flags even when the
     /// makefile assigns directly to MAKEFLAGS (e.g. `MAKEFLAGS = B`).
     pub cmdline_args: MakeArgs,
+    /// Environment snapshot captured once at startup.
+    ///
+    /// Core logic MUST read env vars from here rather than calling `std::env::var` directly.
+    /// TODO(pure-core): migrate remaining scattered env::var calls to use this field.
+    pub env_config: EnvConfig,
     pub db: MakeDatabase,
     pub shell: String,
     pub makefile_list: Vec<PathBuf>,
@@ -463,7 +472,7 @@ pub fn execute_include_recipe_expanded(
 }
 
 /// Determine whether "entering/leaving directory" messages should be printed.
-fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
+fn should_print_directory(args: &crate::cli::MakeArgs, env_cfg: &EnvConfig) -> bool {
     if args.no_print_directory {
         return false;
     }
@@ -474,8 +483,9 @@ fn should_print_directory(args: &crate::cli::MakeArgs) -> bool {
     if args.directory.is_some() {
         return true;
     }
-    // Recursive makes (MAKELEVEL > 0) automatically print directory messages
-    matches!(env::var("MAKELEVEL").ok().and_then(|v| v.parse::<u32>().ok()), Some(level) if level > 0)
+    // Recursive makes (MAKELEVEL > 0) automatically print directory messages.
+    // Use env_config.makelevel_num() (captured at startup) rather than env::var here.
+    env_cfg.makelevel_num() > 0
 }
 
 impl MakeState {
@@ -486,11 +496,12 @@ impl MakeState {
     //       If args.directory is set and chdir fails, the process exits with code 2.
     // NOTE: Panic/drop safety: env::set_current_dir error triggers process::exit(2).
     //       No invariant can be broken because the new MakeState has not been shared yet.
-    pub fn new(args: MakeArgs) -> Self {
+    pub fn new(args: MakeArgs, env_config: EnvConfig) -> Self {
         let cmdline_args = args.clone();
         let mut state = MakeState {
             args,
             cmdline_args,
+            env_config,
             db: MakeDatabase::new(),
             shell: "/bin/sh".to_string(),
             makefile_list: Vec::new(),
@@ -528,8 +539,12 @@ impl MakeState {
             // the -C argument and normalizing, so that symlinks in the parent path
             // are preserved (matching shell `cd` behavior).
             let new_logical = {
-                let old_pwd = env::var("PWD").map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| env::current_dir().unwrap_or_default());
+                // Use env_config.pwd from state (captured at startup) rather than env::var here.
+                let old_pwd = if !state.env_config.pwd.is_empty() {
+                    std::path::PathBuf::from(&state.env_config.pwd)
+                } else {
+                    env::current_dir().unwrap_or_default()
+                };
                 let joined = if std::path::Path::new(dir).is_absolute() {
                     std::path::PathBuf::from(dir)
                 } else {
@@ -549,7 +564,7 @@ impl MakeState {
             env::set_var("PWD", &new_logical);
             // Check if we already printed "Entering directory" in a parent re-exec invocation.
             let entering_already_printed = env::var("JMAKE_ENTERING_PRINTED").as_deref() == Ok("1");
-            if should_print_directory(&state.args) && !entering_already_printed {
+            if should_print_directory(&state.args, &state.env_config) && !entering_already_printed {
                 let cwd = logical_cwd();
                 println!("{}: Entering directory '{}'", progname, cwd.display());
                 state.entering_directory_printed = true;
@@ -620,7 +635,7 @@ impl MakeState {
         // When re-exec'ing after a makefile rebuild, JMAKE_ENTERING_PRINTED=1 suppresses the
         // duplicate "Entering directory" message (the outer invocation already printed it).
         let progname = make_progname();
-        let print_dir = should_print_directory(&self.args);
+        let print_dir = should_print_directory(&self.args, &self.env_config);
         let entering_already_printed = env::var("JMAKE_ENTERING_PRINTED").as_deref() == Ok("1");
         if print_dir && !self.entering_directory_printed && !entering_already_printed {
             // Already printed at startup for -C; print here for -w without -C
@@ -733,6 +748,8 @@ impl MakeState {
         let mut executor = exec::Executor::new(
             &self.db,
             self,
+            Box::new(RealFs),
+            Box::new(RealShell),
             self.args.jobs.get(),
             self.args.load_average,
             self.args.keep_going,
@@ -753,7 +770,7 @@ impl MakeState {
         let result = executor.build_targets(&targets);
 
         // Print leaving-directory if needed
-        let print_dir = should_print_directory(&self.args);
+        let print_dir = should_print_directory(&self.args, &self.env_config);
         if print_dir {
             let cwd = logical_cwd();
             println!("{}: Leaving directory '{}'", progname, cwd.display());
@@ -768,7 +785,8 @@ impl MakeState {
         // Set up built-in variables
         self.db.variables.insert("MAKE_VERSION".into(),
             Variable::new("4.4.1".into(), VarFlavor::Simple, VarOrigin::Default));
-        let make_binary = if test_mode_enabled() {
+        // Use env_config.test_mode (captured at startup) rather than calling env::var here.
+        let make_binary = if self.env_config.test_mode {
             "make".to_string()
         } else {
             env::args().next().unwrap_or_else(|| "make".into())
@@ -865,14 +883,14 @@ impl MakeState {
         self.db.variables.insert("MAKECMDGOALS".into(),
             Variable::new(cmdgoals, VarFlavor::Simple, VarOrigin::Default));
         // MAKELEVEL: 0 for top-level, incremented for recursive makes.
-        // Read from the environment (set by the parent make), defaulting to "0".
-        let makelevel_str = env::var("MAKELEVEL").unwrap_or_else(|_| "0".to_string());
+        // Read from env_config (captured once at startup; avoids scattered env::var calls).
+        let makelevel_str = self.env_config.makelevel.clone();
         self.db.variables.insert("MAKELEVEL".into(),
             Variable::new(makelevel_str, VarFlavor::Simple, VarOrigin::Default));
         // MAKE_RESTARTS: number of times make has re-exec'd itself to reread makefiles.
         // Empty on the first run; set to "1", "2", etc. by the re-exec mechanism.
-        // Read from the MAKE_RESTARTS environment variable (set by the reinvoke logic).
-        let make_restarts = env::var("MAKE_RESTARTS").unwrap_or_default();
+        // Read from env_config (captured once at startup).
+        let make_restarts = self.env_config.make_restarts.clone();
         self.db.variables.insert("MAKE_RESTARTS".into(),
             Variable::new(make_restarts, VarFlavor::Simple, VarOrigin::Default));
         self.db.variables.insert(".DEFAULT_GOAL".into(),
@@ -886,7 +904,9 @@ impl MakeState {
         // Variables that originally came from the environment are always exported to
         // child processes (with their current Make value, which may be overridden by
         // the Makefile), unless explicitly unexported.
-        for (key, value) in env::vars() {
+        // Use env_config.all_vars (snapshot captured at startup) rather than calling
+        // env::vars() here — this is the one-time read guaranteed by the pure-core boundary.
+        for (key, value) in &self.env_config.all_vars {
             self.db.env_var_names.insert(key.clone());
             self.db.variables.entry(key.clone()).or_insert_with(|| {
                 Variable::new(value.clone(), VarFlavor::Recursive, VarOrigin::Environment)
@@ -1348,8 +1368,9 @@ impl MakeState {
                 }
                 // Create a temp file in TMPDIR (or /tmp).
                 // We create it even if we might not re-exec, since we won't know until later.
-                let tmpdir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-                let temp_path = std::path::PathBuf::from(&tmpdir)
+                // Use env_config.tmpdir (captured at startup) rather than calling env::var here.
+                let tmpdir = &self.env_config.tmpdir;
+                let temp_path = std::path::PathBuf::from(tmpdir)
                     .join(format!("jmake-stdin-{}.mk", std::process::id()));
                 if let Err(e) = std::fs::write(&temp_path, &raw) {
                     let progname = crate::eval::make_progname();
@@ -3294,7 +3315,7 @@ impl MakeState {
         };
 
         // Save current print_directory state to detect transition.
-        let was_printing_dir = should_print_directory(&self.args);
+        let was_printing_dir = should_print_directory(&self.args, &self.env_config);
 
         // Start from the original command-line args as a baseline.
         // This preserves cmdline flags (e.g. -i from `-i` on cmdline) even when
@@ -3335,7 +3356,7 @@ impl MakeState {
         // If print_directory was just enabled by the makefile (transition false→true),
         // print the "Entering directory" message now so it appears before subsequent
         // $(info) or recipe output in the makefile.
-        let now_printing_dir = should_print_directory(&self.args);
+        let now_printing_dir = should_print_directory(&self.args, &self.env_config);
         if now_printing_dir && !was_printing_dir && !self.entering_directory_printed {
             let progname = make_progname();
             let cwd = logical_cwd();
