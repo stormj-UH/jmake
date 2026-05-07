@@ -343,12 +343,15 @@ pub fn install_sigterm_handler() {
     // - libc::signal is an FFI call to the POSIX signal(2) syscall.
     // - sigterm_handler satisfies the async-signal-safe contract: it calls
     //   only write, unlink, signal, raise (all POSIX async-signal-safe).
-    // - The cast `sigterm_handler as libc::sighandler_t` is valid because
-    //   `extern "C" fn(c_int)` has the same ABI as the C `sighandler_t` type.
+    // - The two-step cast (fn item → fn pointer → sighandler_t) is required
+    //   because Rust ≥1.94 forbids direct fn-item-to-integer casts.  The
+    //   intermediate `extern "C" fn(c_int)` pointer has the same ABI as the
+    //   C `sighandler_t` type.
     // - I2: set_temp_stdin_path / set_term_message must be called (if needed)
     //   before the next SIGTERM is delivered; the caller owns this ordering.
     unsafe {
-        libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t);
+        let handler: extern "C" fn(libc::c_int) = sigterm_handler;
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
     }
 }
 
