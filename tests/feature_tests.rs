@@ -193,6 +193,37 @@ fn test_wildcard_no_prefix() {
     );
 }
 
+// ── Regression: two-char variables ending in D/F must not be hijacked ───────
+//
+// $(LD), $(XF), etc. were misinterpreted as automatic-variable D/F modifiers
+// (like $(@D) or $(<F)), discarding the stored value.  The D/F modifier check
+// must only fire for single-char automatic variable bases (@, <, ^, +, *, ?, %, |).
+
+#[test]
+fn test_two_char_var_ending_d_f() {
+    let tmp = tempfile::TempDir::new().expect("TempDir");
+    let mk = tmp.path().join("Makefile");
+    std::fs::write(&mk, "LD = my-linker\nXF = my-flags\nall:\n\t@echo \"LD=$(LD) XF=$(XF)\"\n").unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} -f {} -rR 2>&1", jmake.display(), mk.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run jmake");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "jmake failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout.trim(),
+        "LD=my-linker XF=my-flags",
+        "two-char variable ending in D/F was misinterpreted as auto-var modifier: {:?}",
+        stdout
+    );
+}
+
 // ── Security hardening: expansion depth limit ──────────────────────────────
 
 /// A Makefile with a chain of 1001 distinct recursive variables that reference

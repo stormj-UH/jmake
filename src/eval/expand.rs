@@ -405,10 +405,18 @@ impl MakeState {
         // Only attempt if the last byte is ASCII (D/F are single ASCII chars;
         // multi-byte UTF-8 continuation bytes have the high bit set, so this
         // check is both necessary and sufficient to avoid invalid slice indices).
-        if content.len() >= 2 && content.as_bytes()[content.len()-1].is_ascii() {
+        // $(@D), $(@F), $(<D), etc. — the D/F directory/file modifier ONLY
+        // applies to single-character automatic variables.  GNU Make does not
+        // interpret $(LD) as $(L) + dir_part; it is the plain variable "LD".
+        // Guard: the base must be a recognised automatic-variable character.
+        if content.len() == 2 && content.as_bytes()[content.len()-1].is_ascii() {
             let first = &content[..content.len()-1];
             let modifier = &content[content.len()-1..];
-            if (modifier == "D" || modifier == "F") && first.len() == 1 {
+            const AUTO_VAR_CHARS: &[u8] = b"@<^+*?%|";
+            if (modifier == "D" || modifier == "F")
+                && first.len() == 1
+                && AUTO_VAR_CHARS.contains(&first.as_bytes()[0])
+            {
                 let base_char = first;
                 let base_val = if let Some(val) = auto_vars.get(base_char) {
                     val.clone()
