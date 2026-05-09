@@ -92,6 +92,52 @@ Tested against GNU Make 4.4.1 behavior for:
 - Multi-target rules, double-colon rules
 - $(MAKECMDGOALS), MAKELEVEL, recursive make
 
+## Install (any Linux)
+
+One-liner — installs the latest .jpkg to `/usr/local`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/stormj-UH/jmake/main/install.sh | sh
+```
+
+Pin a specific version, install to a custom prefix, or also expose `jmake` as
+the system `make`:
+
+```sh
+# pin a version
+curl -fsSL .../install.sh | sh -s -- --version 1.2.1
+
+# unprivileged install to ~/.local
+curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/.local"
+
+# also create $PREFIX/bin/make → jmake
+curl -fsSL .../install.sh | sh -s -- --make-default
+```
+
+By default the installer drops a single `jmake` binary at `$PREFIX/bin/jmake`
+and never touches `/usr/bin/make`. With `--make-default`, it adds
+`$PREFIX/bin/make` as a symlink to `jmake`; if `/usr/bin/make` is earlier on
+your `$PATH`, the installer warns you so you can adjust.
+
+**Architectures:** `x86_64`, `aarch64` (override with `--arch`).
+
+**Required tools:** `curl` or `wget`, plus `zstd`, `tar`, `od`, and `dd`.
+
+### Installation (other Linuxes)
+
+For distros without a native package (anything outside Jonerix), use the same
+`install.sh` — it's POSIX shell, dependency-free at runtime, and only needs
+the tools listed above. The script downloads `jmake-<VERSION>-<ARCH>.jpkg`
+from the [Jonerix release page](https://github.com/stormj-UH/jonerix/releases/tag/packages),
+verifies the `JPKG` magic, extracts the zstd-compressed tar payload, and
+installs the static-musl binary plus license file under `$PREFIX`. There are
+no glibc requirements — the binary runs on Alpine, Void, Slackware, Debian,
+RHEL, Arch, NixOS (via `--prefix`), and busybox-based systems alike.
+
+If `$PREFIX` isn't writable by the current user, the installer escalates with
+`sudo` for the install steps only. To install without root, use
+`--prefix "$HOME/.local"` and ensure `$HOME/.local/bin` is on your `$PATH`.
+
 ## Building
 
 ```sh
