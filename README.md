@@ -94,30 +94,62 @@ Tested against GNU Make 4.4.1 behavior for:
 
 ## Install (any Linux)
 
-One-liner — installs the latest .jpkg to `/usr/local`:
+One-liner — installs the latest `.jpkg` to `/usr/local`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/stormj-UH/jmake/main/install.sh | sh
 ```
 
-Pin a specific version, install to a custom prefix, or also expose `jmake` as
-the system `make`:
+By default the installer drops **only** the `jmake` binary at
+`$PREFIX/bin/jmake`, plus `LICENSE` and any man pages shipped in the package.
+It does **not** create a `make` symlink, and it **never** modifies
+`/usr/bin/make` or any other system binary.
+
+If your terminal is interactive, the installer asks once whether you want a
+`$PREFIX/bin/make → jmake` symlink. To skip the prompt non-interactively, pass
+either `--no-prompt` (assume "no") or `--yes` (assume "yes").
 
 ```sh
 # pin a version
-curl -fsSL .../install.sh | sh -s -- --version 1.2.1
+curl -fsSL .../install.sh | sh -s -- --version 1.2.1 --no-prompt
 
 # unprivileged install to ~/.local
-curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/.local"
+curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/.local" --no-prompt
 
-# also create $PREFIX/bin/make → jmake
-curl -fsSL .../install.sh | sh -s -- --make-default
+# also create $PREFIX/bin/make -> jmake (never touches /usr/bin/make)
+curl -fsSL .../install.sh | sh -s -- --make-default --no-prompt
 ```
 
-By default the installer drops a single `jmake` binary at `$PREFIX/bin/jmake`
-and never touches `/usr/bin/make`. With `--make-default`, it adds
-`$PREFIX/bin/make` as a symlink to `jmake`; if `/usr/bin/make` is earlier on
-your `$PATH`, the installer warns you so you can adjust.
+If you skip the symlink at install time and want it later:
+
+```sh
+sh install.sh --prefix /usr/local --make-default --no-prompt
+# or just
+ln -sf jmake /usr/local/bin/make
+```
+
+### Flags
+
+| Flag                  | Effect                                                              |
+|-----------------------|---------------------------------------------------------------------|
+| `--version <VER>`     | jmake version to install (default `1.2.1`).                         |
+| `--prefix <DIR>`      | Install prefix (default `/usr/local`).                              |
+| `--arch <ARCH>`       | Override architecture detection (`x86_64` or `aarch64`).            |
+| `--make-default`      | Opt-in: create `$PREFIX/bin/make → jmake`. Never touches `/usr/bin/make`. |
+| `--no-make-default`   | Default behavior. Forces "no" even when paired with `--yes`.        |
+| `--no-prompt`         | Skip the interactive prompt; assume "no" for every opt-in.          |
+| `--yes`, `-y`         | Skip the interactive prompt; assume "yes" for every opt-in.         |
+| `--help`, `-h`        | Print usage and exit.                                               |
+
+All long flags also accept the `--key=value` form.
+
+If `--make-default` is enabled and `/usr/bin/make` precedes `$PREFIX/bin` on
+your `$PATH`, the installer prints a loud warning. Plain `make` will still
+invoke the system make until you reorder `$PATH`.
+
+**POSIX-strict.** The installer is plain `/bin/sh` — no bashisms. It is
+validated against `dash -n`, `mksh -n`, and `shellcheck -s sh` and runs
+unmodified on busybox, dash, mksh, ash, and bash.
 
 **Architectures:** `x86_64`, `aarch64` (override with `--arch`).
 
