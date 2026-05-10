@@ -1456,38 +1456,75 @@ fn test_empty_inline_recipe() {
 
 // ── 2. Multiple rules for same target: prerequisite merging order ─────────────
 
-/// Two rules for the same target: prerequisites must be merged in
-/// textual order (first rule's prereqs first, then second rule's).
-/// Regression for the bug where the recipe-bearing rule's prereqs were
-/// prepended instead of appended.
+/// Two rules for the same target: the recipe-bearing rule's prereqs
+/// come FIRST, then prereq-only rules in textual order. Verified
+/// against GNU Make 4.4.1 and BSD make:
+///   `all: a / all: b<recipe>` → `$^ = b a`, `$< = b`.
 #[test]
 fn test_multi_rule_prereq_merge_order() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("a"), "").unwrap();
     std::fs::write(dir.path().join("b"), "").unwrap();
     // Second rule provides the recipe; first rule provides prereq `a`.
-    // GNU Make order: a b (textual order, not recipe-first).
     let (out, err, ok) = mk_run(dir.path(),
-        "all: a\nall: b\n\t@echo \"prereqs=$^\"\n",
+        "all: a\nall: b\n\t@echo \"prereqs=$^ first=$<\"\n",
         "all");
     assert!(ok, "jmake failed: {}", err);
-    assert_eq!(out.trim(), "prereqs=a b",
-        "prerequisites out of order: got {:?}", out);
+    assert_eq!(out.trim(), "prereqs=b a first=b",
+        "recipe-bearing rule's prereqs must come first: got {:?}", out);
 }
 
-/// Three rules with prereqs split across all three; recipe on the last.
+/// Three rules; recipe on the MIDDLE rule. Recipe-bearing rule's
+/// prereqs come first, then the prereq-only rules in textual order.
+///   all: a       # rule 1, no recipe
+///   all: b c     # rule 2, has recipe
+///   all: d       # rule 3, no recipe
+/// → $^ = "b c a d"
 #[test]
 fn test_multi_rule_three_way_merge() {
     let dir = tempfile::TempDir::new().unwrap();
-    for f in &["a", "b", "c"] {
+    for f in &["a", "b", "c", "d"] {
         std::fs::write(dir.path().join(f), "").unwrap();
     }
     let (out, err, ok) = mk_run(dir.path(),
-        "all: a\nall: b\nall: c\n\t@echo \"prereqs=$^\"\n",
+        "all: a\nall: b c\n\t@echo \"prereqs=$^ first=$<\"\nall: d\n",
         "all");
     assert!(ok, "jmake failed: {}", err);
-    assert_eq!(out.trim(), "prereqs=a b c",
-        "prerequisites out of order: got {:?}", out);
+    assert_eq!(out.trim(), "prereqs=b c a d first=b",
+        "merge ordering wrong: got {:?}", out);
+}
+
+/// cpython 3.15-shape: a prereq-only rule lists header dependencies,
+/// then a separate recipe-bearing rule supplies the .c source. The
+/// suffix-rule recipe uses `$<` and must see the .c file, not the
+/// first header.
+///
+/// Regression for the cpython 3.15 build failure on tormenta
+/// (2026-05-10): jmake 1.2.1 emitted
+///   `clang -c -o Python/ceval.o Python/ceval_macros.h`
+/// → "use of undeclared identifier 'PyThreadState'", because $<
+/// resolved to the header instead of ceval.c.
+#[test]
+fn test_multi_rule_cpython_ceval_shape() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("Python")).unwrap();
+    std::fs::write(dir.path().join("Python/ceval.c"), "").unwrap();
+    std::fs::write(dir.path().join("Python/ceval_macros.h"), "").unwrap();
+    std::fs::write(dir.path().join("Python/condvar.h"), "").unwrap();
+    let (out, err, ok) = mk_run(dir.path(),
+        concat!(
+            "Python/ceval.o: \\\n",
+            "    Python/ceval_macros.h \\\n",
+            "    Python/condvar.h\n",
+            "\n",
+            "Python/ceval.o: Python/ceval.c\n",
+            "\t@echo \"compile-cmd: cc -c -o $@ $<\"\n",
+        ),
+        "Python/ceval.o");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "compile-cmd: cc -c -o Python/ceval.o Python/ceval.c",
+        "recipe-bearing rule's .c source must be $<, not the header from \
+         the prereq-only rule: got {:?}", out);
 }
 
 // ── 3. Recursive make: MAKELEVEL and $(MAKE) ─────────────────────────────────

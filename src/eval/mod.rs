@@ -2926,15 +2926,56 @@ impl MakeState {
                         .cloned()
                         .collect();
 
-                    // GNU Make always appends new prerequisites to the END of the
-                    // existing list, preserving the order in which rules were written.
-                    // The recipe-bearing rule does NOT get priority in prereq ordering.
-                    // (The old code prepended when new_has_recipe, which produced
-                    // reversed order: `all: a\nall: b\n<recipe>` gave `b a` not `a b`.)
+                    // GNU Make orders merged prerequisites by which rule owns
+                    // the recipe: the recipe-bearing rule's prereqs come FIRST
+                    // in the merged list, then prereq-only rules in textual
+                    // order.
+                    //
+                    //   all: a            # rule 1, no recipe
+                    //   all: b c          # rule 2, has recipe
+                    //       @echo $^      # GNU make: "b c a"
+                    //   all: d            # rule 3, no recipe
+                    //                     # final: "b c a d"
+                    //
+                    // Verified against GNU Make 4.4.1 and BSD make.
+                    //
+                    // cpython's Makefile relies on this for `Python/ceval.o`
+                    // (and gc.o, import.o): a prereq-only rule lists header
+                    // dependencies and a separate recipe-bearing rule supplies
+                    // the .c source. With the wrong order, $< expands to a
+                    // header instead of the .c file and clang is asked to
+                    // compile a header ("use of undeclared identifier
+                    // 'PyThreadState'", etc) — which broke cpython 3.15 main
+                    // builds on jonerix tormenta 2026-05-10.
+                    //
+                    // Algorithm: if NEW rule has a recipe, its prereqs go to
+                    // the FRONT of existing (in front of any prereq-only rules
+                    // that happened to land first textually). Otherwise the
+                    // new rule is prereq-only and appends to the end.
                     let new_has_recipe = !rule.recipe.is_empty();
-                    for p in &rule.prerequisites {
-                        if !existing.prerequisites.contains(p) {
-                            existing.prerequisites.push(p.clone());
+                    if new_has_recipe {
+                        // Prepend new prereqs in their textual order while
+                        // de-duplicating against existing entries (a duplicate
+                        // already in existing keeps its original position).
+                        let mut prepend: Vec<String> =
+                            Vec::with_capacity(rule.prerequisites.len());
+                        for p in &rule.prerequisites {
+                            if !existing.prerequisites.contains(p)
+                                && !prepend.contains(p)
+                            {
+                                prepend.push(p.clone());
+                            }
+                        }
+                        if !prepend.is_empty() {
+                            let tail = std::mem::take(&mut existing.prerequisites);
+                            existing.prerequisites = prepend;
+                            existing.prerequisites.extend(tail);
+                        }
+                    } else {
+                        for p in &rule.prerequisites {
+                            if !existing.prerequisites.contains(p) {
+                                existing.prerequisites.push(p.clone());
+                            }
                         }
                     }
                     existing.order_only_prerequisites.extend(filtered_order_only);
