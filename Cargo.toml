@@ -21,6 +21,10 @@ libc = "0.2"
 tempfile = "3"
 filetime = "0.2"
 
+[[bench]]
+name = "functions_bench"
+harness = false
+
 [lints.rust]
 warnings = "deny"
 rust-2018-idioms = "deny"

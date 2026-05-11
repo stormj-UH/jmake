@@ -4067,14 +4067,17 @@ impl<'a> Executor<'a> {
             .any(|rule| rule.targets.iter().any(|pt| pt.len() > 1 && match_pattern(pt, target).is_some()));
 
         // User rules first (higher priority), then built-ins.
-        let all_rules: Vec<&Rule> = user_rules.iter().chain(builtin_rules.iter()).collect();
+        // Avoid collecting into a Vec<&Rule> on every call — iterate the two
+        // contiguous slices directly via chain().  The Vec allocation was
+        // O(total_rules) per uncached find_pattern_rule_inner call.
+        let all_rules_iter = || user_rules.iter().chain(builtin_rules.iter());
 
         let mut compat_rule: Option<(Rule, String)> = None;
 
         // Pass 1: all prereqs immediately satisfiable.
         // Try matching candidates in shortest-stem order and stop at the first success.
         let mut pass1_matches: Vec<(usize, usize, &Rule, String, String)> = Vec::new();
-        for (order, rule) in all_rules.iter().enumerate() {
+        for (order, rule) in all_rules_iter().enumerate() {
             // Skip rules with no recipe unless they have SE prereqs (which may produce
             // errors or provide prerequisites at build time) or are terminal rules.
             if rule.recipe.is_empty()
@@ -4137,7 +4140,7 @@ impl<'a> Executor<'a> {
 
         // Pass 2: prereqs can be built via chaining. Terminal rules skipped.
         let mut pass2_matches: Vec<(usize, usize, &Rule, String, String)> = Vec::new();
-        for (order, rule) in all_rules.iter().enumerate() {
+        for (order, rule) in all_rules_iter().enumerate() {
             if rule.recipe.is_empty()
                 && !rule.is_terminal
                 && rule.second_expansion_prereqs.is_none()
@@ -4202,7 +4205,7 @@ impl<'a> Executor<'a> {
         // prereqs are immediately satisfiable (on disk, in building set for
         // cycles, PHONY, VPATH, or have explicit rules). NO chaining allowed.
         if compat_rule.is_none() {
-            for rule in &all_rules {
+            for rule in all_rules_iter() {
                 if !rule.is_terminal { continue; }
                 if rule.recipe.is_empty() { continue; }
                 for pattern_target in &rule.targets {
@@ -4220,7 +4223,7 @@ impl<'a> Executor<'a> {
                             })
                         };
                         if prereqs_ok {
-                            let mut r = (**rule).clone();
+                            let mut r = (*rule).clone();
                             r.is_compat = true;
                             compat_rule = Some((r, stem));
                             break;
