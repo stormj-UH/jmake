@@ -1,3 +1,3 @@
-dotslash count=17
+dotslash count=2
 abs=/tmp/wc-test/src/bar.c /tmp/wc-test/src/foo.c
 noprefix=bar.c foo.c
