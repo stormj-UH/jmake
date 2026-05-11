@@ -409,8 +409,38 @@ impl Parser {
         let is_tab_prefixed = line.starts_with('\t');
         let is_custom_prefix = recipe_prefix != '\t' && line.starts_with(recipe_prefix);
         if (is_tab_prefixed || is_custom_prefix) && self.in_recipe {
-            // Strip exactly the one prefix character
+            // Strip exactly the one prefix character.
             let stripped = &line[recipe_prefix.len_utf8()..];
+            // GNU Make 4.x treats a tab-indented line as a variable assignment
+            // (not a recipe line) when it unambiguously parses as one using a
+            // Make-specific assignment operator.  This handles the Valkey
+            // src/Makefile pattern where `ifeq`/`else`/`endif` blocks appear
+            // after a rule definition, leaving `in_recipe == true`, while
+            // containing tab-indented lines like:
+            //
+            //   	FINAL_LIBS += -ldl
+            //
+            // which must be assignments, not recipe commands.  Without this
+            // check, jmake queues them as shell commands for the preceding rule,
+            // causing `/bin/sh: FINAL_LIBS: command not found` at link time.
+            //
+            // We check only for Make-specific operators (+=, :=, ::=, :::=, ?=,
+            // !=) which cannot appear in shell assignment syntax.  Plain `=` is
+            // deliberately excluded because `VAR=value cmd` is valid shell syntax
+            // (environment-variable prefix for a command), and `@x=hello` inside
+            // .ONESHELL recipes is a legitimate silenced shell assignment.
+            //
+            // Safe for the recipe-conditional pattern (`all: / ifeq / \t@echo`):
+            // `@echo arg1 NOT equal arg2` contains no Make-specific operator, so
+            // we correctly fall through to ParsedLine::Recipe.
+            let stripped_trimmed = stripped.trim_start();
+            if tab_indented_is_make_assignment(stripped_trimmed) {
+                if let Some(va @ ParsedLine::VariableAssignment { .. }) =
+                    try_parse_variable_assignment(stripped_trimmed)
+                {
+                    return va;
+                }
+            }
             return ParsedLine::Recipe(stripped.to_string());
         }
 
@@ -732,6 +762,49 @@ pub fn strip_comment(line: &str) -> String {
     }
 
     result
+}
+
+/// Return true when a tab-indented line (with the leading tab already stripped)
+/// contains a Make-specific assignment operator (`+=`, `:=`, `::=`, `:::=`,
+/// `?=`, `!=`) at the top level (outside `$(…)`/`${…}`).
+///
+/// Plain `=` is **not** considered here because `VAR=value command` is valid
+/// POSIX shell syntax (an environment-variable prefix), so it is ambiguous in a
+/// recipe context.  The operators listed above have no meaning in any shell, so
+/// their presence makes the line unambiguously a Make variable assignment.
+///
+/// This is used by `parse_line` to detect tab-indented assignments inside
+/// `ifeq`/`else`/`endif` blocks that follow a rule definition.
+fn tab_indented_is_make_assignment(line: &str) -> bool {
+    // Make-specific operators (longest first to avoid partial matching `:=` as `::=`).
+    const MAKE_OPS: &[&str] = &[":::=", "::=", "+=", "?=", "!=", ":="];
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    while i < len {
+        match bytes[i] {
+            b'$' if i + 1 < len && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') => {
+                depth += 1;
+                i += 2;
+            }
+            b')' | b'}' if depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if depth == 0 => {
+                for op in MAKE_OPS {
+                    let ob = op.as_bytes();
+                    if i + ob.len() <= len && &bytes[i..i + ob.len()] == ob {
+                        return true;
+                    }
+                }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+    false
 }
 
 pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
