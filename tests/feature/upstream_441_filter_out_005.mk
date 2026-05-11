@@ -1,0 +1,1 @@
+all:;@echo '$(filter foo\%\%\\\%\%bar,foo%%\%%bar fooX\Ybar)'

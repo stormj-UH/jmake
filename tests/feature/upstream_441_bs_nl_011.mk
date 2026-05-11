@@ -1,0 +1,2 @@
+dquote:;@echo "dqu\
+	    ote"

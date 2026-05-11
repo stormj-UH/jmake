@@ -1,0 +1,4 @@
+export = 123
+export export
+export export = 456
+a: ; @echo "\$$(export)=$(export) / \$$export=$$export"
