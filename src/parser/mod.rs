@@ -1432,11 +1432,31 @@ fn expand_static_pattern_rule(
         split_prerequisites(prereq_str);
 
     let mut rules: Vec<Rule> = Vec::new();
+    // Targets that do not match the target pattern.  GNU Make warns about each
+    // one and still creates an explicit rule with empty prereqs so that any
+    // following recipe lines remain associated with the target.
+    let mut unmatched: Vec<String> = Vec::new();
 
     for target in targets {
         let stem = match match_pattern(&target, target_pattern) {
             Some(s) => s,
-            None => continue, // target doesn't match pattern — skip
+            None => {
+                // GNU Make: warn (emitted by the evaluator) and create an
+                // explicit rule with empty prerequisites so the recipe is
+                // still associated with the target.
+                let canonical_target = unescape_percent_in_target(&target);
+                unmatched.push(canonical_target.clone());
+                let mut rule = Rule::new();
+                rule.targets = vec![canonical_target];
+                rule.is_pattern = false;
+                rule.is_double_colon = is_double_colon;
+                if let Some(ref recipe_line) = inline_recipe {
+                    rule.has_inline_recipe_marker = true;
+                    rule.recipe.push((0, recipe_line.clone()));
+                }
+                rules.push(rule);
+                continue;
+            }
         };
 
         // Substitute the stem into every prerequisite pattern.
@@ -1511,7 +1531,7 @@ fn expand_static_pattern_rule(
         rules.push(rule);
     }
 
-    ParsedLine::StaticPatternExpansion(rules)
+    ParsedLine::StaticPatternExpansion { rules, unmatched }
 }
 
 /// Public wrapper around find_rule_colon for use in the eval loop.

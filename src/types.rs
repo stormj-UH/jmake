@@ -498,8 +498,16 @@ pub enum ParsedLine {
         name: String,
         is_override: bool,
     },
-    /// Expanded static pattern rule: one Rule per target, already resolved.
-    StaticPatternExpansion(Vec<Rule>),
+    /// Expanded static pattern rule: one Rule per matching target, already resolved.
+    ///
+    /// `rules` holds one entry per target that matched the target pattern.
+    /// `unmatched` holds the names of targets that did NOT match the target
+    /// pattern; GNU Make warns about each of them and still associates the
+    /// recipe with the target (as if it were an explicit rule with empty prereqs).
+    StaticPatternExpansion {
+        rules: Vec<Rule>,
+        unmatched: Vec<String>,
+    },
     Recipe(String),
     Comment,
     Empty,
