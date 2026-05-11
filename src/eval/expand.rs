@@ -177,6 +177,23 @@ fn builtin_var_names() -> &'static HashSet<&'static str> {
 // thread stack and kill the process with SIGSEGV.
 const MAX_EXPANSION_DEPTH: usize = 1000;
 
+/// Maximum byte length of a single expanded string value.
+///
+/// GNU Make imposes no such limit; jmake adds it as an
+/// allocation-bomb defence.  A Makefile with nested `$(foreach)`
+/// that doubles the word list at each level can exceed available
+/// RAM in ~25 iterations.  256 MiB is orders of magnitude larger
+/// than any legitimate Makefile value while still being far below
+/// what a modern system can absorb without OOM-killing the process.
+///
+/// This limit is checked in `expand_foreach` (the primary doubling
+/// attack path) and in the text-function helpers that materialise
+/// large lists (`fn_sort`, `fn_join` in `functions/mod.rs`).
+// SECURITY: without this limit a crafted Makefile can exhaust all
+// available memory via a chain of `:=` assignments each doubling
+// the previous value through `$(foreach x,$(L),$(x) $(x))`.
+pub const MAX_EXPANDED_VALUE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 impl MakeState {
     /// Expand all variable and function references in `input`, with no automatic
     /// variables in scope.
@@ -271,6 +288,25 @@ impl MakeState {
                             let content = &input[start..end];
                             let expanded = self.expand_reference(content, auto_vars);
                             result.push_str(&expanded);
+                            // SECURITY: guard against allocation-bomb strings produced by
+                            // e.g. `W1 := $(W0)$(W0)` doubling chains (without the foreach
+                            // guard, 28 such lines can expand to a 256 MiB string).
+                            if result.len() > MAX_EXPANDED_VALUE_BYTES {
+                                let file = self.current_file.borrow().clone();
+                                let line = *self.current_line.borrow();
+                                let loc = if file.is_empty() {
+                                    make_progname()
+                                } else if line == 0 {
+                                    file
+                                } else {
+                                    format!("{}:{}", file, line)
+                                };
+                                eprintln!(
+                                    "{}: *** expanded value exceeds maximum size ({} bytes).  Stop.",
+                                    loc, MAX_EXPANDED_VALUE_BYTES
+                                );
+                                std::process::exit(2);
+                            }
                             i = end + 1;
                         } else {
                             // Unmatched opening paren/brace: unterminated variable reference.
@@ -1484,9 +1520,16 @@ impl MakeState {
         // re-used every iteration instead of being cloned O(words) times.
         // The remove() at the end of each iteration restores the map to the
         // pre-loop state, which is correct for nested foreach as well.
+        //
+        // SECURITY: accumulate output incrementally and abort early if the
+        // result would exceed MAX_EXPANDED_VALUE_BYTES.  A nested $(foreach)
+        // that doubles the word list at each level can otherwise exhaust all
+        // available RAM in ~25 iterations (each producing 2× the parent's
+        // output string).  We count bytes accumulated so far and bail out
+        // rather than allocating the final joined string.
         let mut loop_auto_vars = auto_vars.clone();
         let mut out = String::new();
-        let mut first = true;
+        let mut first_word = true;
         for word in &words {
             // Replace all forms of the variable reference in the body before expanding:
             //   $(var), ${var}, and $v (single-char only)
@@ -1514,9 +1557,29 @@ impl MakeState {
             loop_auto_vars.insert(var.clone(), word.to_string());
             let expanded = self.expand_with_auto_vars(&substituted, &loop_auto_vars);
             loop_auto_vars.remove(&var);
-            if !first { out.push(' '); }
+
+            // SECURITY: check accumulated output size before appending.
+            let sep_len = if first_word { 0 } else { 1 };
+            let new_len = out.len().saturating_add(sep_len).saturating_add(expanded.len());
+            if new_len > MAX_EXPANDED_VALUE_BYTES {
+                let file = self.current_file.borrow().clone();
+                let line = *self.current_line.borrow();
+                let loc = if file.is_empty() {
+                    make_progname()
+                } else if line == 0 {
+                    file
+                } else {
+                    format!("{}:{}", file, line)
+                };
+                eprintln!(
+                    "{}: *** $(foreach) output exceeds maximum value size ({} bytes).  Stop.",
+                    loc, MAX_EXPANDED_VALUE_BYTES
+                );
+                std::process::exit(2);
+            }
+            if !first_word { out.push(' '); }
             out.push_str(&expanded);
-            first = false;
+            first_word = false;
         }
         out
     }

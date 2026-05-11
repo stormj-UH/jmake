@@ -2325,3 +2325,27 @@ all:
 #[test] fn test_upstream_441_word_001() { run_feature_test("upstream_441_word_001", &[]); }
 #[test] fn test_upstream_441_word_017() { run_feature_test("upstream_441_word_017", &[]); }
 #[test] fn test_upstream_441_word_018() { run_feature_test("upstream_441_word_018", &[]); }
+// ── Security regression tests ──────────────────────────────────────────────────
+//
+// These tests verify that jmake's allocation-bomb defences are in place.
+// Each test constructs a Makefile that would exhaust memory without the guard
+// and verifies that jmake exits with a diagnostic instead of OOMing.
+
+/// Assignment-doubling allocation bomb: `S_n := $(S_{n-1})$(S_{n-1})` builds
+/// exponentially large strings.  Without the 256 MiB cap, 30 such lines
+/// exhaust all available RAM.  With the cap, jmake must exit 2 with the
+/// "expanded value exceeds maximum size" diagnostic.
+#[test]
+fn test_security_alloc_bomb() {
+    run_feature_test("security_alloc_bomb", &[]);
+}
+
+/// Terminal escape injection: $(info) and $(warning) must not corrupt the
+/// developer's terminal when they contain ANSI escape sequences.
+/// When output is piped (non-TTY, as in `cargo test`), no sanitisation is
+/// applied (so this test verifies the non-TTY pass-through path does not
+/// accidentally strip legitimate output).
+#[test]
+fn test_security_escape_injection() {
+    run_feature_test("security_escape_injection", &[]);
+}

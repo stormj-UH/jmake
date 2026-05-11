@@ -148,6 +148,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use crate::eval::MAX_EXPANDED_VALUE_BYTES;
 
 pub type FnHandler = fn(args: &[String], expand: &dyn Fn(&str) -> String) -> String;
 
@@ -440,12 +441,24 @@ fn fn_sort(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     words.sort_unstable(); // unstable sort is faster and output order of duplicates is irrelevant
     words.dedup();
     // Direct-push avoids a second Vec<String> allocation that .join(" ") requires.
+    //
+    // SECURITY: the input has already passed MAX_EXPANDED_VALUE_BYTES checks in
+    // the expansion engine, so the output here cannot exceed the input length
+    // (dedup only reduces word count).  The post-loop check is defence-in-depth
+    // for any future code path that bypasses the expansion-engine check.
     let mut out = String::new();
     let mut first = true;
     for w in &words {
         if !first { out.push(' '); }
         out.push_str(w);
         first = false;
+    }
+    if out.len() > MAX_EXPANDED_VALUE_BYTES {
+        eprintln!(
+            "make: *** $(sort) output exceeds maximum value size ({} bytes).  Stop.",
+            MAX_EXPANDED_VALUE_BYTES
+        );
+        std::process::exit(2);
     }
     out
 }
@@ -607,6 +620,16 @@ fn fn_join(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
         if i > 0 { out.push(' '); }
         out.push_str(list1.get(i).unwrap_or(&""));
         out.push_str(list2.get(i).unwrap_or(&""));
+        // SECURITY: guard against allocation bomb when joining two very large lists.
+        // Each concatenated pair can be longer than either input word, so the joined
+        // output can exceed the sum of both input lists.
+        if out.len() > MAX_EXPANDED_VALUE_BYTES {
+            eprintln!(
+                "make: *** $(join) output exceeds maximum value size ({} bytes).  Stop.",
+                MAX_EXPANDED_VALUE_BYTES
+            );
+            std::process::exit(2);
+        }
     }
     out
 }
@@ -1052,18 +1075,145 @@ fn fn_shell(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     fn_shell_exec(&args[0])
 }
 
+/// Strip ANSI / VT100 escape sequences from a string when output goes to a TTY.
+///
+/// GNU Make passes `$(info)` / `$(warning)` / `$(error)` messages straight to
+/// the terminal with no sanitisation.  A Makefile that reads external data
+/// (e.g. from `$(shell …)`) and injects it into a diagnostic message can
+/// send arbitrary escape sequences to the developer's terminal — clearing the
+/// screen, overwriting the window title, moving the cursor, etc.
+///
+/// We strip the sequences only when the destination file descriptor is a real
+/// terminal (i.e. `isatty()` returns true).  Piped / redirected output is left
+/// unchanged so that legitimate downstream consumers of jmake's output are not
+/// broken by unexpected stripping.
+///
+/// Sequences stripped:
+///  * ESC `[` … `m|A|B|C|D|H|J|K|…`  (CSI — Control Sequence Introducer)
+///  * ESC `]` … `BEL`/`ESC \`        (OSC — Operating System Command, e.g. titles)
+///  * ESC `(`/`)`/`*`/`+` `X`        (character set designators)
+///  * Bare ESC followed by a single ASCII char (`ESC c`, `ESC =`, etc.)
+///  * Raw C0 controls: BEL (0x07), BS (0x08), DEL (0x7f), and the FF/VT
+///    form-feed/vertical-tab pair — these can reposition the cursor without
+///    a leading ESC.
+///
+/// `\r` (carriage return) is intentionally preserved: it appears in normal
+/// Windows-line-ending output and stripping it would corrupt the text.
+///
+// SECURITY: this function is the primary mitigation for terminal escape
+// injection via Makefile diagnostic messages.  Without it, an attacker
+// who controls Makefile content (e.g. from a fetched dependency's build
+// system or from environment variables) can inject arbitrary terminal
+// control sequences into the developer's terminal.
+//
+// PRE:  `s` is valid UTF-8 (Rust strings are always UTF-8).
+// POST: All ESC-sequence and raw C0 control characters listed above are
+//       removed.  Printable ASCII, \n, \r, and all multi-byte UTF-8
+//       codepoints are left unchanged.
+fn sanitize_terminal_output(s: &str) -> String {
+    use std::io::IsTerminal as _;
+    // Fast path: if no ESC byte is present and no dangerous C0 controls are
+    // present, return a reference to the original (via Cow) without allocating.
+    let needs_sanitize = s.bytes().any(|b| matches!(b, 0x1b | 0x07 | 0x08 | 0x0c | 0x0d | 0x7f));
+    if !needs_sanitize {
+        return s.to_string();
+    }
+    // Only sanitize when writing to a real terminal.  Piped output is unchanged.
+    // We check both stdout and stderr since info/warning/error target different fds.
+    let is_tty = std::io::stderr().is_terminal() || std::io::stdout().is_terminal();
+    if !is_tty {
+        return s.to_string();
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // ESC — start of a multi-byte sequence
+            0x1b => {
+                if i + 1 >= bytes.len() {
+                    // Bare ESC at end: strip it
+                    i += 1;
+                    continue;
+                }
+                match bytes[i + 1] {
+                    // CSI: ESC [ ... final_byte  (final byte is 0x40–0x7e)
+                    b'[' => {
+                        i += 2; // skip ESC [
+                        while i < bytes.len() && !matches!(bytes[i], 0x40..=0x7e) {
+                            i += 1;
+                        }
+                        i += 1; // skip final byte
+                    }
+                    // OSC: ESC ] ... (BEL | ESC \)
+                    b']' => {
+                        i += 2; // skip ESC ]
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                // BEL terminator
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                                // String Terminator: ESC \
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    // Character-set designators: ESC ( X, ESC ) X, ESC * X, ESC + X
+                    b'(' | b')' | b'*' | b'+' => {
+                        i += 3; // skip ESC <char> <designator>
+                    }
+                    // Any other ESC X: single-character escape sequence
+                    _ => {
+                        i += 2; // skip ESC + one char
+                    }
+                }
+            }
+            // BEL — terminal bell: could be used to annoy; strip from TTY output
+            0x07 => { i += 1; }
+            // BS — backspace: could overwrite visible output
+            0x08 => { i += 1; }
+            // FF / VT — form feed / vertical tab: reposition cursor
+            0x0c | 0x0b => { i += 1; }
+            // DEL
+            0x7f => { i += 1; }
+            // All other bytes (including \n, \r, printable ASCII, UTF-8 continuations)
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // SAFETY: we only copy bytes from the original valid-UTF-8 string or skip
+    // them; we never insert bytes that would break UTF-8 encoding.  ESC-sequences
+    // are always ASCII, so stripping them cannot split a multi-byte codepoint.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
 fn fn_error(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    eprintln!("*** {}.  Stop.", args[0]);
+    // SECURITY: sanitize terminal escape sequences from error messages to prevent
+    // injection attacks (e.g. screen clearing, cursor repositioning) when the
+    // message contains untrusted content such as shell-command output.
+    let msg = sanitize_terminal_output(&args[0]);
+    eprintln!("*** {}.  Stop.", msg);
     std::process::exit(2);
 }
 
 fn fn_warning(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    eprintln!("{}", args[0]);
+    // SECURITY: sanitize terminal escape sequences from warning messages.
+    let msg = sanitize_terminal_output(&args[0]);
+    eprintln!("{}", msg);
     String::new()
 }
 
 fn fn_info(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    println!("{}", args[0]);
+    // SECURITY: sanitize terminal escape sequences from info messages.
+    let msg = sanitize_terminal_output(&args[0]);
+    println!("{}", msg);
     String::new()
 }
 

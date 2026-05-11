@@ -176,6 +176,7 @@ pub mod env_config_mod;
 mod expand;
 
 pub use env_config_mod::EnvConfig;
+pub use expand::MAX_EXPANDED_VALUE_BYTES;
 
 use crate::cli::MakeArgs;
 use crate::database::MakeDatabase;
