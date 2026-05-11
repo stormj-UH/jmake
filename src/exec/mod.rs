@@ -5637,10 +5637,20 @@ impl<'a> Executor<'a> {
 
             self.any_recipe_ran = true;
             if !self.dry_run {
+                // Tokenize SHELL into (program, extra args). When SHELL contains
+                // whitespace (e.g. `SHELL = /bin/sh -e`) the program is the first
+                // word and remaining words become leading argv elements; the
+                // recipe-or-script string is passed as a single final argv
+                // element. This matches GNU Make and avoids re-tokenization by
+                // an outer shell, which would lose the script-string boundary.
+                let (shell_prog, shell_extra) = parse_shell_program(self.shell);
                 // Parse shell_flags respecting shell-like single-quote quoting.
                 // E.g. `.SHELLFLAGS = -w -E 'use warnings;' -E` produces 4 separate args.
                 let flags: Vec<String> = parse_shell_flags(self.shell_flags);
-                let mut child = Command::new(self.shell);
+                let mut child = Command::new(&shell_prog);
+                for arg in &shell_extra {
+                    child.arg(arg);
+                }
                 for flag in &flags {
                     child.arg(flag);
                 }
@@ -5809,36 +5819,34 @@ impl<'a> Executor<'a> {
                 //
                 // The expanded `cmd` string is passed as a SINGLE argv element to
                 // the shell (not interpolated into a shell command string), so no
-                // additional shell-meta-character escaping is required.  The
-                // "SHELL contains spaces" branch is the only path where `cmd` is
-                // embedded into a larger shell string; that branch is only reached
-                // when the user has explicitly set SHELL to a multi-word value,
-                // so they own the quoting responsibility.
+                // additional shell-meta-character escaping is required. This holds
+                // for both single-word and multi-word SHELL values because we
+                // tokenize SHELL ourselves and always pass `cmd` as one argv elem.
                 //
-                // When SHELL contains spaces (e.g. "echo hi"), GNU Make composes the full
-                // invocation as a shell string and runs it through /bin/sh -c, so that
-                // shell quoting in .SHELLFLAGS is properly interpreted.
-                // Otherwise use direct execvp with the shell program.
-                let child_status = if eff_shell_raw.contains(' ') {
-                    // Compose full command string: "SHELL SHELLFLAGS cmd"
-                    let composed = format!("{} {} {}", eff_shell_raw, eff_flags, cmd);
-                    let mut c = Command::new("/bin/sh");
-                    c.arg("-c").arg(&composed);
-                    c.env("MAKELEVEL", self.get_makelevel());
-                    self.setup_exports(&mut c);
-                    run_cmd_with_error_handling(c, &cmd, &self.progname)
-                } else {
-                    // Direct exec: shell_prog [shell_flags] cmd
-                    //
-                    // Split any cluster that contains `-c` into individual
-                    // tokens. POSIX sh specifies `-c` as the option that
-                    // takes command_string as its operand, so clustering
-                    // `-ec` (the default .SHELLFLAGS under .POSIX) is
-                    // formally ambiguous. bash / dash / mksh all accept
-                    // it; toybox sh rejects with "Unknown option 'ec'".
-                    // Splitting to `-e -c` is equivalent everywhere and
-                    // lets toybox sh pass the 19-ish POSIX-strictness
-                    // tests that tripped on the Pi but passed on castle.
+                // Tokenize SHELL into (program, extra args). When SHELL is
+                // multi-word (e.g. `SHELL = /bin/sh -e`, which Python's
+                // configure writes by default), the program is the first word
+                // and the remaining words become leading argv elements. The
+                // recipe text is then passed as a SINGLE final argv element,
+                // which is what GNU Make does. Previously this branch composed
+                // a shell string and ran it through `/bin/sh -c`, which lost
+                // the recipe-string boundary and let the outer shell
+                // re-tokenize the recipe — turning `cc -c -o out.o in.c` into
+                // separate positional args to `cc`, so `cc` saw no input file.
+                //
+                // Direct exec, no intermediate `/bin/sh -c`:
+                //   argv = [program, ...shell_extra, ...shellflags, recipe]
+                //
+                // Split any flag cluster that contains `-c` into individual
+                // tokens. POSIX sh specifies `-c` as the option that takes
+                // command_string as its operand, so clustering `-ec` (the
+                // default .SHELLFLAGS under .POSIX) is formally ambiguous.
+                // bash / dash / mksh all accept it; toybox sh rejects with
+                // "Unknown option 'ec'". Splitting to `-e -c` is equivalent
+                // everywhere and lets toybox sh pass the 19-ish POSIX-
+                // strictness tests that tripped on the Pi but passed on castle.
+                let child_status = {
+                    let (shell_prog, shell_extra) = parse_shell_program(eff_shell_raw);
                     let raw_flags: Vec<&str> = eff_flags.split_whitespace().collect();
                     let mut flags: Vec<String> = Vec::with_capacity(raw_flags.len() + 2);
                     for flag in &raw_flags {
@@ -5859,7 +5867,10 @@ impl<'a> Executor<'a> {
                             flags.push((*flag).to_string());
                         }
                     }
-                    let mut c = Command::new(eff_shell_raw);
+                    let mut c = Command::new(&shell_prog);
+                    for arg in &shell_extra {
+                        c.arg(arg);
+                    }
                     for flag in &flags {
                         c.arg(flag);
                     }
@@ -6407,6 +6418,28 @@ fn parse_shell_flags(flags: &str) -> Vec<String> {
         result.push(current);
     }
     result
+}
+
+/// Tokenize a SHELL variable value into (program, extra_args).
+///
+/// GNU Make tokenizes SHELL at whitespace and passes the first token as the
+/// program with subsequent tokens as leading argv elements. The recipe text
+/// is then appended as a single final argv element.
+///
+/// For `SHELL = /bin/sh -e`, this returns ("/bin/sh", ["-e"]). For a plain
+/// `SHELL = /bin/sh`, it returns ("/bin/sh", []). For an empty value, it
+/// returns ("", []) and callers fall back to their default shell.
+///
+/// Single-quoted segments are kept literal (no whitespace split inside),
+/// matching `parse_shell_flags`. This is what GNU Make and POSIX shells do
+/// when consuming the `SHELL` variable from a Makefile.
+fn parse_shell_program(shell: &str) -> (String, Vec<String>) {
+    let mut tokens = parse_shell_flags(shell);
+    if tokens.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let program = tokens.remove(0);
+    (program, tokens)
 }
 
 fn match_pattern(pattern: &str, target: &str) -> Option<String> {
@@ -6964,10 +6997,15 @@ fn strip_recipe_prefixes(line: &str) -> String {
 /// Only strips @-+ recipe prefixes in ONESHELL mode for Bourne-compatible shells;
 /// for non-standard shells (perl, python, etc.) the prefixes are left in place
 /// because they may be valid syntax in those languages.
+///
+/// The `shell` argument may include flag tokens (e.g. `/bin/sh -e`); only the
+/// program token (first whitespace-delimited word) determines compatibility.
 fn is_bourne_compatible_shell(shell: &str) -> bool {
     const UNIX_SHELLS: &[&str] = &["sh", "bash", "dash", "ksh", "rksh", "zsh", "ash"];
-    // Get the basename of the shell path
-    let basename = std::path::Path::new(shell)
+    // Take only the program token (first word) so values like "/bin/sh -e"
+    // are still recognised as Bourne-compatible.
+    let (program, _) = parse_shell_program(shell);
+    let basename = std::path::Path::new(&program)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");

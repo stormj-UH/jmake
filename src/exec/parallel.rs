@@ -318,13 +318,31 @@ pub fn execute_job(job: Job) -> JobResult {
 /// Check if the given shell path is a Bourne-compatible shell.
 /// For non-Bourne shells (perl, python, etc.) in .ONESHELL mode,
 /// recipe prefix chars (@, -, +) must NOT be stripped.
+///
+/// The `shell` argument may include flag tokens (e.g. `/bin/sh -e`); only the
+/// program token (first whitespace-delimited word) determines compatibility.
 fn is_bourne_compatible_shell_standalone(shell: &str) -> bool {
     const UNIX_SHELLS: &[&str] = &["sh", "bash", "dash", "ksh", "rksh", "zsh", "ash"];
-    let basename = std::path::Path::new(shell)
+    let (program, _) = parse_shell_program_standalone(shell);
+    let basename = std::path::Path::new(&program)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     UNIX_SHELLS.contains(&basename)
+}
+
+/// Tokenize a SHELL variable value into (program, extra_args).
+///
+/// Mirrors `parse_shell_program` in exec/mod.rs. GNU Make tokenizes SHELL at
+/// whitespace; the first token is the program, remaining tokens become
+/// leading argv elements ahead of any .SHELLFLAGS args.
+pub fn parse_shell_program_standalone(shell: &str) -> (String, Vec<String>) {
+    let mut tokens = parse_shell_flags_standalone(shell);
+    if tokens.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let program = tokens.remove(0);
+    (program, tokens)
 }
 
 fn execute_job_oneshell(job: Job) -> JobResult {
@@ -382,8 +400,17 @@ fn execute_job_oneshell(job: Job) -> JobResult {
         return JobResult { target, rebuilt: true, error: None };
     }
 
+    // Tokenize SHELL into (program, extra args). When SHELL contains
+    // whitespace (e.g. `SHELL = /bin/sh -e`) the program is the first word
+    // and remaining words become leading argv elements; the script string
+    // is passed as a single final argv element. This matches GNU Make and
+    // avoids re-tokenization by an outer shell.
+    let (shell_prog, shell_extra) = parse_shell_program_standalone(&job.shell);
     let flags = parse_shell_flags_standalone(&job.shell_flags);
-    let mut cmd = Command::new(&job.shell);
+    let mut cmd = Command::new(&shell_prog);
+    for arg in &shell_extra {
+        cmd.arg(arg);
+    }
     for flag in &flags {
         cmd.arg(flag);
     }
@@ -471,17 +498,19 @@ fn execute_job_normal(job: Job) -> JobResult {
             // Determine effective shell/flags for this command.
             // (target-specific SHELL/.SHELLFLAGS are already baked into the job's
             // shell/shell_flags fields by the scheduler.)
-            let child_status = if job.shell.contains(' ') {
-                let composed = format!("{} {} {}", job.shell, job.shell_flags, cmd);
-                let mut c = Command::new("/bin/sh");
-                c.arg("-c").arg(&composed);
-                apply_env_ops(&mut c, &job.env_ops, &job.extra_exports,
-                              &job.extra_unexports, &job.makelevel,
-                              job.gnumakeflags_was_set);
-                c.status()
-            } else {
+            //
+            // Tokenize SHELL into (program, extra args). The recipe `cmd` is
+            // always the final, single argv element. See exec/mod.rs for the
+            // rationale — the previous "compose into one /bin/sh -c string"
+            // branch lost the recipe-string boundary when SHELL had whitespace
+            // (e.g. `SHELL = /bin/sh -e`).
+            let child_status = {
+                let (shell_prog, shell_extra) = parse_shell_program_standalone(&job.shell);
                 let flags = parse_shell_flags_standalone(&job.shell_flags);
-                let mut c = Command::new(&job.shell);
+                let mut c = Command::new(&shell_prog);
+                for arg in &shell_extra {
+                    c.arg(arg);
+                }
                 for flag in &flags {
                     c.arg(flag);
                 }

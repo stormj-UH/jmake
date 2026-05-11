@@ -1892,3 +1892,139 @@ fn test_fn_value() {
     assert!(ok, "jmake failed: {}", err);
     assert_eq!(out.trim(), "hello $(X)");
 }
+
+// ── Regression: multi-word SHELL (e.g. `SHELL = /bin/sh -e`) ────────────────
+//
+// 1.2.2 and earlier: when SHELL contained whitespace, jmake composed the
+// invocation as a single shell string ("SHELL SHELLFLAGS cmd") and handed
+// it to `/bin/sh -c`.  The outer shell then re-tokenized the string,
+// destroying the recipe-string boundary: inner `cc -c -o out.o in.c`
+// became `argv = [..., "-c", "cc", "-c", "-o", "out.o", "in.c"]` so the
+// real `cc` ran with no input file.  Likewise, `if test ... ; then ... fi`
+// recipes failed with "syntax error near unexpected token 'then'".
+//
+// Fix: tokenize SHELL ourselves into (program, extra_args) and exec
+// `[program, ...extra_args, ...shellflags, recipe]` directly, mirroring
+// GNU Make.  The recipe is always the single final argv element.
+//
+// Python's `./configure` writes `SHELL=/bin/sh -e` by default, so this
+// bug broke `make python` on every cpython 3.x checkout.
+
+/// `SHELL = /bin/sh -e` with a recipe that has positional-looking words.
+/// Without the fix, the recipe was re-tokenized and `printf` saw no args.
+#[test]
+fn test_shell_with_flag_positional_args() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "\
+SHELL = /bin/sh -e
+all:
+\t@printf 'a=%s b=%s c=%s\\n' one two three
+", "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "a=one b=two c=three");
+}
+
+/// `SHELL = /bin/sh -e` with an inline `if test ... ; then ... fi` recipe.
+/// Without the fix, the inner `sh -e -c if test ... fi` had its command
+/// string truncated to `if` and the rest became positional args, producing
+/// "syntax error near unexpected token 'then'".
+#[test]
+fn test_shell_with_flag_if_then_fi() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "\
+SHELL = /bin/sh -e
+all:
+\t@if test -f /etc/hostname ; then echo HAVE-IT ; else echo NOPE ; fi
+", "all");
+    assert!(ok, "jmake failed: {}", err);
+    let t = out.trim();
+    assert!(t == "HAVE-IT" || t == "NOPE", "unexpected output: {:?}", out);
+}
+
+/// Multi-flag SHELL value: `SHELL = /bin/sh -e -u`.  The fix must tokenize
+/// at every whitespace boundary, not just the first.  All three trailing
+/// flags must reach the shell as separate argv elements.
+#[test]
+fn test_shell_with_multiple_flags() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "\
+SHELL = /bin/sh -e -u
+all:
+\t@SOME_DEFINED_VAR=hello ; echo \"v=$$SOME_DEFINED_VAR words=a b c\"
+", "all");
+    assert!(ok, "jmake failed: {}", err);
+    // The literal `b c` part must reach the shell as part of the recipe
+    // string, not get split off as positional args.  With the bug, the
+    // shell re-tokenized and `b` / `c` became $1 / $2 instead of staying
+    // in the echo argument.
+    assert_eq!(out.trim(), "v=hello words=a b c");
+}
+
+/// Plain `SHELL = /bin/sh` (no flag) — the no-regression baseline.  This
+/// path was already correct before the fix; the test guards against future
+/// changes accidentally regressing the no-whitespace case.
+#[test]
+fn test_shell_no_flag_baseline() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "\
+SHELL = /bin/sh
+all:
+\t@printf 'a=%s b=%s\\n' xx yy
+", "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "a=xx b=yy");
+}
+
+/// Parallel scheduler regression: same `SHELL = /bin/sh -e` bug must also
+/// be fixed in the worker path (exec/parallel.rs).  Run with `-j2` to push
+/// recipes through the parallel executor.
+#[test]
+fn test_shell_with_flag_parallel() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("Makefile"), "\
+SHELL = /bin/sh -e
+all: a.out b.out
+a.out:
+\t@printf 'a-args=%s,%s\\n' one two > $@
+b.out:
+\t@printf 'b-args=%s,%s\\n' three four > $@
+").unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new(&jmake)
+        .current_dir(dir.path())
+        .env("JMAKE_TEST_MODE", "1")
+        .arg("-j2")
+        .arg("all")
+        .output()
+        .expect("run jmake");
+    assert!(out.status.success(),
+        "jmake -j2 failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+
+    let a = std::fs::read_to_string(dir.path().join("a.out")).unwrap();
+    let b = std::fs::read_to_string(dir.path().join("b.out")).unwrap();
+    assert_eq!(a.trim(), "a-args=one,two");
+    assert_eq!(b.trim(), "b-args=three,four");
+}
+
+/// `.ONESHELL` with multi-word SHELL: the whole recipe is passed as one
+/// script to the multi-word shell.  Without the fix, `Command::new(self.shell)`
+/// tried to exec a binary literally named `/bin/sh -e`, which would fail
+/// with ENOENT.  The `@` on the first line suppresses recipe echoing for
+/// the whole ONESHELL block (GNU make rule: first-line prefix governs).
+#[test]
+fn test_shell_with_flag_oneshell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (out, err, ok) = mk_run(dir.path(), "\
+.ONESHELL:
+SHELL = /bin/sh -e
+all:
+\t@X=1
+\tY=2
+\techo \"sum=$$((X + Y)) tail=z\"
+", "all");
+    assert!(ok, "jmake failed: {}", err);
+    assert_eq!(out.trim(), "sum=3 tail=z");
+}
