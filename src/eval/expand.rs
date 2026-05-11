@@ -855,26 +855,38 @@ impl MakeState {
                     //      already borrowed — the debug_asserts below catch this.
                     //
                     // SAFETY:
-                    // - I1 (pointer validity): `self` is a valid, aligned reference
-                    //   to `MakeState`; casting `*const Self → *mut Self` gives a
-                    //   valid mutable raw pointer to the same allocation.
-                    // - I2 (no live map references): every `self.db.variables.get()`
-                    //   call in this file uses `.cloned()` before calling
-                    //   `expand_var_value`, so no `&Variable` reference into the
-                    //   IndexMap is live anywhere on the call stack above this point.
-                    //   `eval_string` may reallocate the map; that is safe only
-                    //   because of this cloning discipline.
+                    // - I1 (pointer validity): `self` is a valid, aligned, live
+                    //   reference to `MakeState`; the `*const Self as *mut Self`
+                    //   cast yields a valid raw pointer to the same allocation.
+                    //   No `NonNull` / type-level proof is available, but validity
+                    //   is guaranteed by Rust's borrow rules at the call site.
+                    // - I2 (no live IndexMap references): every
+                    //   `self.db.variables.get()` call in this file uses
+                    //   `.cloned()` before entering `expand_var_value`.  No
+                    //   `&Variable` reference into the IndexMap is alive anywhere
+                    //   on the current call stack.  `eval_string` may reallocate
+                    //   the map; that is safe precisely because of this cloning
+                    //   discipline.
                     // - I3 (no live RefCell borrows): `in_second_expansion`,
-                    //   `in_recipe_execution`, and `eval_pending` borrows taken
-                    //   earlier in this function were let-bindings that are now out
-                    //   of scope.  The debug_asserts below verify this at runtime in
-                    //   debug builds; a panic here indicates a re-entrancy bug.
-                    // - I4 (single-threaded): jmake never spawns threads during
-                    //   expansion; no concurrent write to `self` is possible.
+                    //   `in_recipe_execution`, `eval_pending`, and
+                    //   `expansion_caller_stack` borrows taken earlier in this
+                    //   function were let-bindings that have since gone out of
+                    //   scope.  The `debug_assert!` checks immediately below
+                    //   verify this at runtime in debug builds; a panic there
+                    //   indicates a re-entrancy bug.
+                    // - I4 (single-threaded): jmake does not spawn worker threads
+                    //   during expansion; no concurrent write to `*self_ptr` is
+                    //   possible.
                     // - KNOWN LIMITATION: the cast is not provably sound under
-                    //   Stacked Borrows / MIRI because `self: &Self` nominally
-                    //   aliases the mutation target.  The fully sound fix is
-                    //   wrapping `db` in `RefCell<MakeDatabase>` (deferred refactor).
+                    //   the Stacked Borrows model (Miri) because `self: &Self`
+                    //   nominally aliases the mutation target.  The fully sound
+                    //   fix is to wrap `db` in `RefCell<MakeDatabase>` (tracked,
+                    //   deferred).  Until then this block must not be called with
+                    //   Miri.
+                    //
+                    // #[cfg(kani)] — Kani harness opportunity (deferred):
+                    //   kani::assume(!self.eval_pending.try_borrow().is_err());
+                    //   etc., to formally verify the no-aliasing precondition.
                     debug_assert!(
                         self.eval_pending.try_borrow().is_ok(),
                         "eval_pending is exclusively borrowed at $(eval) call site — re-entrancy bug"
@@ -980,26 +992,31 @@ impl MakeState {
                         //      behind a RefCell, and this is the only mutation path).
                         //
                         // SAFETY:
-                        // - I1 (pointer validity): `self` is a valid, aligned
-                        //   reference; `*const Self as *mut Self` is a valid raw
-                        //   pointer to the same allocation.
-                        // - I2 (no live map references): `final_content` is a
-                        //   fully-owned `String`; it holds no reference into `self`.
-                        //   All `self.db.variables.get(...)` sites in this file use
-                        //   `.cloned()` before calling `expand_var_value`, so no
-                        //   `&Variable` reference into the IndexMap is live anywhere
-                        //   on the call stack above this point.  `eval_string` may
-                        //   reallocate the map; that is safe because of this
-                        //   cloning discipline.
+                        // - I1 (pointer validity): `self` is a valid, aligned,
+                        //   live reference to `MakeState`; `*const Self as *mut
+                        //   Self` yields a valid raw pointer to the same allocation.
+                        // - I2 (no live IndexMap references): `final_content` is a
+                        //   fully-owned `String` with no references into `self`.
+                        //   All `self.db.variables.get(...)` call sites in this
+                        //   file use `.cloned()` before entering `expand_var_value`,
+                        //   so no `&Variable` into the IndexMap is live on the call
+                        //   stack above this point.  `eval_string` may reallocate
+                        //   the map; that is safe because of the cloning discipline.
                         // - I3 (no live RefCell borrows): all RefCell borrow guards
-                        //   taken earlier in this function have gone out of scope
-                        //   before this block.  The debug_asserts below verify this
-                        //   at runtime in debug builds.
-                        // - I4 (single-threaded): jmake never spawns threads during
-                        //   expansion; no concurrent write to `self` is possible.
-                        // - KNOWN LIMITATION: not provably sound under Stacked
-                        //   Borrows / MIRI.  Fully sound fix: wrap `db` in
-                        //   `RefCell<MakeDatabase>` (deferred refactor).
+                        //   taken earlier in this function have gone out of scope.
+                        //   The `debug_assert!` checks immediately below verify
+                        //   this at runtime in debug builds; a panic indicates a
+                        //   re-entrancy bug.
+                        // - I4 (single-threaded): jmake does not spawn worker
+                        //   threads during expansion; no concurrent write to
+                        //   `*self_ptr` is possible.
+                        // - KNOWN LIMITATION: not provably sound under the Stacked
+                        //   Borrows model (Miri).  Fully sound fix: wrap `db` in
+                        //   `RefCell<MakeDatabase>` (tracked, deferred).
+                        //
+                        // #[cfg(kani)] — Kani harness opportunity (deferred):
+                        //   kani::assume(!self.eval_pending.try_borrow().is_err());
+                        //   etc., to formally verify the no-aliasing precondition.
                         debug_assert!(
                             self.eval_pending.try_borrow().is_ok(),
                             "eval_pending is exclusively borrowed at $(eval) call site — re-entrancy bug"
