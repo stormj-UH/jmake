@@ -177,6 +177,23 @@ fn builtin_var_names() -> &'static HashSet<&'static str> {
 // thread stack and kill the process with SIGSEGV.
 const MAX_EXPANSION_DEPTH: usize = 1000;
 
+/// Maximum byte length of a single expanded string value.
+///
+/// GNU Make imposes no such limit; jmake adds it as an
+/// allocation-bomb defence.  A Makefile with nested `$(foreach)`
+/// that doubles the word list at each level can exceed available
+/// RAM in ~25 iterations.  256 MiB is orders of magnitude larger
+/// than any legitimate Makefile value while still being far below
+/// what a modern system can absorb without OOM-killing the process.
+///
+/// This limit is checked in `expand_foreach` (the primary doubling
+/// attack path) and in the text-function helpers that materialise
+/// large lists (`fn_sort`, `fn_join` in `functions/mod.rs`).
+// SECURITY: without this limit a crafted Makefile can exhaust all
+// available memory via a chain of `:=` assignments each doubling
+// the previous value through `$(foreach x,$(L),$(x) $(x))`.
+pub const MAX_EXPANDED_VALUE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 impl MakeState {
     /// Expand all variable and function references in `input`, with no automatic
     /// variables in scope.
@@ -271,6 +288,25 @@ impl MakeState {
                             let content = &input[start..end];
                             let expanded = self.expand_reference(content, auto_vars);
                             result.push_str(&expanded);
+                            // SECURITY: guard against allocation-bomb strings produced by
+                            // e.g. `W1 := $(W0)$(W0)` doubling chains (without the foreach
+                            // guard, 28 such lines can expand to a 256 MiB string).
+                            if result.len() > MAX_EXPANDED_VALUE_BYTES {
+                                let file = self.current_file.borrow().clone();
+                                let line = *self.current_line.borrow();
+                                let loc = if file.is_empty() {
+                                    make_progname()
+                                } else if line == 0 {
+                                    file
+                                } else {
+                                    format!("{}:{}", file, line)
+                                };
+                                eprintln!(
+                                    "{}: *** expanded value exceeds maximum size ({} bytes).  Stop.",
+                                    loc, MAX_EXPANDED_VALUE_BYTES
+                                );
+                                std::process::exit(2);
+                            }
                             i = end + 1;
                         } else {
                             // Unmatched opening paren/brace: unterminated variable reference.
@@ -1475,23 +1511,31 @@ impl MakeState {
         let body_has_dollar = pat_dollar.as_deref().map(|pd| body.contains(pd)).unwrap_or(false);
         let body_needs_subst = body_has_paren || body_has_brace || body_has_dollar;
 
-        let results: Vec<String> = words.iter().map(|word| {
+        // SECURITY: accumulate output incrementally and abort early if the
+        // result would exceed MAX_EXPANDED_VALUE_BYTES.  A nested $(foreach)
+        // that doubles the word list at each level can otherwise exhaust all
+        // available RAM in ~25 iterations (each producing 2× the parent's
+        // output string).  We count bytes accumulated so far and bail out
+        // rather than allocating the final joined string.
+        let mut out = String::new();
+        let mut first_word = true;
+        for word in &words {
             // Replace all forms of the variable reference in the body before expanding:
             //   $(var), ${var}, and $v (single-char only)
             // Guard each replace() behind the pre-computed `contains` result so that
             // bodies without references to the loop variable avoid O(body_len) scans.
             let substituted: std::borrow::Cow<'_, str> = if body_needs_subst {
                 let mut s = if body_has_paren {
-                    body.replace(pat_paren.as_str(), word)
+                    body.replace(pat_paren.as_str(), *word)
                 } else {
                     body.to_string()
                 };
                 if body_has_brace {
-                    s = s.replace(pat_brace.as_str(), word);
+                    s = s.replace(pat_brace.as_str(), *word);
                 }
                 if body_has_dollar {
                     if let Some(ref pd) = pat_dollar {
-                        s = s.replace(pd.as_str(), word);
+                        s = s.replace(pd.as_str(), *word);
                     }
                 }
                 std::borrow::Cow::Owned(s)
@@ -1502,9 +1546,32 @@ impl MakeState {
             // the loop variable by name (after substitution) work correctly.
             let mut loop_auto_vars = auto_vars.clone();
             loop_auto_vars.insert(var.clone(), word.to_string());
-            self.expand_with_auto_vars(&substituted, &loop_auto_vars)
-        }).collect();
-        results.join(" ")
+            let expanded = self.expand_with_auto_vars(&substituted, &loop_auto_vars);
+
+            // Check accumulated output size before appending.
+            let sep_len = if first_word { 0 } else { 1 };
+            let new_len = out.len().saturating_add(sep_len).saturating_add(expanded.len());
+            if new_len > MAX_EXPANDED_VALUE_BYTES {
+                let file = self.current_file.borrow().clone();
+                let line = *self.current_line.borrow();
+                let loc = if file.is_empty() {
+                    make_progname()
+                } else if line == 0 {
+                    file
+                } else {
+                    format!("{}:{}", file, line)
+                };
+                eprintln!(
+                    "{}: *** $(foreach) output exceeds maximum value size ({} bytes).  Stop.",
+                    loc, MAX_EXPANDED_VALUE_BYTES
+                );
+                std::process::exit(2);
+            }
+            if !first_word { out.push(' '); }
+            out.push_str(&expanded);
+            first_word = false;
+        }
+        out
     }
 
     /// Implement the `$(file op filename[,text])` built-in.

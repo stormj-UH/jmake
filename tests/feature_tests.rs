@@ -2189,3 +2189,19 @@ all:
     assert!(ok, "jmake failed: {}", err);
     assert_eq!(out.trim(), "sum=3 tail=z");
 }
+
+// ── Security regression tests ──────────────────────────────────────────────────
+//
+// These tests verify that jmake's allocation-bomb defences are in place.
+// Each test constructs a Makefile that would exhaust memory without the guard
+// and verifies that jmake exits with a diagnostic instead of OOMing.
+
+/// Assignment-doubling allocation bomb: `S_n := $(S_{n-1})$(S_{n-1})` builds
+/// exponentially large strings.  Without the 256 MiB cap, 30 such lines
+/// exhaust all available RAM.  With the cap, jmake must exit 2 with the
+/// "expanded value exceeds maximum size" diagnostic.
+#[test]
+fn test_security_alloc_bomb() {
+    run_feature_test("security_alloc_bomb", &[]);
+}
+

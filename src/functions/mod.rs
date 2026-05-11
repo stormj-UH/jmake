@@ -148,6 +148,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use crate::eval::MAX_EXPANDED_VALUE_BYTES;
 
 pub type FnHandler = fn(args: &[String], expand: &dyn Fn(&str) -> String) -> String;
 
@@ -439,7 +440,19 @@ fn fn_sort(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let mut words: Vec<&str> = args[0].split_whitespace().collect();
     words.sort_unstable(); // unstable sort is faster and output order of duplicates is irrelevant
     words.dedup();
-    words.join(" ")
+    // SECURITY: the input string has already passed MAX_EXPANDED_VALUE_BYTES checks
+    // in the expansion engine, so the joined output here cannot exceed the input
+    // length (dedup only reduces the word count).  The guard below is a defence-in-
+    // depth check for any future code path that bypasses the expansion-engine check.
+    let joined = words.join(" ");
+    if joined.len() > MAX_EXPANDED_VALUE_BYTES {
+        eprintln!(
+            "make: *** $(sort) output exceeds maximum value size ({} bytes).  Stop.",
+            MAX_EXPANDED_VALUE_BYTES
+        );
+        std::process::exit(2);
+    }
+    joined
 }
 
 fn fn_word(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -593,6 +606,16 @@ fn fn_join(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
         if i > 0 { out.push(' '); }
         out.push_str(list1.get(i).unwrap_or(&""));
         out.push_str(list2.get(i).unwrap_or(&""));
+        // SECURITY: guard against allocation bomb when joining two very large lists.
+        // Each concatenated pair can be longer than either input word, so the joined
+        // output can exceed the sum of both input lists.
+        if out.len() > MAX_EXPANDED_VALUE_BYTES {
+            eprintln!(
+                "make: *** $(join) output exceeds maximum value size ({} bytes).  Stop.",
+                MAX_EXPANDED_VALUE_BYTES
+            );
+            std::process::exit(2);
+        }
     }
     out
 }
