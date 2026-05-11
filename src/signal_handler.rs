@@ -127,9 +127,22 @@ const _: () = assert!(MAX_MSG == 2048, "MAX_MSG sentinel — update if you chang
 // wrapper type that asserts `Sync` + `Send` under invariant I1.
 struct SyncBuffer<const N: usize>(UnsafeCell<[u8; N]>);
 
-// SAFETY: I1 — single-threaded; no concurrent access from multiple threads.
+// SAFETY:
+// - I1 (single-threaded writes): the only writers (set_temp_stdin_path,
+//   clear_temp_stdin_path, set_term_message, clear_term_message) are called
+//   exclusively from the main thread.  No concurrent write can occur.
+// - The signal handler (sigterm_handler) reads via raw pointer after an
+//   Acquire load of the length atomic (I2), so it never races with a write.
+// - Sharing the buffer as `&SyncBuffer` across thread boundaries is therefore
+//   safe: the caller invariant (I1) prevents simultaneous mutation.
 unsafe impl<const N: usize> Sync for SyncBuffer<N> {}
-// SAFETY: I1 — single-threaded; ownership transfer between threads never occurs.
+
+// SAFETY:
+// - I1 (single-threaded): SyncBuffer values are only ever constructed as
+//   `static` items (TEMP_FILE_BUF, TERM_MSG_BUF).  No code moves a
+//   SyncBuffer between threads.  Implementing Send satisfies the compiler's
+//   requirement for `static` items, and the invariant I1 ensures the impl is
+//   never exercised by an actual cross-thread transfer.
 unsafe impl<const N: usize> Send for SyncBuffer<N> {}
 
 impl<const N: usize> SyncBuffer<N> {
@@ -174,27 +187,31 @@ static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub fn set_temp_stdin_path(path: &str) {
     let bytes = path.as_bytes();
     let len = bytes.len().min(MAX_PATH - 1);
-    // I1 (single-threaded): no concurrent writer — enforced by the caller
-    // contract documented on this module (main thread only).
-    // I2 (Release/Acquire ordering): the store below happens-after this write.
-    // I3 (bounds): len ≤ MAX_PATH-1 by the .min() above.
-    // I4 (no aliasing): no live Rust reference into TEMP_FILE_BUF exists here.
-    debug_assert!(len < MAX_PATH, "path len {len} must be < MAX_PATH {MAX_PATH}");
-    debug_assert!(
+    // Constructor-time bounds check (not a hot path — called during setup only).
+    // assert! rather than debug_assert! so a bad caller is caught in release builds.
+    assert!(len < MAX_PATH, "path len {len} must be < MAX_PATH {MAX_PATH}");
+    assert!(
         len + 1 <= MAX_PATH,
-        "NUL terminator at offset {0} must be within buffer [0, {MAX_PATH})",
+        "NUL terminator at offset {} must be within buffer [0, {MAX_PATH})",
         len + 1
     );
     // SAFETY:
-    // - I1: jmake is single-threaded; no concurrent writer exists.
-    // - I2: pointer from UnsafeCell::get() — the approved way to obtain *mut
-    //   without constructing a &mut or & reference; no Rust reference to the
-    //   buffer interior is created.
-    // - I3: len ≤ MAX_PATH-1 (enforced by .min() and the debug_assert above),
-    //   so bytes [0..len] and the NUL at [len] are all within the array bounds.
-    // - I4: the Release store to TEMP_FILE_LEN below happens-after this write;
-    //   the signal handler loads with Acquire and therefore cannot observe a
-    //   partially-written buffer.
+    // - I1 (single-threaded): jmake is single-threaded at the point these
+    //   globals are written; no concurrent writer can race with this store.
+    //   Enforced by the module-level caller contract (main thread only).
+    // - I2 (pointer via UnsafeCell): `as_mut_ptr()` calls `UnsafeCell::get()`
+    //   which yields a raw `*mut u8` without materialising any Rust reference.
+    //   This is the language-approved path for interior mutability (I4).
+    // - I3 (bounds): `len ≤ MAX_PATH-1` is guaranteed by `.min(MAX_PATH - 1)`
+    //   above and enforced by the `assert!` above this block.  The NUL byte is
+    //   written at `[len]`, which is at most `[MAX_PATH-1]` — the last valid
+    //   index of an array of length `MAX_PATH`.
+    // - I4 (Release/Acquire ordering): the `Release` store to `TEMP_FILE_LEN`
+    //   immediately below this block happens-after the buffer write.  The
+    //   signal handler's `Acquire` load of `TEMP_FILE_LEN` therefore sees a
+    //   fully-written buffer; it never observes a partial write.
+    // - I5 (no live map or RefCell references): this function contains no
+    //   borrow guards; no `&` or `&mut` into the buffer interior exists.
     unsafe {
         let dst = TEMP_FILE_BUF.as_mut_ptr();
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
@@ -224,23 +241,31 @@ pub fn clear_temp_stdin_path() {
 pub fn set_term_message(msg: &str) {
     let bytes = msg.as_bytes();
     let len = bytes.len().min(MAX_MSG - 1);
-    // I1 (single-threaded): no concurrent writer — main thread only.
-    // I2 (Release/Acquire): store below happens-after the write.
-    // I3 (bounds): len ≤ MAX_MSG-1 by the .min() above.
-    // I4 (no aliasing): no live Rust reference into TERM_MSG_BUF exists here.
-    debug_assert!(len < MAX_MSG, "msg len {len} must be < MAX_MSG {MAX_MSG}");
-    debug_assert!(
+    // Constructor-time bounds check (not a hot path — called during recipe setup).
+    // assert! rather than debug_assert! so a bad caller is caught in release builds.
+    assert!(len < MAX_MSG, "msg len {len} must be < MAX_MSG {MAX_MSG}");
+    assert!(
         len + 1 <= MAX_MSG,
-        "NUL terminator at offset {0} must be within buffer [0, {MAX_MSG})",
+        "NUL terminator at offset {} must be within buffer [0, {MAX_MSG})",
         len + 1
     );
     // SAFETY:
-    // - I1: single-threaded; no concurrent writer.
-    // - I2: pointer from UnsafeCell::get(); no Rust reference materialised.
-    // - I3: len ≤ MAX_MSG-1 (enforced by .min() and debug_assert above),
-    //   so [0..len] and the NUL at [len] are within the array bounds.
-    // - I4: Release store below ensures the signal handler (Acquire load)
-    //   observes the complete buffer write.
+    // - I1 (single-threaded): jmake is single-threaded at the point these
+    //   globals are written; no concurrent writer can race with this store.
+    //   Enforced by the module-level caller contract (main thread only).
+    // - I2 (pointer via UnsafeCell): `as_mut_ptr()` calls `UnsafeCell::get()`
+    //   which yields a raw `*mut u8` without materialising any Rust reference.
+    //   This is the language-approved path for interior mutability (I4).
+    // - I3 (bounds): `len ≤ MAX_MSG-1` is guaranteed by `.min(MAX_MSG - 1)`
+    //   above and enforced by the `assert!` above this block.  The NUL byte is
+    //   written at `[len]`, which is at most `[MAX_MSG-1]` — the last valid
+    //   index of an array of length `MAX_MSG`.
+    // - I4 (Release/Acquire ordering): the `Release` store to `TERM_MSG_LEN`
+    //   immediately below this block happens-after the buffer write.  The
+    //   signal handler's `Acquire` load of `TERM_MSG_LEN` therefore sees a
+    //   fully-written buffer; it never observes a partial write.
+    // - I5 (no live references): this function contains no borrow guards;
+    //   no `&` or `&mut` into the buffer interior is ever alive here.
     unsafe {
         let dst = TERM_MSG_BUF.as_mut_ptr();
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
@@ -286,13 +311,17 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     let msg_len = TERM_MSG_LEN.load(Ordering::Acquire);
     if msg_len > 0 {
         // SAFETY:
-        // - I2/I3: msg_len was stored with Release by set_term_message after
-        //   writing the buffer; we load with Acquire, so the buffer write is
-        //   visible here.
-        // - as_ptr() returns the UnsafeCell interior pointer; msg_len ≤ MAX_MSG-1
-        //   so the pointer range [0, msg_len) is within the array.
-        // - No Rust reference to TERM_MSG_BUF is created; we use a raw pointer.
-        // - libc::write is async-signal-safe.
+        // - msg_len is non-zero (checked above) and ≤ MAX_MSG-1 because
+        //   set_term_message caps it with `.min(MAX_MSG - 1)` before storing.
+        // - I2 (Release/Acquire): msg_len was stored with `Release` by
+        //   set_term_message *after* the buffer bytes were written; this
+        //   `Acquire` load therefore observes a fully-written buffer.
+        // - TERM_MSG_BUF.as_ptr() returns the UnsafeCell interior pointer
+        //   (`*const u8`) without creating a Rust reference; the range
+        //   [ptr, ptr + msg_len) lies within the MAX_MSG-byte array (I5).
+        // - No heap allocation or lock acquisition occurs (I3: async-signal-safe).
+        // - libc::write(STDERR_FILENO, …) is async-signal-safe per
+        //   POSIX.1-2017 §2.4.3.
         unsafe {
             libc::write(
                 libc::STDERR_FILENO,
@@ -306,12 +335,17 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     let path_len = TEMP_FILE_LEN.load(Ordering::Acquire);
     if path_len > 0 {
         // SAFETY:
-        // - I2/I3: path_len was stored with Release by set_temp_stdin_path after
-        //   writing the buffer and the NUL terminator; Acquire load sees the full write.
-        // - as_ptr() is the UnsafeCell interior pointer; the byte at [path_len] is 0
-        //   (NUL terminator written by set_temp_stdin_path), so it is a valid C string.
-        // - No Rust reference is created; raw pointer used throughout.
-        // - libc::unlink is async-signal-safe.
+        // - path_len is non-zero (checked above) and ≤ MAX_PATH-1 because
+        //   set_temp_stdin_path caps it with `.min(MAX_PATH - 1)` before storing.
+        // - I2 (Release/Acquire): path_len was stored with `Release` by
+        //   set_temp_stdin_path *after* writing path bytes AND the NUL byte at
+        //   [path_len]; this `Acquire` load therefore observes a fully-written,
+        //   NUL-terminated C string.
+        // - TEMP_FILE_BUF.as_ptr() returns the UnsafeCell interior pointer
+        //   without creating a Rust reference; the NUL at [path_len] makes the
+        //   pointed-to region a valid C string (I5).
+        // - No heap allocation or lock acquisition occurs (I3: async-signal-safe).
+        // - libc::unlink is async-signal-safe per POSIX.1-2017 §2.4.3.
         unsafe {
             libc::unlink(TEMP_FILE_BUF.as_ptr() as *const libc::c_char);
         }
@@ -319,10 +353,15 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 
     // Reset SIGTERM to default and re-raise to die with signal 15 status.
     // SAFETY:
-    // - libc::signal and libc::raise are async-signal-safe per POSIX.
-    // - SIG_DFL is a valid signal disposition.
-    // - Passing SIGTERM to raise() kills the current process; control does
-    //   not return from this block in normal operation.
+    // - libc::signal(SIGTERM, SIG_DFL) resets the disposition to the default
+    //   (terminate); SIG_DFL is always a valid sighandler_t value.
+    // - libc::raise(SIGTERM) sends SIGTERM to the calling process; with the
+    //   disposition reset to SIG_DFL, the process terminates immediately and
+    //   the caller sees a signal-killed exit status (not exit code 1).
+    // - Both libc::signal and libc::raise are async-signal-safe per
+    //   POSIX.1-2017 §2.4.3.
+    // - No heap allocation, no locks, no Rust references involved (I3).
+    // - Normal control flow does not continue past libc::raise(SIGTERM).
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::raise(libc::SIGTERM);
@@ -340,15 +379,23 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 // NOTE: Panic/drop safety: libc::signal is an FFI call; it cannot unwind into Rust.
 pub fn install_sigterm_handler() {
     // SAFETY:
-    // - libc::signal is an FFI call to the POSIX signal(2) syscall.
+    // - libc::signal is an FFI call to the POSIX signal(2) syscall; it cannot
+    //   unwind into Rust.
+    // - `sigterm_handler` is declared `extern "C"` and matches the C
+    //   `sighandler_t` ABI (fn(c_int)).  The explicit local binding
+    //   `handler: extern "C" fn(libc::c_int)` documents the ABI and allows
+    //   the cast to `sighandler_t` without a direct fn-item-to-integer cast
+    //   (which Rust ≥1.94 forbids).
     // - sigterm_handler satisfies the async-signal-safe contract: it calls
-    //   only write, unlink, signal, raise (all POSIX async-signal-safe).
-    // - The two-step cast (fn item → fn pointer → sighandler_t) is required
-    //   because Rust ≥1.94 forbids direct fn-item-to-integer casts.  The
-    //   intermediate `extern "C" fn(c_int)` pointer has the same ABI as the
-    //   C `sighandler_t` type.
-    // - I2: set_temp_stdin_path / set_term_message must be called (if needed)
-    //   before the next SIGTERM is delivered; the caller owns this ordering.
+    //   only write(2), unlink(2), signal(2), raise(2) — all listed as
+    //   async-signal-safe in POSIX.1-2017 §2.4.3.  It performs no heap
+    //   allocation, takes no locks, and dereferences no Rust references.
+    // - I1 (single-threaded install): this function is called once from the
+    //   main thread before any recipes execute.  No concurrent call to
+    //   set_*/clear_* can race with the libc::signal() call.
+    // - I2 (buffer-before-handler ordering): set_temp_stdin_path and
+    //   set_term_message must be called (with their Release stores) before
+    //   the first SIGTERM is delivered; the caller owns this ordering.
     unsafe {
         let handler: extern "C" fn(libc::c_int) = sigterm_handler;
         libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
@@ -374,9 +421,14 @@ mod tests {
 
         // The NUL terminator must sit at index MAX_PATH-1, which is within the
         // MAX_PATH-element buffer (valid indices 0..MAX_PATH-1 inclusive).
-        // SAFETY: stored_len == MAX_PATH-1 < MAX_PATH; reading one byte at that
-        // offset is within the buffer.  No other code mutates the buffer
-        // concurrently (single-threaded test).
+        // SAFETY:
+        // - stored_len == MAX_PATH-1 (asserted above), which is < MAX_PATH, so
+        //   `as_ptr().add(stored_len)` points to a valid byte inside the array.
+        // - `as_ptr()` yields the UnsafeCell interior pointer without creating
+        //   a Rust reference (I4); `.read()` performs a volatile-equivalent
+        //   single-byte load — no aliasing hazard.
+        // - This is a single-threaded test; no concurrent mutation of the
+        //   buffer can occur (I1).
         let nul_byte = unsafe { TEMP_FILE_BUF.as_ptr().add(stored_len).read() };
         assert_eq!(nul_byte, 0u8, "byte at [stored_len] must be NUL terminator");
 
