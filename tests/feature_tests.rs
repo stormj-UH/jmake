@@ -120,6 +120,167 @@ fn test_wildcard_variants() {
 #[test] fn test_include_variants()      { run_feature_test("include_variants",      &[]); }
 #[test] fn test_tab_var_conditional()   { run_feature_test("tab_var_conditional",   &[]); }
 #[test] fn test_bare_colon_conditional(){ run_feature_test("bare_colon_conditional",&[]); }
+#[test]
+fn test_static_pattern_prereq_merge() {
+    // The .mk references src/a.c and src/b.c relative to tests/feature/.
+    // Create them before the run and remove after so the test is hermetic.
+    let fixture_dir = feature_dir().join("src");
+    std::fs::create_dir_all(&fixture_dir).expect("create tests/feature/src");
+    std::fs::File::create(fixture_dir.join("a.c")).expect("create a.c");
+    std::fs::File::create(fixture_dir.join("b.c")).expect("create b.c");
+    let result = std::panic::catch_unwind(|| {
+        run_feature_test_with_setup("static_pattern_prereq_merge", &[], || {});
+    });
+    // Best-effort cleanup: remove the .c files but leave the dir in case other
+    // tests rely on its existence.
+    let _ = std::fs::remove_file(fixture_dir.join("a.c"));
+    let _ = std::fs::remove_file(fixture_dir.join("b.c"));
+    let _ = std::fs::remove_dir(&fixture_dir);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+// ── Static pattern rule: prerequisite merge variants ─────────────────────────
+//
+// These tests harden the fix for "static pattern rule prerequisite merge":
+// GNU Make merges prerequisites across multiple static pattern rule declarations
+// for the same target list, and warns (but doesn't error) when a target doesn't
+// match the target pattern in a given declaration.
+
+/// Reversed ordering: recipe-bearing decl comes FIRST, prereq-only decl SECOND.
+/// Both patterns match all targets — the classic merge case.
+#[test]
+fn test_static_pattern_merge_recipe_first() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.c"), "").unwrap();
+    std::fs::write(src.join("b.c"), "").unwrap();
+
+    // Recipe comes before the prereq-only declaration.
+    let mk = format!(concat!(
+        "OBJS = {src}/a.o {src}/b.o\n",
+        "all: $(OBJS)\n",
+        "\t@echo done\n",
+        "\n",
+        "# decl1: recipe, no prereqs\n",
+        "$(OBJS): %.o:\n",
+        "\t@echo CC $@ $<\n",
+        "\n",
+        "# decl2: prereqs, no recipe — pattern must match\n",
+        "$(OBJS): {src}/%.o: {src}/%.c\n",
+    ), src = src.display());
+    std::fs::write(tmp.path().join("Makefile"), mk).unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} 2>&1", jmake.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run jmake");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "jmake failed:\n{}", stdout);
+    // $< must be non-empty (the .c file)
+    assert!(stdout.contains(&format!("CC {}/a.o {}/a.c", src.display(), src.display())),
+        "expected $< = .c path; got:\n{}", stdout);
+    assert!(stdout.contains("done"), "expected 'done'; got:\n{}", stdout);
+}
+
+/// Three-way split: three separate declarations each contributing different info.
+/// decl A: prereqs only
+/// decl B: empty prereqs, no recipe (extra dep-only declaration)
+/// decl C: recipe only, non-matching pattern → warning issued
+#[test]
+fn test_static_pattern_merge_three_way() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.c"), "").unwrap();
+
+    // decl A: matches, provides prereq src/a.c
+    // decl B: matches, adds no new prereq
+    // decl C: does NOT match (prefix "pfx/"), emits warning, still provides recipe
+    let mk = format!(concat!(
+        "OBJS = {src}/a.o\n",
+        "all: $(OBJS)\n",
+        "\t@echo done\n",
+        "\n",
+        "$(OBJS): {src}/%.o: {src}/%.c\n",
+        "\n",
+        "$(OBJS): {src}/%.o:\n",
+        "\n",
+        "$(OBJS): pfx/%.o:\n",
+        "\t@echo CC $@ $<\n",
+    ), src = src.display());
+    std::fs::write(tmp.path().join("Makefile"), mk).unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} 2>&1", jmake.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run jmake");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "jmake failed:\n{}", stdout);
+    // The warning must be emitted
+    assert!(stdout.contains("doesn't match the target pattern"),
+        "expected mismatch warning; got:\n{}", stdout);
+    // $< must still be the .c file from decl A
+    assert!(stdout.contains(&format!("CC {}/a.o {}/a.c", src.display(), src.display())),
+        "expected $< = .c path; got:\n{}", stdout);
+}
+
+/// All targets in OBJS fail to match the target pattern: every target gets the
+/// "doesn't match" warning, and the recipe is still associated with each target.
+/// The prerequisite from a prior decl fills $<.
+#[test]
+fn test_static_pattern_all_unmatched_with_recipe() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("s");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("x.c"), "").unwrap();
+    std::fs::write(src.join("y.c"), "").unwrap();
+
+    // decl1: matches all OBJS, provides prereqs
+    // decl2: "nomatch/%.o" — matches NONE of the targets → warnings + recipe
+    let mk = format!(concat!(
+        "OBJS = {src}/x.o {src}/y.o\n",
+        "all: $(OBJS)\n",
+        "\t@echo all-done\n",
+        "\n",
+        "$(OBJS): {src}/%.o: {src}/%.c\n",
+        "\n",
+        "$(OBJS): nomatch/%.o:\n",
+        "\t@echo BUILT $@ from $<\n",
+    ), src = src.display());
+    std::fs::write(tmp.path().join("Makefile"), mk).unwrap();
+
+    let jmake = jmake_bin();
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} 2>&1", jmake.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("run jmake");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "jmake failed:\n{}", stdout);
+    // Both targets must warn about mismatch
+    let warn_count = stdout.matches("doesn't match the target pattern").count();
+    assert_eq!(warn_count, 2,
+        "expected 2 mismatch warnings, got {}:\n{}", warn_count, stdout);
+    // Both targets must be built with correct $<
+    assert!(stdout.contains(&format!("BUILT {}/x.o from {}/x.c", src.display(), src.display())),
+        "x.o not built correctly:\n{}", stdout);
+    assert!(stdout.contains(&format!("BUILT {}/y.o from {}/y.c", src.display(), src.display())),
+        "y.o not built correctly:\n{}", stdout);
+    assert!(stdout.contains("all-done"), "expected 'all-done':\n{}", stdout);
+}
 
 // ── Regression tests: wildcard with absolute path and no-prefix (CWD-relative) ──
 //

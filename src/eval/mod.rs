@@ -2077,7 +2077,7 @@ impl MakeState {
                     parser.in_recipe = true;
                     current_rule = Some(rule);
                 }
-                ParsedLine::StaticPatternExpansion(expanded_rules) => {
+                ParsedLine::StaticPatternExpansion { rules: expanded_rules, unmatched } => {
                     // Flush the previous current_rule (and any siblings from a
                     // prior static pattern rule in this same block).
                     if let Some(prev) = current_rule.take() {
@@ -2091,7 +2091,19 @@ impl MakeState {
                         self.register_rule(prev);
                     }
 
+                    // Emit GNU Make-compatible warnings for targets that did not
+                    // match the target pattern.  These warnings always use the
+                    // file:lineno prefix, never the progname prefix.
+                    let fname = parser.filename.to_string_lossy();
+                    for target in &unmatched {
+                        eprintln!("{}:{}: target `{}' doesn't match the target pattern",
+                            fname, lineno, target);
+                    }
+                    drop(fname);
+
                     if expanded_rules.is_empty() {
+                        // The OBJS target list was empty (unusual but valid).
+                        // Nothing to collect recipe lines for — stay in non-recipe mode.
                         static_rule_siblings.clear();
                         parser.in_recipe = false;
                         continue;

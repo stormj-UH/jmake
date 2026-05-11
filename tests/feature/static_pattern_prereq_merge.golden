@@ -1,0 +1,5 @@
+static_pattern_prereq_merge.mk:24: target `src/a.o' doesn't match the target pattern
+static_pattern_prereq_merge.mk:24: target `src/b.o' doesn't match the target pattern
+CC src/a.o src/a.c
+CC src/b.o src/b.c
+done
