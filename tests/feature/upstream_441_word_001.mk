@@ -1,0 +1,20 @@
+string  := word.pl general_test2.pl   FORCE.pl word.pl generic_test.perl MAKEFILES_variable.pl
+string2 := $(string) $(string) $(string) $(string) $(string) $(string) $(string)
+string3 := $(string2) $(string2) $(string2) $(string2) $(string2) $(string2) $(string2)
+string4 := $(string3) $(string3) $(string3) $(string3) $(string3) $(string3) $(string3)
+.RECIPEPREFIX = >
+all:
+> @echo $(words $(string))
+> @echo $(words $(string4))
+> @echo $(word 1, $(string))
+> @echo $(word 100, $(string))
+> @echo $(word 1  , $(string))
+> @echo $(word 1000, $(string3))
+> @echo $(word 9223372036854775807, $(string2))
+> @echo $(wordlist 3, 4, $(string))
+> @echo $(wordlist 4, 3, $(string))
+> @echo $(wordlist 1 , 6  , $(string))
+> @echo $(wordlist 5,7, $(string))
+> @echo $(wordlist 100, 110, $(string))
+> @echo $(wordlist 7, 10, $(string2))
+> @echo $(wordlist 9223372036854775807, 0, $(string2))
