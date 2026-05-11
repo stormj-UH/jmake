@@ -1,0 +1,2 @@
+all: ; @echo hello=$(hello) hello=$$hello
+export hello=sun
