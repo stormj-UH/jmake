@@ -697,11 +697,15 @@ impl MakeState {
             format!("%{}", replacement)
         };
 
-        let words: Vec<&str> = var_value.split_whitespace().collect();
-        let results: Vec<String> = words.iter()
-            .map(|w| functions::patsubst_word(w, &full_pattern, &full_replacement))
-            .collect();
-        results.join(" ")
+        // Direct-push avoids Vec<&str> + Vec<String> + join allocation triple.
+        let mut out = String::new();
+        let mut first = true;
+        for w in var_value.split_whitespace() {
+            if !first { out.push(' '); }
+            out.push_str(&functions::patsubst_word(w, &full_pattern, &full_replacement));
+            first = false;
+        }
+        out
     }
 
     /// Expand a built-in function call `$(name args_str)`.
@@ -1475,36 +1479,46 @@ impl MakeState {
         let body_has_dollar = pat_dollar.as_deref().map(|pd| body.contains(pd)).unwrap_or(false);
         let body_needs_subst = body_has_paren || body_has_brace || body_has_dollar;
 
-        let results: Vec<String> = words.iter().map(|word| {
+        // Clone the base auto_vars once outside the loop.  Inside the loop we
+        // insert the loop variable, expand, then remove it — so the map is
+        // re-used every iteration instead of being cloned O(words) times.
+        // The remove() at the end of each iteration restores the map to the
+        // pre-loop state, which is correct for nested foreach as well.
+        let mut loop_auto_vars = auto_vars.clone();
+        let mut out = String::new();
+        let mut first = true;
+        for word in &words {
             // Replace all forms of the variable reference in the body before expanding:
             //   $(var), ${var}, and $v (single-char only)
             // Guard each replace() behind the pre-computed `contains` result so that
             // bodies without references to the loop variable avoid O(body_len) scans.
             let substituted: std::borrow::Cow<'_, str> = if body_needs_subst {
                 let mut s = if body_has_paren {
-                    body.replace(pat_paren.as_str(), word)
+                    body.replace(pat_paren.as_str(), *word)
                 } else {
                     body.to_string()
                 };
                 if body_has_brace {
-                    s = s.replace(pat_brace.as_str(), word);
+                    s = s.replace(pat_brace.as_str(), *word);
                 }
                 if body_has_dollar {
                     if let Some(ref pd) = pat_dollar {
-                        s = s.replace(pd.as_str(), word);
+                        s = s.replace(pd.as_str(), *word);
                     }
                 }
                 std::borrow::Cow::Owned(s)
             } else {
                 std::borrow::Cow::Borrowed(body)
             };
-            // Pass the current word in auto_vars so nested expansions that reference
-            // the loop variable by name (after substitution) work correctly.
-            let mut loop_auto_vars = auto_vars.clone();
+            // Mutate the shared map for this iteration, restore after.
             loop_auto_vars.insert(var.clone(), word.to_string());
-            self.expand_with_auto_vars(&substituted, &loop_auto_vars)
-        }).collect();
-        results.join(" ")
+            let expanded = self.expand_with_auto_vars(&substituted, &loop_auto_vars);
+            loop_auto_vars.remove(&var);
+            if !first { out.push(' '); }
+            out.push_str(&expanded);
+            first = false;
+        }
+        out
     }
 
     /// Implement the `$(file op filename[,text])` built-in.

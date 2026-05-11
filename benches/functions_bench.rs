@@ -66,6 +66,88 @@ fn new_filter_out(patterns_str: &str, words_str: &str) -> String {
     out
 }
 
+// ── sort ──────────────────────────────────────────────────────────────────────
+
+fn old_sort(words_str: &str) -> String {
+    let mut words: Vec<&str> = words_str.split_whitespace().collect();
+    words.sort_unstable();
+    words.dedup();
+    words.join(" ")
+}
+
+fn new_sort(words_str: &str) -> String {
+    let mut words: Vec<&str> = words_str.split_whitespace().collect();
+    words.sort_unstable();
+    words.dedup();
+    let mut out = String::new();
+    let mut first = true;
+    for w in &words {
+        if !first { out.push(' '); }
+        out.push_str(w);
+        first = false;
+    }
+    out
+}
+
+// ── substitution ref ──────────────────────────────────────────────────────────
+
+/// Simplified patsubst_word: percent pattern, replaces stem.
+fn patsubst_word_simple(w: &str, pattern: &str, replacement: &str) -> String {
+    // only handles the `prefix%suffix` form, sufficient for bench
+    let pct = pattern.find('%').unwrap_or(pattern.len());
+    let prefix = &pattern[..pct];
+    let suffix = if pct < pattern.len() { &pattern[pct+1..] } else { "" };
+    if w.starts_with(prefix) && w.ends_with(suffix) && w.len() >= prefix.len() + suffix.len() {
+        let stem = &w[prefix.len()..w.len()-suffix.len()];
+        let rpct = replacement.find('%').unwrap_or(replacement.len());
+        let rpfx = &replacement[..rpct];
+        let rsfx = if rpct < replacement.len() { &replacement[rpct+1..] } else { "" };
+        format!("{}{}{}", rpfx, stem, rsfx)
+    } else {
+        w.to_string()
+    }
+}
+
+fn old_subst_ref(words_str: &str, pattern: &str, replacement: &str) -> String {
+    let words: Vec<&str> = words_str.split_whitespace().collect();
+    let results: Vec<String> = words.iter()
+        .map(|w| patsubst_word_simple(w, pattern, replacement))
+        .collect();
+    results.join(" ")
+}
+
+fn new_subst_ref(words_str: &str, pattern: &str, replacement: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for w in words_str.split_whitespace() {
+        if !first { out.push(' '); }
+        out.push_str(&patsubst_word_simple(w, pattern, replacement));
+        first = false;
+    }
+    out
+}
+
+// ── realpath/abspath (IO-less path normalization stand-in) ────────────────────
+
+fn old_abspath_sim(words_str: &str, cwd: &str) -> String {
+    let words: Vec<&str> = words_str.split_whitespace().collect();
+    let results: Vec<String> = words.iter().map(|w| format!("{}/{}", cwd, w)).collect();
+    results.join(" ")
+}
+
+fn new_abspath_sim(words_str: &str, cwd: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for w in words_str.split_whitespace() {
+        if !first { out.push(' '); }
+        out.push_str(cwd);
+        out.push('/');
+        out.push_str(w);
+        first = false;
+    }
+    out
+}
+
 fn bench<F: Fn() -> String>(name: &str, iters: u32, f: F) -> f64 {
     // Warm up
     for _ in 0..10 { let _ = f(); }
@@ -104,4 +186,23 @@ fn main() {
     let old_f = bench("old: collect+join",  n, || old_filter_out(&pats50, &words1000));
     let new_f = bench("new: push_str direct", n, || new_filter_out(&pats50, &words1000));
     println!("  speedup: {:.2}x", old_f / new_f);
+
+    println!("\n=== sort+dedup (1000 words) ===");
+    let old_s = bench("old: dedup+join",       n, || old_sort(&words1000));
+    let new_s = bench("new: dedup+push_str",   n, || new_sort(&words1000));
+    println!("  speedup: {:.2}x", old_s / new_s);
+
+    println!("\n=== substitution-ref (1000 words, %.c -> %.o) ===");
+    let pat = "%.c";
+    let repl = "%.o";
+    let words_c: String = (1..=1000).map(|i| format!("src{}.c", i)).collect::<Vec<_>>().join(" ");
+    let old_sr = bench("old: Vec+map+join",     n, || old_subst_ref(&words_c, pat, repl));
+    let new_sr = bench("new: push_str direct",  n, || new_subst_ref(&words_c, pat, repl));
+    println!("  speedup: {:.2}x", old_sr / new_sr);
+
+    println!("\n=== abspath-sim (1000 words, cwd prefix) ===");
+    let cwd = "/home/user/project";
+    let old_ab = bench("old: Vec+format+join",  n, || old_abspath_sim(&words1000, cwd));
+    let new_ab = bench("new: push_str direct",  n, || new_abspath_sim(&words1000, cwd));
+    println!("  speedup: {:.2}x", old_ab / new_ab);
 }

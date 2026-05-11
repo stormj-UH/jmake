@@ -439,7 +439,15 @@ fn fn_sort(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let mut words: Vec<&str> = args[0].split_whitespace().collect();
     words.sort_unstable(); // unstable sort is faster and output order of duplicates is irrelevant
     words.dedup();
-    words.join(" ")
+    // Direct-push avoids a second Vec<String> allocation that .join(" ") requires.
+    let mut out = String::new();
+    let mut first = true;
+    for w in &words {
+        if !first { out.push(' '); }
+        out.push_str(w);
+        first = false;
+    }
+    out
 }
 
 fn fn_word(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -455,13 +463,19 @@ fn fn_word(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 fn fn_wordlist(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let s: usize = args[0].trim().parse().unwrap_or(0);
     let e: usize = args[1].trim().parse().unwrap_or(0);
-    let words: Vec<&str> = args[2].split_whitespace().collect();
-    if s >= 1 && s <= words.len() && e >= s {
-        let end = e.min(words.len());
-        words[s-1..end].join(" ")
-    } else {
-        String::new()
+    if s < 1 || e < s {
+        return String::new();
     }
+    // Iterate split_whitespace with skip/take directly into one String,
+    // avoiding both the Vec<&str> collect and the final join allocation.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[2].split_whitespace().skip(s - 1).take(e - s + 1) {
+        if !first { out.push(' '); }
+        out.push_str(w);
+        first = false;
+    }
+    out
 }
 
 fn fn_words(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -605,7 +619,11 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     // to that of a shell script: the author of the Makefile owns the paths it
     // can access.  No sanitisation is applied here.
     let patterns: Vec<&str> = args[0].split_whitespace().collect();
-    let mut results = Vec::new();
+    // Accumulate matches across patterns directly into one String to avoid a
+    // Vec<String> allocation + final join. `matches` stays a Vec because
+    // GNU Make sorts each pattern's hits before emitting them.
+    let mut results = String::new();
+    let mut first = true;
     for pattern in patterns {
         let mut matches = Vec::new();
         // GNU Make preserves the pattern's directory prefix in its output.
@@ -703,9 +721,13 @@ fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
         }
         // GNU Make sorts wildcard results lexicographically
         matches.sort();
-        results.extend(matches);
+        for m in matches {
+            if !first { results.push(' '); }
+            results.push_str(&m);
+            first = false;
+        }
     }
-    results.join(" ")
+    results
 }
 
 fn fn_realpath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -713,11 +735,16 @@ fn fn_realpath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     // $(realpath ../../etc/passwd) resolves the symlink chain and returns the
     // canonical path.  This is intended behavior; the Makefile author is trusted.
     // SECURITY: verified — no sanitisation required.
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    let results: Vec<String> = words.iter().filter_map(|w| {
-        std::fs::canonicalize(w).ok().map(|p| p.to_string_lossy().to_string())
-    }).collect();
-    results.join(" ")
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
+        if let Ok(p) = std::fs::canonicalize(w) {
+            if !first { out.push(' '); }
+            out.push_str(&p.to_string_lossy());
+            first = false;
+        }
+    }
+    out
 }
 
 fn fn_abspath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -725,17 +752,21 @@ fn fn_abspath(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     // $(abspath ../../etc/passwd) normalises the path without resolving symlinks.
     // The Makefile author is trusted; no path filtering is applied.
     // SECURITY: verified — no sanitisation required.
-    let words: Vec<&str> = args[0].split_whitespace().collect();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let results: Vec<String> = words.iter().map(|w| {
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
         let p = Path::new(w);
-        if p.is_absolute() {
+        let norm = if p.is_absolute() {
             normalize_path(p)
         } else {
             normalize_path(&cwd.join(p))
-        }
-    }).collect();
-    results.join(" ")
+        };
+        if !first { out.push(' '); }
+        out.push_str(&norm);
+        first = false;
+    }
+    out
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -802,19 +833,25 @@ fn fn_and(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
 
 fn fn_foreach(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
     let var = args[0].trim();
-    let list: Vec<&str> = args[1].split_whitespace().collect();
     let body = &args[2];
 
-    let results: Vec<String> = list.iter().map(|word| {
+    // Write directly into one String to avoid both the Vec<&str> word collect
+    // and the Vec<String> result collect + join.
+    let mut out = String::new();
+    let mut first = true;
+    for word in args[1].split_whitespace() {
         // Replace $(var), ${var}, and $v (single-char) in body with word, then expand
         let mut substituted = body.replace(&format!("$({})", var), word)
                                   .replace(&format!("${{{}}}", var), word);
         if var.len() == 1 {
             substituted = substituted.replace(&format!("${}", var), word);
         }
-        expand(&substituted)
-    }).collect();
-    results.join(" ")
+        let expanded = expand(&substituted);
+        if !first { out.push(' '); }
+        out.push_str(&expanded);
+        first = false;
+    }
+    out
 }
 
 fn fn_file(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -1044,9 +1081,18 @@ fn fn_let(args: &[String], expand: &dyn Fn(&str) -> String) -> String {
     let mut substituted = body.clone();
     for (i, var) in vars.iter().enumerate() {
         let val: String = if i == vars.len() - 1 {
-            // Last variable gets all remaining words
-            let remaining: Vec<&str> = if i < words.len() { words[i..].to_vec() } else { vec![] };
-            remaining.join(" ")
+            // Last variable gets all remaining words.  Build the joined value
+            // directly to skip the intermediate Vec<&str> + join allocation.
+            let mut joined = String::new();
+            if i < words.len() {
+                let mut first = true;
+                for w in &words[i..] {
+                    if !first { joined.push(' '); }
+                    joined.push_str(w);
+                    first = false;
+                }
+            }
+            joined
         } else if i < words.len() {
             words[i].to_string()
         } else {
