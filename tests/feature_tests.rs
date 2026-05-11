@@ -130,6 +130,14 @@ fn test_wildcard_variants() {
 /// This is the Valkey src/Makefile pattern (lines 145/166) that caused
 /// `/bin/sh: FINAL_LIBS: inaccessible or not found` during the link step.
 #[test] fn test_tab_assignment_in_ifeq() { run_feature_test("tab_assignment_in_ifeq", &[]); }
+/// Bug C: A tab-indented `:=` (Simple/immediate) assignment inside an ifeq block
+/// must expand its RHS at assignment time, not store it verbatim.
+/// Valkey src/Makefile line 295 (inside `ifeq ($(MALLOC),jemalloc)`):
+///   	FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
+/// Without the fix jmake stored FINAL_LIBS verbatim, creating a self-referential
+/// recursive variable.  The LINK recipe then emitted an unexpanded `$(FINAL_LIBS)`
+/// shell subshell, causing `/bin/sh: FINAL_LIBS: inaccessible or not found`.
+#[test] fn test_tab_simple_assign_ifeq() { run_feature_test("tab_simple_assign_ifeq", &[]); }
 #[test]
 fn test_static_pattern_prereq_merge() {
     // The .mk references src/a.c and src/b.c relative to tests/feature/.
