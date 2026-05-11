@@ -2205,3 +2205,12 @@ fn test_security_alloc_bomb() {
     run_feature_test("security_alloc_bomb", &[]);
 }
 
+/// Terminal escape injection: $(info) and $(warning) must not corrupt the
+/// developer's terminal when they contain ANSI escape sequences.
+/// When output is piped (non-TTY, as in `cargo test`), no sanitisation is
+/// applied (so this test verifies the non-TTY pass-through path does not
+/// accidentally strip legitimate output).
+#[test]
+fn test_security_escape_injection() {
+    run_feature_test("security_escape_injection", &[]);
+}
