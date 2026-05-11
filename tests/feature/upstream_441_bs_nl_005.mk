@@ -1,0 +1,2 @@
+fast:;@echo fa\
+	st

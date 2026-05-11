@@ -1,0 +1,3 @@
+mkdir -p dir/subdir
+touch dir/subdir/file.b
+cp dir/subdir/file.b dir/subdir/file.a

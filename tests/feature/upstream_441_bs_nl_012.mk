@@ -1,0 +1,2 @@
+squote:;@echo 'squ\
+		   ote'
