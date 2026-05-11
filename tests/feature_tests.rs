@@ -2365,3 +2365,90 @@ fn test_security_alloc_bomb() {
 fn test_security_escape_injection() {
     run_feature_test("security_escape_injection", &[]);
 }
+
+// ── Regression: @-prefix introduced by expansion in include-rebuild path ──────
+//
+// When `-include gen.mk` triggers a rebuild of gen.mk and the recipe uses a
+// variable like QUIET_GEN = @printf '...' 1>&2; that expands to a string
+// starting with '@', expand_include_recipe_lines() must strip the '@' from
+// the *expanded* command and set cmd_silent=true.  Previously, only the raw
+// template was stripped — '@' values introduced by variable expansion leaked
+// through to the shell as a literal '@printf', causing
+// "/bin/sh: @printf: inaccessible or not found" on every build.
+//
+// Minimal reproducer for the Valkey 9.0.4 + jmake 1.2.5 bug:
+//
+//   QUIET_GEN = @echo GENERATING 1>&2;
+//   GEN_CMD   = $(QUIET_GEN)touch
+//   -include gen.mk
+//   gen.mk:
+//       -$(GEN_CMD) gen.mk
+//   all:
+//       @echo done
+//
+// Running this with a missing gen.mk must rebuild gen.mk silently (the @
+// suppresses echo for include-rebuild), without passing "@echo" to the shell.
+
+#[test]
+fn test_quiet_prefix_in_include_rebuild() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // Write the Makefile that reproduces the Valkey QUIET_CC pattern.
+    // QUIET_GEN expands to a value beginning with '@'; the recipe prefix for
+    // gen.mk is '-', so the raw template is "-$(GEN_CMD) gen.mk".
+    // After stripping '-' from the template, expansion of $(GEN_CMD) produces
+    // "@echo GENERATING 1>&2;touch".  That leading '@' must be stripped and
+    // treated as cmd_silent=true before the command reaches the shell.
+    //
+    // 'all' is the first (default) target so it runs after the include-rebuild.
+    // gen.mk must be absent before jmake runs so the include-rebuild path fires.
+    std::fs::write(dir.path().join("Makefile"),
+        "QUIET_GEN = @echo GENERATING 1>&2;\n\
+         GEN_CMD   = $(QUIET_GEN)touch\n\
+         \n\
+         all:\n\
+         \t@echo done\n\
+         \n\
+         -include gen.mk\n\
+         \n\
+         gen.mk:\n\
+         \t-$(GEN_CMD) gen.mk\n"
+    ).unwrap();
+
+    let jmake = jmake_bin();
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{} 2>&1", jmake.display()))
+        .env("JMAKE_TEST_MODE", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("run jmake");
+
+    let combined = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // The build must succeed (gen.mk is generated, then 'all' runs).
+    assert!(
+        out.status.success(),
+        "jmake failed — expected success;\noutput: {:?}", combined
+    );
+
+    // 'done' must appear (the all: recipe ran).
+    assert!(
+        combined.contains("done"),
+        "expected 'done' in output (all: recipe didn't run);\noutput: {:?}", combined
+    );
+
+    // The shell must NOT have seen '@echo' literally — no "inaccessible or not found".
+    assert!(
+        !combined.contains("inaccessible or not found"),
+        "shell saw '@' prefix as a literal command name — @ was not stripped;\noutput: {:?}",
+        combined
+    );
+    // Also confirm '@echo GENERATING' was not echoed as the recipe text (which would
+    // indicate silent-stripping failed in the echo path as well).
+    assert!(
+        !combined.contains("@echo GENERATING"),
+        "@ prefix leaked into recipe echo — cmd_silent not set;\noutput: {:?}",
+        combined
+    );
+}
