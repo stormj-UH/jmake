@@ -138,7 +138,35 @@ use crate::eval::MakeState;
 use crate::eval::make_progname;
 use crate::functions;
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+/// Return a reference to the set of built-in variable names that should not
+/// trigger `--warn-undefined-variables` warnings.
+///
+/// Built once via `OnceLock`; each subsequent call is a single pointer load
+/// (O(1)), replacing the previous O(n) linear scan through a `&[&str]` slice.
+fn builtin_var_names() -> &'static HashSet<&'static str> {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        [
+            // Automatic / special variables (always set by make)
+            ".VARIABLES", "MAKECMDGOALS", "MAKE_RESTARTS", "CURDIR",
+            "GNUMAKEFLAGS", "MAKEFLAGS", "MFLAGS", "MAKE_COMMAND", "MAKE",
+            "MAKEFILE_LIST", "MAKEOVERRIDES", "-*-command-variables-*-",
+            ".RECIPEPREFIX", ".LOADED", ".FEATURES",
+            "SHELL", ".SHELLFLAGS", "MAKE_TERMOUT", "MAKE_TERMERR",
+            ".DEFAULT", ".DEFAULT_GOAL", "-*-eval-flags-*-", "SUFFIXES",
+            "VPATH", "GPATH",
+            // Additional special variables
+            "MAKELEVEL", "MAKEFILES", "MAKEFILE", "MAKEINFO",
+            ".LIBPATTERNS", "MAKE_VERSION",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    })
+}
 
 /// Maximum nesting depth for recursive variable expansion.
 /// GNU Make aborts with "Recursive variable … references itself (eventually)"
@@ -464,21 +492,9 @@ impl MakeState {
         // Warn if requested — but suppress warnings for GNU Make's special/auto-set
         // variables that are always "defined" (even if empty) in GNU Make.  Users should
         // not get warnings for referencing these standard variables.
-        const BUILTIN_VARS: &[&str] = &[
-            // Automatic variables (always set by make)
-            ".VARIABLES", "MAKECMDGOALS", "MAKE_RESTARTS", "CURDIR",
-            "GNUMAKEFLAGS", "MAKEFLAGS", "MFLAGS", "MAKE_COMMAND", "MAKE",
-            "MAKEFILE_LIST", "MAKEOVERRIDES", "-*-command-variables-*-",
-            ".RECIPEPREFIX", ".LOADED", ".FEATURES",
-            "SHELL", ".SHELLFLAGS", "MAKE_TERMOUT", "MAKE_TERMERR",
-            ".DEFAULT", ".DEFAULT_GOAL", "-*-eval-flags-*-", "SUFFIXES",
-            "VPATH", "GPATH",
-            // Additional special variables
-            "MAKELEVEL", "MAKEFILES", "MAKEFILE", "MAKEINFO",
-            ".LIBPATTERNS", ".DEFAULT_GOAL", "MAKE_VERSION",
-            "MAKELEVEL", "MAKEFILE_LIST",
-        ];
-        let is_builtin = BUILTIN_VARS.contains(&expanded_name.as_str());
+        // `builtin_var_names()` returns a &'static HashSet for O(1) lookup,
+        // avoiding the previous O(n) linear scan through a &[&str] slice.
+        let is_builtin = builtin_var_names().contains(expanded_name.as_str());
         if self.args.warn_undefined_variables && !is_builtin {
             // Use the outermost caller context (expansion_caller_stack) when available,
             // as it reflects the location in the user's makefile where the expansion
@@ -1421,15 +1437,50 @@ impl MakeState {
         let body = &args[2];
 
         let words: Vec<&str> = list.split_whitespace().collect();
+
+        // Pre-compute the three search patterns once — they are constant across
+        // all iterations and building them with format! inside the loop was
+        // O(words × var.len()) in both allocations and copies.
+        let pat_paren = format!("$({})", var);   // $(var)
+        let pat_brace = format!("${{{}}}", var); // ${var}
+        // Single-char $v form only applies when var is exactly one character.
+        let pat_dollar: Option<String> = if var.len() == 1 {
+            Some(format!("${}", var))
+        } else {
+            None
+        };
+
+        // Check once whether the body actually contains any form of the variable
+        // reference.  When it doesn't, we can skip all three replace() calls
+        // (each of which is an O(body_len) scan + potential new allocation).
+        let body_has_paren  = body.contains(pat_paren.as_str());
+        let body_has_brace  = body.contains(pat_brace.as_str());
+        let body_has_dollar = pat_dollar.as_deref().map(|pd| body.contains(pd)).unwrap_or(false);
+        let body_needs_subst = body_has_paren || body_has_brace || body_has_dollar;
+
         let results: Vec<String> = words.iter().map(|word| {
             // Replace all forms of the variable reference in the body before expanding:
             //   $(var), ${var}, and $v (single-char only)
-            let mut substituted = body.replace(&format!("$({})", var), word)
-                                      .replace(&format!("${{{}}}", var), word);
-            // Handle single-character variable form $v (only when var is exactly one char)
-            if var.len() == 1 {
-                substituted = substituted.replace(&format!("${}", var), word);
-            }
+            // Guard each replace() behind the pre-computed `contains` result so that
+            // bodies without references to the loop variable avoid O(body_len) scans.
+            let substituted: std::borrow::Cow<'_, str> = if body_needs_subst {
+                let mut s = if body_has_paren {
+                    body.replace(pat_paren.as_str(), word)
+                } else {
+                    body.to_string()
+                };
+                if body_has_brace {
+                    s = s.replace(pat_brace.as_str(), word);
+                }
+                if body_has_dollar {
+                    if let Some(ref pd) = pat_dollar {
+                        s = s.replace(pd.as_str(), word);
+                    }
+                }
+                std::borrow::Cow::Owned(s)
+            } else {
+                std::borrow::Cow::Borrowed(body)
+            };
             // Pass the current word in auto_vars so nested expansions that reference
             // the loop variable by name (after substitution) work correctly.
             let mut loop_auto_vars = auto_vars.clone();
