@@ -3887,7 +3887,21 @@ impl MakeState {
                     _ => break,
                 }
             }
-            let expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
+            let mut expanded_cmd = self.expand_with_auto_vars(&cmd, &auto_vars);
+            // After expansion, a variable like $(QUIET_CC) may expand to a value
+            // that itself begins with @, -, or + (e.g. `@printf '...' 1>&2;cc`).
+            // Those introduced-by-expansion prefixes must also be stripped and their
+            // flags ORed with the outer flags, exactly as the main execute_recipe
+            // path does via parse_recipe_prefix on the already-expanded sub_line.
+            loop {
+                match expanded_cmd.chars().next().unwrap_or(' ') {
+                    '@' => { cmd_silent = true; expanded_cmd = expanded_cmd[1..].to_string(); }
+                    '-' => { ignore_error = true; expanded_cmd = expanded_cmd[1..].to_string(); }
+                    '+' => { expanded_cmd = expanded_cmd[1..].to_string(); }
+                    ' ' | '\t' => { expanded_cmd = expanded_cmd[1..].to_string(); }
+                    _ => break,
+                }
+            }
             (*lineno, expanded_cmd, cmd_silent, ignore_error)
         }).collect()
     }
