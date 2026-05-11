@@ -245,9 +245,16 @@ fn fn_patsubst(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let replacement = &args[1];
     let text = &args[2];
 
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| patsubst_word(w, pattern, replacement)).collect();
-    results.join(" ")
+    // Avoid intermediate Vec + collect + join by writing directly into one String.
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for w in text.split_whitespace() {
+        if !first { out.push(' '); }
+        let transformed = patsubst_word(w, pattern, replacement);
+        out.push_str(&transformed);
+        first = false;
+    }
+    out
 }
 
 /// Apply a single `patsubst` pattern to one word.
@@ -273,8 +280,15 @@ pub fn patsubst_word(word: &str, pattern: &str, replacement: &str) -> String {
 }
 
 fn fn_strip(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    words.join(" ")
+    // Avoid collecting into a Vec; build the result directly in one pass.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
+        if !first { out.push(' '); }
+        out.push_str(w);
+        first = false;
+    }
+    out
 }
 
 fn fn_findstring(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
@@ -289,20 +303,32 @@ fn fn_findstring(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 
 fn fn_filter(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let patterns: Vec<&str> = args[0].split_whitespace().collect();
-    let words: Vec<&str> = args[1].split_whitespace().collect();
-    let results: Vec<&str> = words.into_iter().filter(|w| {
-        patterns.iter().any(|p| pattern_matches(p, w))
-    }).collect();
-    results.join(" ")
+    // Write directly into one String to avoid a Vec<&str> allocation + subsequent join.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[1].split_whitespace() {
+        if patterns.iter().any(|p| pattern_matches(p, w)) {
+            if !first { out.push(' '); }
+            out.push_str(w);
+            first = false;
+        }
+    }
+    out
 }
 
 fn fn_filter_out(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let patterns: Vec<&str> = args[0].split_whitespace().collect();
-    let words: Vec<&str> = args[1].split_whitespace().collect();
-    let results: Vec<&str> = words.into_iter().filter(|w| {
-        !patterns.iter().any(|p| pattern_matches(p, w))
-    }).collect();
-    results.join(" ")
+    // Write directly into one String to avoid a Vec<&str> allocation + subsequent join.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[1].split_whitespace() {
+        if !patterns.iter().any(|p| pattern_matches(p, w)) {
+            if !first { out.push(' '); }
+            out.push_str(w);
+            first = false;
+        }
+    }
+    out
 }
 
 /// Match a GNU Make filter pattern against a word.
@@ -452,88 +478,123 @@ fn fn_lastword(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
 }
 
 fn fn_dir(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| {
+    // Write directly into one String to avoid Vec<String> + join allocation.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
+        if !first { out.push(' '); }
         match w.rfind('/') {
-            Some(pos) => w[..=pos].to_string(),
-            None => "./".to_string(),
+            Some(pos) => out.push_str(&w[..=pos]),
+            None => out.push_str("./"),
         }
-    }).collect();
-    results.join(" ")
+        first = false;
+    }
+    out
 }
 
 fn fn_notdir(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| {
+    // Write directly into one String to avoid Vec<String> + join allocation.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
+        if !first { out.push(' '); }
         match w.rfind('/') {
-            Some(pos) => w[pos+1..].to_string(),
-            None => w.to_string(),
+            Some(pos) => out.push_str(&w[pos+1..]),
+            None => out.push_str(w),
         }
-    }).collect();
-    results.join(" ")
+        first = false;
+    }
+    out
 }
 
 fn fn_suffix(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    let results: Vec<String> = words.iter().filter_map(|w| {
+    // Write directly into one String to avoid Vec<String> + join allocation.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
         let name = match w.rfind('/') {
             Some(pos) => &w[pos+1..],
             None => w,
         };
-        name.rfind('.').map(|pos| name[pos..].to_string())
-    }).collect();
-    results.join(" ")
+        if let Some(dot_pos) = name.rfind('.') {
+            if !first { out.push(' '); }
+            out.push_str(&name[dot_pos..]);
+            first = false;
+        }
+    }
+    out
 }
 
 fn fn_basename(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
-    let words: Vec<&str> = args[0].split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| {
-        let name = match w.rfind('/') {
+    // Write directly into one String to avoid Vec<String> + join allocation.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[0].split_whitespace() {
+        if !first { out.push(' '); }
+        match w.rfind('/') {
             Some(slash_pos) => {
                 let dir = &w[..=slash_pos];
                 let file = &w[slash_pos+1..];
                 match file.rfind('.') {
-                    Some(dot_pos) => format!("{}{}", dir, &file[..dot_pos]),
-                    None => w.to_string(),
+                    Some(dot_pos) => {
+                        out.push_str(dir);
+                        out.push_str(&file[..dot_pos]);
+                    }
+                    None => out.push_str(w),
                 }
             }
             None => {
                 match w.rfind('.') {
-                    Some(pos) => w[..pos].to_string(),
-                    None => w.to_string(),
+                    Some(pos) => out.push_str(&w[..pos]),
+                    None => out.push_str(w),
                 }
             }
-        };
-        name
-    }).collect();
-    results.join(" ")
+        }
+        first = false;
+    }
+    out
 }
 
 fn fn_addsuffix(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let suffix = &args[0];
-    let words: Vec<&str> = args[1].split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| format!("{}{}", w, suffix)).collect();
-    results.join(" ")
+    // Pre-size: avoid format! overhead — each result is word.len() + suffix.len() bytes.
+    // Use a single pre-allocated String and push directly.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[1].split_whitespace() {
+        if !first { out.push(' '); }
+        out.push_str(w);
+        out.push_str(suffix);
+        first = false;
+    }
+    out
 }
 
 fn fn_addprefix(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let prefix = &args[0];
-    let words: Vec<&str> = args[1].split_whitespace().collect();
-    let results: Vec<String> = words.iter().map(|w| format!("{}{}", prefix, w)).collect();
-    results.join(" ")
+    // Pre-size: avoid format! overhead — each result is prefix.len() + word.len() bytes.
+    let mut out = String::new();
+    let mut first = true;
+    for w in args[1].split_whitespace() {
+        if !first { out.push(' '); }
+        out.push_str(prefix);
+        out.push_str(w);
+        first = false;
+    }
+    out
 }
 
 fn fn_join(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
     let list1: Vec<&str> = args[0].split_whitespace().collect();
     let list2: Vec<&str> = args[1].split_whitespace().collect();
     let max = list1.len().max(list2.len());
-    let mut results = Vec::new();
+    let mut out = String::new();
     for i in 0..max {
-        let a = list1.get(i).unwrap_or(&"");
-        let b = list2.get(i).unwrap_or(&"");
-        results.push(format!("{}{}", a, b));
+        if i > 0 { out.push(' '); }
+        out.push_str(list1.get(i).unwrap_or(&""));
+        out.push_str(list2.get(i).unwrap_or(&""));
     }
-    results.join(" ")
+    out
 }
 
 fn fn_wildcard(args: &[String], _expand: &dyn Fn(&str) -> String) -> String {
