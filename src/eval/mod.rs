@@ -2220,7 +2220,48 @@ impl MakeState {
                             }
                         }
                     } else {
-                        self.set_variable(&name, &value, &flavor, is_override, is_export);
+                        // Tab-indented `:=` (Simple) and `:::=` (PosixSimple) assignments
+                        // inside active ifeq/else blocks bypass the pre-expansion path
+                        // (which handles non-tab-prefixed lines at ~1741-1793 and `continue`s
+                        // before reaching this dispatch point). When such an assignment reaches
+                        // here the value is still the raw, unexpanded text from the makefile.
+                        //
+                        // We must expand it now — exactly as the pre-expansion path does —
+                        // otherwise the stored value keeps a literal `$(VAR)` reference that
+                        // creates a self-referential recursive variable. In the Valkey pattern:
+                        //
+                        //   ifeq ($(MALLOC),jemalloc)
+                        //   	FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
+                        //   endif
+                        //
+                        // jmake stored `FINAL_LIBS` verbatim as `…jemalloc.a $(FINAL_LIBS)`.
+                        // When the LINK recipe expanded `$(FINAL_LIBS)`, the shell received the
+                        // literal subshell `$(FINAL_LIBS)` and tried to run `FINAL_LIBS` as a
+                        // command, emitting: `/bin/sh: FINAL_LIBS: inaccessible or not found`.
+                        //
+                        // Non-Simple/PosixSimple flavors (=, +=, ?=, !=, shell) are unaffected:
+                        //   - Recursive (=): value is intentionally stored unexpanded.
+                        //   - Append (+=): expanded in set_variable when base var is Simple.
+                        //   - Conditional (?=): stored unexpanded (lazy).
+                        //   - Shell (!=): expanded inside set_variable before shell execution.
+                        let effective_value = match &flavor {
+                            VarFlavor::Simple => self.expand(&value),
+                            VarFlavor::PosixSimple => {
+                                // :::= expands the RHS immediately. The `$`-escaping step
+                                // (so that subsequent += appends raw text per GNU Make
+                                // semantics) is performed inside set_variable's PosixSimple
+                                // arm, so we only expand here and let set_variable escape.
+                                self.expand(&value)
+                            }
+                            _ => value.clone(),
+                        };
+                        self.set_variable(&name, &effective_value, &flavor, is_override, is_export);
+                        // Drain $(eval …) callbacks queued during value expansion.
+                        loop {
+                            let pending: Vec<String> = std::mem::take(&mut *self.eval_pending.borrow_mut());
+                            if pending.is_empty() { break; }
+                            for s in pending { self.eval_string(&s)?; }
+                        }
                         // Handle unexport on global variable assignments.
                         // `unexport FOO=bar` sets FOO=bar but marks it as NOT exported.
                         if is_unexport {
