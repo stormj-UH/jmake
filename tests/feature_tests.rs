@@ -124,6 +124,12 @@ fn test_wildcard_variants() {
 /// stripped.  `Q = @echo` then `\t$(Q) hello` must print only "hello" (no
 /// "@echo hello" echo and no "@echo: command not found" error).
 #[test] fn test_recipe_modifier_after_expansion() { run_feature_test("recipe_modifier_after_expansion", &[]); }
+/// Bug B: A tab-indented variable assignment (`VAR += value`) inside an
+/// ifeq/else/endif block that appears AFTER a rule definition is treated as a
+/// variable assignment rather than a recipe line of the preceding rule.
+/// This is the Valkey src/Makefile pattern (lines 145/166) that caused
+/// `/bin/sh: FINAL_LIBS: inaccessible or not found` during the link step.
+#[test] fn test_tab_assignment_in_ifeq() { run_feature_test("tab_assignment_in_ifeq", &[]); }
 #[test]
 fn test_static_pattern_prereq_merge() {
     // The .mk references src/a.c and src/b.c relative to tests/feature/.
