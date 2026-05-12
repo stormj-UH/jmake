@@ -171,7 +171,13 @@ jobs:
             /<!-- test-badge-start -->/{print; print badge; skip=1; next}
             /<!-- test-badge-end -->/{skip=0}
             !skip{print}
-          ' README.md > README.tmp && mv README.tmp README.md
+          ' README.md > README.tmp
+          if cmp -s README.tmp README.md; then
+            rm -f README.tmp
+            echo "README badge unchanged, skipping README update"
+            exit 0
+          fi
+          mv README.tmp README.md
           echo "Updated badge to: $BADGE"
           # Push via API
           CONTENT=$(base64 -w 0 < README.md 2>/dev/null || base64 < README.md | awk '{printf "%s",$0}')
