@@ -1,4 +1,4 @@
-# jmake
+# jmake - part of the GNO stack
 
 A clean-room drop-in replacement for GNU Make 4.4.1, written in Rust.
 
