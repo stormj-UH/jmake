@@ -87,4 +87,9 @@ jobs:
           git remote add github-mirror "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/stormj-UH/${repo_name}.git"
           git fetch github-mirror "${GITHUB_REF_NAME}"
           git push --force-with-lease=refs/heads/"${GITHUB_REF_NAME}" github-mirror HEAD:refs/heads/"${GITHUB_REF_NAME}"
-          git push github-mirror --tags
+          git ls-remote --tags github-mirror >"${RUNNER_TEMP}/github-tags.txt"
+          git for-each-ref --format='%(refname)' refs/tags | while IFS= read -r tag_ref; do
+            if ! awk -v ref="${tag_ref}" '$2 == ref { found = 1 } END { exit !found }' "${RUNNER_TEMP}/github-tags.txt"; then
+              git push github-mirror "${tag_ref}:${tag_ref}"
+            fi
+          done
