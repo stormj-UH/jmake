@@ -1,0 +1,90 @@
+name: Mirror to GitHub
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-github-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout canonical repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for green CI
+        shell: sh
+        env:
+          FORGEJO_API_TOKEN: ${{ secrets.FORGEJO_API_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -eu
+
+          runs_file="${RUNNER_TEMP}/forgejo-runs.json"
+          attempts=120
+
+          sleep 30
+          while [ "${attempts}" -gt 0 ]; do
+            curl -fsS \
+              -H "Authorization: token ${FORGEJO_API_TOKEN}" \
+              "${SERVER_URL}/api/v1/repos/${REPO}/actions/runs?head_sha=${SHA}&limit=100" \
+              >"${runs_file}"
+
+            bad_runs=$(
+              jq -r --arg run_id "${RUN_ID}" '
+                (if type == "array" then .[] else .workflow_runs[]? end)
+                | select((.id | tostring) != $run_id)
+                | select(.status == "failure" or .status == "cancelled" or .status == "blocked")
+                | "\(.workflow_id // "workflow"): \(.status)"
+              ' "${runs_file}"
+            )
+            if [ -n "${bad_runs}" ]; then
+              printf 'Refusing to mirror because CI is not green:\n%s\n' "${bad_runs}"
+              exit 1
+            fi
+
+            pending_runs=$(
+              jq -r --arg run_id "${RUN_ID}" '
+                (if type == "array" then .[] else .workflow_runs[]? end)
+                | select((.id | tostring) != $run_id)
+                | select(.status != "success" and .status != "skipped" and .status != "failure" and .status != "cancelled" and .status != "blocked")
+                | "\(.workflow_id // "workflow"): \(.status)"
+              ' "${runs_file}"
+            )
+            if [ -z "${pending_runs}" ]; then
+              exit 0
+            fi
+
+            printf 'Waiting for CI before mirroring:\n%s\n' "${pending_runs}"
+            attempts=$((attempts - 1))
+            sleep 30
+          done
+
+          printf 'Timed out waiting for CI to finish.\n'
+          exit 1
+
+      - name: Push canonical branch to GitHub mirror
+        shell: sh
+        env:
+          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+        run: |
+          set -eu
+
+          repo_name=${GITHUB_REPOSITORY##*/}
+          git remote add github-mirror "https://x-access-token:${GH_MIRROR_TOKEN}@github.com/stormj-UH/${repo_name}.git"
+          git fetch github-mirror "${GITHUB_REF_NAME}"
+          git push --force-with-lease=refs/heads/"${GITHUB_REF_NAME}" github-mirror HEAD:refs/heads/"${GITHUB_REF_NAME}"
+          git push github-mirror --tags
