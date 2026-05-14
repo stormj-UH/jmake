@@ -118,6 +118,7 @@ fn test_wildcard_variants() {
 #[test] fn test_make_k()                { run_feature_test("make_k",                &["-k"]); }
 #[test] fn test_make_flags_n()          { run_feature_test("make_flags_n",          &["-n"]); }
 #[test] fn test_include_variants()      { run_feature_test("include_variants",      &[]); }
+#[test] fn test_autotools_shell_ne_recipe() { run_feature_test("autotools_shell_ne_recipe", &["-n"]); }
 #[test] fn test_tab_var_conditional()   { run_feature_test("tab_var_conditional",   &[]); }
 #[test] fn test_bare_colon_conditional(){ run_feature_test("bare_colon_conditional",&[]); }
 /// Bug A: @, -, + modifiers introduced by variable expansion are recognised and

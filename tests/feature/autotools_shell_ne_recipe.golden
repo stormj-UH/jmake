@@ -1,0 +1,4 @@
+srcdirstrip=x; \
+if test $d != y; then :; fi
+test -n "" \
+|| printf 'mode-fix\n'

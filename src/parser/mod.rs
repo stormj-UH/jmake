@@ -796,7 +796,7 @@ fn tab_indented_is_make_assignment(line: &str) -> bool {
                 for op in MAKE_OPS {
                     let ob = op.as_bytes();
                     if i + ob.len() <= len && &bytes[i..i + ob.len()] == ob {
-                        return true;
+                        return tabbed_assignment_lhs_is_make_like(&line[..i]);
                     }
                 }
                 i += 1;
@@ -805,6 +805,52 @@ fn tab_indented_is_make_assignment(line: &str) -> bool {
         }
     }
     false
+}
+
+/// Return true when the left side of a Make-specific assignment operator in a
+/// tab-indented line looks like make syntax rather than shell code.
+///
+/// This keeps GNU make-compatible tabbed assignments such as
+/// `FINAL_LIBS += -ldl` working after an active rule, but avoids treating
+/// ordinary recipe shell tests (`test $$d != $(srcdir)`) as make `!=`
+/// assignments.  Shell command separators before the operator, or whitespace
+/// in a non-target-specific left side, mean the operator belongs to shell text.
+fn tabbed_assignment_lhs_is_make_like(lhs: &str) -> bool {
+    let lhs = lhs.trim();
+    if lhs.is_empty() {
+        return false;
+    }
+
+    let mut depth = 0i32;
+    let mut has_rule_colon = false;
+    let bytes = lhs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' if i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b'{') => {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            b')' | b'}' if depth > 0 => {
+                depth -= 1;
+            }
+            b':' if depth == 0 => {
+                has_rule_colon = true;
+            }
+            b';' | b'|' | b'&' | b'\'' | b'"' if depth == 0 => {
+                return false;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if has_rule_colon {
+        return true;
+    }
+
+    !lhs.chars().any(char::is_whitespace)
 }
 
 pub fn try_parse_variable_assignment(line: &str) -> Option<ParsedLine> {
